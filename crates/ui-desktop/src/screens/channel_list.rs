@@ -97,8 +97,8 @@ impl ChannelListScreen {
                 }).collect();
 
                 ScrollArea::vertical().show(ui, |ui| {
-                    // 4-column grid
-                    let available_width = ui.available_width();
+                    // 4-column grid — subtract ~16px for the scrollbar
+                    let available_width = (ui.available_width() - 16.0).max(0.0);
                     let tile_width = (available_width / 4.0 - 12.0).max(160.0);
                     let tile_height = 80.0;
 
@@ -138,6 +138,10 @@ impl ChannelListScreen {
                                 if (i + 1) % 4 == 0 {
                                     ui.end_row();
                                 }
+                            }
+                            // Flush any trailing partial row
+                            if !visible.is_empty() && visible.len() % 4 != 0 {
+                                ui.end_row();
                             }
                         });
                 });
