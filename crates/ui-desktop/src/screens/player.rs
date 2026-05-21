@@ -4,7 +4,7 @@ use crate::player::mpv::MpvPlayer;
 use frenchetv_core::StreamUrl;
 
 pub struct PlayerScreen {
-    channel: Channel,
+    pub channel: Channel,
     player: MpvPlayer,
     info_visible: bool,
     info_hide_timer: f32,  // seconds remaining to show info overlay
@@ -37,8 +37,30 @@ impl PlayerScreen {
     pub fn show(&mut self, ctx: &egui::Context) -> PlayerAction {
         let mut action = PlayerAction::None;
 
-        // Tick the info overlay hide timer using egui's dt
-        let dt = ctx.input(|i| i.unstable_dt);
+        // Read dt and keyboard input in one pass
+        let (dt, key_action, toggle_info) = ctx.input(|i| {
+            let dt = i.unstable_dt;
+            let key_action = if i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace) {
+                PlayerAction::Back
+            } else if i.key_pressed(Key::ArrowRight) {
+                PlayerAction::NextChannel
+            } else if i.key_pressed(Key::ArrowLeft) {
+                PlayerAction::PrevChannel
+            } else {
+                PlayerAction::None
+            };
+            let toggle_info = i.key_pressed(Key::Enter);
+            (dt, key_action, toggle_info)
+        });
+
+        action = key_action;
+
+        if toggle_info {
+            self.info_visible = !self.info_visible;
+            self.info_hide_timer = 3.0;
+        }
+
+        // Tick the info overlay hide timer
         if self.info_visible {
             self.info_hide_timer -= dt;
             if self.info_hide_timer <= 0.0 {
@@ -47,23 +69,6 @@ impl PlayerScreen {
             // Keep requesting repaints while timer is running
             ctx.request_repaint();
         }
-
-        // Keyboard input
-        ctx.input(|i| {
-            if i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace) {
-                action = PlayerAction::Back;
-            }
-            if i.key_pressed(Key::Enter) {
-                self.info_visible = !self.info_visible;
-                self.info_hide_timer = 3.0;
-            }
-            if i.key_pressed(Key::ArrowRight) {
-                action = PlayerAction::NextChannel;
-            }
-            if i.key_pressed(Key::ArrowLeft) {
-                action = PlayerAction::PrevChannel;
-            }
-        });
 
         // Black background (mpv renders in its own window)
         egui::CentralPanel::default()
