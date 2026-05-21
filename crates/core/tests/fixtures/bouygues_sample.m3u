@@ -1,0 +1,7 @@
+#EXTM3U
+#EXTINF:-1 tvg-id="tf1" tvg-name="TF1" tvg-logo="https://logos.example.com/tf1.png" tvg-chno="1" group-title="Généraliste",TF1
+http://bbox.example.com/tf1/index.m3u8
+#EXTINF:-1 tvg-id="m6" tvg-name="M6" tvg-logo="https://logos.example.com/m6.png" tvg-chno="6" group-title="Généraliste",M6
+http://bbox.example.com/m6/index.m3u8
+#EXTINF:-1 tvg-id="eurosport" tvg-name="Eurosport 1" tvg-logo="" tvg-chno="44" group-title="Sport",Eurosport 1
+http://bbox.example.com/eurosport/index.m3u8
