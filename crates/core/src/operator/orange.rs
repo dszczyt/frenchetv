@@ -49,6 +49,8 @@ impl OrangeOperator {
     }
 
     /// Try to refresh the access token using the stored refresh token.
+    /// Used in v0.2 transparent token-refresh wrapper.
+    #[allow(dead_code)]
     async fn refresh_access_token(&mut self) -> Result<()> {
         let refresh_token = self.refresh_token.as_ref()
             .ok_or_else(|| OperatorError::TokenRefreshFailed("no refresh token".into()))?

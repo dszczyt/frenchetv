@@ -37,6 +37,8 @@ impl MpvPlayer {
     }
 
     /// Returns true if mpv is still running.
+    /// Used in v0.2 for player state polling.
+    #[allow(dead_code)]
     pub fn is_playing(&mut self) -> bool {
         self.handle.as_mut().map_or(false, |c| {
             c.try_wait().map_or(false, |status| status.is_none())

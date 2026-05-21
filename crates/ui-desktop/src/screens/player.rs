@@ -35,12 +35,10 @@ impl PlayerScreen {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> PlayerAction {
-        let mut action = PlayerAction::None;
-
         // Read dt and keyboard input in one pass
-        let (dt, key_action, toggle_info) = ctx.input(|i| {
+        let (dt, action, toggle_info) = ctx.input(|i| {
             let dt = i.unstable_dt;
-            let key_action = if i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace) {
+            let action = if i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace) {
                 PlayerAction::Back
             } else if i.key_pressed(Key::ArrowRight) {
                 PlayerAction::NextChannel
@@ -50,10 +48,8 @@ impl PlayerScreen {
                 PlayerAction::None
             };
             let toggle_info = i.key_pressed(Key::Enter);
-            (dt, key_action, toggle_info)
+            (dt, action, toggle_info)
         });
-
-        action = key_action;
 
         if toggle_info {
             self.info_visible = !self.info_visible;
@@ -98,7 +94,7 @@ impl PlayerScreen {
                         Color32::from_rgba_unmultiplied(0, 0, 0, 180),
                     );
 
-                    ui.allocate_ui_at_rect(overlay_rect, |ui| {
+                    ui.allocate_new_ui(egui::UiBuilder::new().max_rect(overlay_rect), |ui| {
                         ui.add_space(12.0);
                         ui.horizontal(|ui| {
                             ui.add_space(16.0);

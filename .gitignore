@@ -1,0 +1,6 @@
+/target
+/.claude/worktrees
+ruvector.db
+*.db-shm
+*.db-wal
+Cargo.lock
