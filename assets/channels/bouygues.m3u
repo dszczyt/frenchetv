@@ -1,3 +1,21 @@
 #EXTM3U
 #EXTINF:-1 tvg-id="tf1" tvg-name="TF1" tvg-logo="" tvg-chno="1" group-title="Généraliste",TF1
 https://bbox.bouyguestelecom.fr/live/tf1/playlist.m3u8
+#EXTINF:-1 tvg-id="france2" tvg-name="France 2" tvg-logo="" tvg-chno="2" group-title="Généraliste",France 2
+https://bbox.bouyguestelecom.fr/live/france2/playlist.m3u8
+#EXTINF:-1 tvg-id="france3" tvg-name="France 3" tvg-logo="" tvg-chno="3" group-title="Généraliste",France 3
+https://bbox.bouyguestelecom.fr/live/france3/playlist.m3u8
+#EXTINF:-1 tvg-id="canalplus" tvg-name="Canal+" tvg-logo="" tvg-chno="4" group-title="Divertissement",Canal+
+https://bbox.bouyguestelecom.fr/live/canalplus/playlist.m3u8
+#EXTINF:-1 tvg-id="france5" tvg-name="France 5" tvg-logo="" tvg-chno="5" group-title="Généraliste",France 5
+https://bbox.bouyguestelecom.fr/live/france5/playlist.m3u8
+#EXTINF:-1 tvg-id="m6" tvg-name="M6" tvg-logo="" tvg-chno="6" group-title="Généraliste",M6
+https://bbox.bouyguestelecom.fr/live/m6/playlist.m3u8
+#EXTINF:-1 tvg-id="arte" tvg-name="Arte" tvg-logo="" tvg-chno="7" group-title="Généraliste",Arte
+https://bbox.bouyguestelecom.fr/live/arte/playlist.m3u8
+#EXTINF:-1 tvg-id="c8" tvg-name="C8" tvg-logo="" tvg-chno="8" group-title="Divertissement",C8
+https://bbox.bouyguestelecom.fr/live/c8/playlist.m3u8
+#EXTINF:-1 tvg-id="bfmtv" tvg-name="BFM TV" tvg-logo="" tvg-chno="15" group-title="Info",BFM TV
+https://bbox.bouyguestelecom.fr/live/bfmtv/playlist.m3u8
+#EXTINF:-1 tvg-id="eurosport1" tvg-name="Eurosport 1" tvg-logo="" tvg-chno="44" group-title="Sport",Eurosport 1
+https://bbox.bouyguestelecom.fr/live/eurosport1/playlist.m3u8

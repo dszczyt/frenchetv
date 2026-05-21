@@ -1,3 +1,21 @@
 #EXTM3U
 #EXTINF:-1 tvg-id="TF1.fr" tvg-name="TF1" tvg-logo="" tvg-chno="1" group-title="Généraliste",TF1
 https://ott.orange.fr/live/manifest.m3u8?channel=TF1
+#EXTINF:-1 tvg-id="France2.fr" tvg-name="France 2" tvg-logo="" tvg-chno="2" group-title="Généraliste",France 2
+https://ott.orange.fr/live/manifest.m3u8?channel=France2
+#EXTINF:-1 tvg-id="France3.fr" tvg-name="France 3" tvg-logo="" tvg-chno="3" group-title="Généraliste",France 3
+https://ott.orange.fr/live/manifest.m3u8?channel=France3
+#EXTINF:-1 tvg-id="CanalPlus.fr" tvg-name="Canal+" tvg-logo="" tvg-chno="4" group-title="Divertissement",Canal+
+https://ott.orange.fr/live/manifest.m3u8?channel=CanalPlus
+#EXTINF:-1 tvg-id="France5.fr" tvg-name="France 5" tvg-logo="" tvg-chno="5" group-title="Généraliste",France 5
+https://ott.orange.fr/live/manifest.m3u8?channel=France5
+#EXTINF:-1 tvg-id="M6.fr" tvg-name="M6" tvg-logo="" tvg-chno="6" group-title="Généraliste",M6
+https://ott.orange.fr/live/manifest.m3u8?channel=M6
+#EXTINF:-1 tvg-id="Arte.fr" tvg-name="Arte" tvg-logo="" tvg-chno="7" group-title="Généraliste",Arte
+https://ott.orange.fr/live/manifest.m3u8?channel=Arte
+#EXTINF:-1 tvg-id="C8.fr" tvg-name="C8" tvg-logo="" tvg-chno="8" group-title="Divertissement",C8
+https://ott.orange.fr/live/manifest.m3u8?channel=C8
+#EXTINF:-1 tvg-id="W9.fr" tvg-name="W9" tvg-logo="" tvg-chno="9" group-title="Divertissement",W9
+https://ott.orange.fr/live/manifest.m3u8?channel=W9
+#EXTINF:-1 tvg-id="BFMTV.fr" tvg-name="BFM TV" tvg-logo="" tvg-chno="15" group-title="Info",BFM TV
+https://ott.orange.fr/live/manifest.m3u8?channel=BFMTV
