@@ -34,10 +34,11 @@ pub struct App {
     tx: mpsc::SyncSender<AsyncMsg>,
     rx: mpsc::Receiver<AsyncMsg>,
     rt: tokio::runtime::Runtime,
+    egui_ctx: egui::Context,
 }
 
 impl App {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         let (tx, rx) = mpsc::sync_channel(16);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         // Load config but don't crash if it's missing or malformed
@@ -50,6 +51,7 @@ impl App {
             tx,
             rx,
             rt,
+            egui_ctx: cc.egui_ctx.clone(),
         }
     }
 
@@ -57,10 +59,12 @@ impl App {
     /// The operator is kept alive in the SharedOperator so tokens persist.
     fn start_auth(&self, kind: OperatorKind, username: String, password: String) {
         let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
             if let Err(e) = op.authenticate(&username, &password).await {
                 let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                ctx.request_repaint();
                 return;
             }
             match op.fetch_channels().await {
@@ -72,12 +76,14 @@ impl App {
                     let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string()));
                 }
             }
+            ctx.request_repaint();
         });
     }
 
     /// Spawn: resolve_stream using the stored (authenticated) operator.
     fn start_resolve_stream(&self, channel: Channel) {
         let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
         let op = match &self.current_operator {
             Some(op) => op.clone(),
             None => {
@@ -86,8 +92,12 @@ impl App {
             }
         };
         self.rt.spawn(async move {
-            let op = op.lock().await;
-            match op.resolve_stream(&channel).await {
+            // Release lock before sending so concurrent resolutions don't block
+            let result = {
+                let op = op.lock().await;
+                op.resolve_stream(&channel).await
+            };
+            match result {
                 Ok(stream) => {
                     let _ = tx.send(AsyncMsg::StreamOk { channel, stream });
                 }
@@ -95,6 +105,7 @@ impl App {
                     let _ = tx.send(AsyncMsg::StreamErr(e.to_string()));
                 }
             }
+            ctx.request_repaint();
         });
     }
 
@@ -160,8 +171,10 @@ impl eframe::App for App {
                     }
                     PlayerAction::PrevChannel => {
                         if let Some(idx) = channels.iter().position(|c| c.id == current_id) {
-                            let prev = if idx == 0 { channels.len() - 1 } else { idx - 1 };
-                            self.start_resolve_stream(channels[prev].clone());
+                            if !channels.is_empty() {
+                                let prev = if idx == 0 { channels.len() - 1 } else { idx - 1 };
+                                self.start_resolve_stream(channels[prev].clone());
+                            }
                         }
                     }
                     PlayerAction::None => {}
