@@ -1,0 +1,12 @@
+[package]
+name = "frenchetv-ui-desktop"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "frenchetv"
+path = "src/main.rs"
+
+[dependencies]
+frenchetv-core = { path = "../core" }
