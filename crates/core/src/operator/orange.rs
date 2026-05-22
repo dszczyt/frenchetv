@@ -655,21 +655,6 @@ impl Operator for OrangeOperator {
                         return Ok(parse_m3u(FALLBACK_M3U));
                     }
                 };
-                // Log key channels to identify the correct stream identifier.
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
-                    if let Some(channels_arr) = v["channels"].as_array() {
-                        for ch in channels_arr {
-                            let name = ch["name"].as_str().unwrap_or("");
-                            if ["TF1","France 2","FRANCE 2","France 3","FRANCE 3","M6"].contains(&name) {
-                                tracing::info!(
-                                    "Orange stream debug: name={} idEPG={} editoChannelId={:?} techLive={}",
-                                    name, ch["idEPG"], ch["editoChannelId"],
-                                    ch["technicalChannels"]["live"]
-                                );
-                            }
-                        }
-                    }
-                }
                 let channels_raw: Vec<OrangeChannel> = match serde_json::from_str::<OrangeChannelList>(&body_text) {
                     Ok(wrapper) => wrapper.channels,
                     Err(e) => {
@@ -771,7 +756,7 @@ impl Operator for OrangeOperator {
             self.stream_base, channel.id
         );
 
-        tracing::info!("Orange resolve_stream: GET {} (tv_token len={})", stream_url, tv_token.len());
+        tracing::debug!("Orange resolve_stream: GET {} (tv_token len={})", stream_url, tv_token.len());
         let mut req = self.client
             .get(&stream_url)
             .header("tv_token", format!("Bearer {}", tv_token))
