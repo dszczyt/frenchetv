@@ -7,7 +7,7 @@ use crate::channel::m3u::parse_m3u;
 use crate::epg::EpgData;
 use crate::error::OperatorError;
 use crate::stream::StreamUrl;
-use super::traits::{Operator, Result};
+use super::traits::{AuthPhase, Operator, Result};
 
 /// Fallback M3U shipped with the binary.
 const FALLBACK_M3U: &str = include_str!("../../../../assets/channels/orange.m3u");
@@ -27,6 +27,8 @@ pub struct OrangeOperator {
     pub(crate) tv_token: Option<String>,
     /// When the current `tv_token` expires (25 min after extraction).
     tv_token_expires: Option<std::time::Instant>,
+    /// XSRF token captured from `/api/access`; forwarded to subsequent steps.
+    xsrf_token: Option<String>,
 }
 
 impl OrangeOperator {
@@ -60,6 +62,7 @@ impl OrangeOperator {
             wassup: None,
             tv_token: None,
             tv_token_expires: None,
+            xsrf_token: None,
         }
     }
 
@@ -113,6 +116,17 @@ impl OrangeOperator {
 
         Ok(())
     }
+
+    /// Attach the XSRF token header if we have one.
+    fn with_xsrf<'a>(
+        &self,
+        builder: reqwest::RequestBuilder,
+    ) -> reqwest::RequestBuilder {
+        match &self.xsrf_token {
+            Some(tok) => builder.header("X-XSRF-TOKEN", tok.clone()),
+            None => builder,
+        }
+    }
 }
 
 impl Default for OrangeOperator {
@@ -151,12 +165,16 @@ impl Operator for OrangeOperator {
         true
     }
 
-    async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
+    fn uses_phased_auth(&self) -> bool {
+        true
+    }
+
+    /// Phase 1: visit login page, call /api/access and /api/login, detect auth method.
+    async fn begin_auth(&mut self, username: &str) -> Result<AuthPhase> {
         let login_base = self.login_base.clone();
         let referer = format!("{}/", login_base);
 
         // Step 0 — Seed session cookies by visiting the login page.
-        // Errors suppressed: the API calls below will fail clearly if the host is down.
         let _ = self
             .client
             .get(&referer)
@@ -179,7 +197,7 @@ impl Operator for OrangeOperator {
             .await?;
 
         // Capture XSRF-TOKEN before consuming the body (double-submit cookie pattern).
-        let xsrf_token: Option<String> = resp
+        self.xsrf_token = resp
             .cookies()
             .find(|c| c.name().eq_ignore_ascii_case("xsrf-token"))
             .map(|c| c.value().to_string());
@@ -193,7 +211,6 @@ impl Operator for OrangeOperator {
             });
         }
 
-        // `nextStep == "feedback"` means Orange rejected the request (CSRF/bot-check).
         let body1: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
         if matches!(
             body1.get("nextStep").and_then(|v| v.as_str()),
@@ -205,7 +222,7 @@ impl Operator for OrangeOperator {
         }
 
         // Step 2 — POST /api/login
-        let mut builder = self
+        let builder = self
             .client
             .post(format!("{}/api/login", login_base))
             .header("Origin", &login_base)
@@ -215,10 +232,7 @@ impl Operator for OrangeOperator {
                 "login": username,
                 "loginOrigin": "input"
             }));
-        if let Some(ref tok) = xsrf_token {
-            builder = builder.header("X-XSRF-TOKEN", tok);
-        }
-        let resp = builder.send().await?;
+        let resp = self.with_xsrf(builder).send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -231,16 +245,24 @@ impl Operator for OrangeOperator {
                 body,
             });
         }
-        let body2: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-        if matches!(
-            body2.get("nextStep").and_then(|v| v.as_str()),
-            Some("feedback")
-        ) {
-            return Err(OperatorError::InvalidCredentials);
-        }
 
-        // Step 3 — POST /api/password
-        let mut builder = self
+        let body2: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        match body2.get("nextStep").and_then(|v| v.as_str()) {
+            Some("feedback") => Err(OperatorError::InvalidCredentials),
+            Some("push") | Some("push_notification") => {
+                tracing::info!("Orange: push auth required; waiting for mobile approval");
+                Ok(AuthPhase::Push)
+            }
+            _ => Ok(AuthPhase::Password),
+        }
+    }
+
+    /// Phase 2a: submit password, extract wassup cookie, fetch tv_token.
+    async fn complete_auth_password(&mut self, password: &str) -> Result<()> {
+        let login_base = self.login_base.clone();
+        let referer = format!("{}/", login_base);
+
+        let builder = self
             .client
             .post(format!("{}/api/password", login_base))
             .header("Origin", &login_base)
@@ -250,10 +272,7 @@ impl Operator for OrangeOperator {
                 "password": password,
                 "remember": true
             }));
-        if let Some(ref tok) = xsrf_token {
-            builder = builder.header("X-XSRF-TOKEN", tok);
-        }
-        let resp = builder.send().await?;
+        let resp = self.with_xsrf(builder).send().await?;
 
         let status = resp.status();
         // Read cookies before consuming the body.
@@ -276,7 +295,6 @@ impl Operator for OrangeOperator {
         match wassup {
             Some(v) => self.wassup = Some(v),
             None => {
-                // `nextStep == "feedback"` with 200 means bad password.
                 let body3: serde_json::Value =
                     resp.json().await.unwrap_or(serde_json::Value::Null);
                 if matches!(
@@ -289,10 +307,95 @@ impl Operator for OrangeOperator {
             }
         }
 
-        // Immediately fetch the tv_token while the session is fresh.
-        self.ensure_tv_token().await?;
+        self.ensure_tv_token().await
+    }
 
-        Ok(())
+    /// Phase 2b: poll `POST /api/push` every 3 s until Orange signals approval
+    /// (`nextStep == "end"`) or the 90-second window expires.
+    ///
+    /// The exact polling endpoint is inferred from the `/api/*` pattern used by the
+    /// Orange login SPA. If Orange uses a different path the debug log will show what
+    /// the server actually returns, making the adjustment straightforward.
+    async fn wait_for_push_auth(&mut self) -> Result<()> {
+        use std::time::Duration;
+
+        const POLL_INTERVAL: Duration = Duration::from_secs(3);
+        const MAX_ATTEMPTS: u32 = 30; // 30 × 3 s = 90 s
+
+        let login_base = self.login_base.clone();
+        let referer = format!("{}/", login_base);
+
+        for attempt in 0..MAX_ATTEMPTS {
+            tokio::time::sleep(POLL_INTERVAL).await;
+
+            let builder = self
+                .client
+                .post(format!("{}/api/push", login_base))
+                .header("Origin", &login_base)
+                .header("Referer", &referer)
+                .header("Accept", "application/json, text/plain, */*")
+                .json(&serde_json::json!({}));
+            let resp = match self.with_xsrf(builder).send().await {
+                Ok(r) => r,
+                Err(e) => {
+                    tracing::warn!("push poll attempt {}: network error: {}", attempt + 1, e);
+                    continue;
+                }
+            };
+
+            let status = resp.status();
+            let wassup = resp
+                .cookies()
+                .find(|c| c.name() == "wassup")
+                .map(|c| c.value().to_string());
+
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                tracing::debug!(
+                    "push poll attempt {}: HTTP {} — {}",
+                    attempt + 1,
+                    status,
+                    body
+                );
+                continue;
+            }
+
+            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+            let next_step = body.get("nextStep").and_then(|v| v.as_str()).unwrap_or("");
+            tracing::debug!("push poll attempt {}: nextStep={:?}", attempt + 1, next_step);
+
+            match next_step {
+                "end" => {
+                    if let Some(w) = wassup {
+                        self.wassup = Some(w);
+                    }
+                    return self.ensure_tv_token().await;
+                }
+                "feedback" => {
+                    return Err(OperatorError::AuthFailed(
+                        "push notification was rejected or expired".into(),
+                    ));
+                }
+                _ => {
+                    // "push" or unknown — still pending, keep polling
+                }
+            }
+        }
+
+        Err(OperatorError::AuthFailed(
+            "push auth timed out (90 s); please try again".into(),
+        ))
+    }
+
+    /// Convenience: single-call auth for tests and password-based accounts.
+    /// If the account requires push, returns `AuthFailed` — use the phased methods.
+    async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
+        match self.begin_auth(username).await? {
+            AuthPhase::Password => self.complete_auth_password(password).await,
+            AuthPhase::Push => Err(OperatorError::AuthFailed(
+                "account requires mobile push auth; use the phased auth flow".into(),
+            )),
+        }
     }
 
     async fn fetch_channels(&self) -> Result<Vec<Channel>> {
@@ -535,7 +638,45 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Test 3 — 500 from channels endpoint falls back to M3U
+    // Test 3 — begin_auth detects push nextStep
+    // ---------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_begin_auth_detects_push() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "nextStep": "push"
+            })))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(ResponseTemplate::new(200).set_body_string(""))
+            .mount(&mock)
+            .await;
+
+        let mut op = OrangeOperator::new_with_bases(
+            &mock.uri(),
+            &format!("{}/", mock.uri()),
+            &format!("{}/channels", mock.uri()),
+            &format!("{}/stream", mock.uri()),
+        );
+
+        let phase = op.begin_auth("user@orange.fr").await.unwrap();
+        assert_eq!(phase, AuthPhase::Push);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Test 4 — 500 from channels endpoint falls back to M3U
     // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_fetch_channels_falls_back_on_api_error() {
@@ -563,7 +704,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Test 4 — API response is parsed correctly
+    // Test 5 — API response is parsed correctly
     // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_fetch_channels_parses_api_response() {
@@ -613,7 +754,7 @@ mod tests {
     }
 
     // ---------------------------------------------------------------------------
-    // Test 5 — stream resolution returns URL from API JSON
+    // Test 6 — stream resolution returns URL from API JSON
     // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_resolve_stream() {

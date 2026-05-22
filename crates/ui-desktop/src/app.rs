@@ -1,7 +1,7 @@
 use std::sync::{mpsc, Arc};
 use tokio::sync::Mutex;
-use frenchetv_core::{Channel, Config, Operator, OperatorKind, OperatorRegistry, StreamUrl};
-use crate::screens::{ChannelListScreen, PlayerScreen, SetupScreen};
+use frenchetv_core::{AuthPhase, Channel, Config, Operator, OperatorKind, OperatorRegistry, StreamUrl};
+use crate::screens::{ChannelListScreen, PlayerScreen, PushWaitScreen, SetupScreen};
 use crate::screens::setup::SetupAction;
 use crate::screens::channel_list::ChannelListAction;
 use crate::screens::player::PlayerAction;
@@ -11,6 +11,8 @@ type SharedOperator = Arc<Mutex<Box<dyn Operator>>>;
 /// Messages sent from Tokio tasks back to the UI thread.
 enum AsyncMsg {
     AuthErr(String),
+    /// Operator requires mobile push approval — show the push-wait screen.
+    PushAuthPending,
     /// Authentication + channel fetch both succeeded. Carries the live operator
     /// (with token set) so it can be reused for resolve_stream.
     ChannelsOk { channels: Vec<Channel>, operator: SharedOperator },
@@ -21,6 +23,7 @@ enum AsyncMsg {
 
 enum Screen {
     Setup(SetupScreen),
+    PushWait(PushWaitScreen),
     ChannelList(ChannelListScreen),
     Player(PlayerScreen),
 }
@@ -56,17 +59,61 @@ impl App {
     }
 
     /// Spawn: authenticate → fetch_channels → send ChannelsOk (or AuthErr / ChannelsErr).
-    /// The operator is kept alive in the SharedOperator so tokens persist.
+    /// For operators that use phased auth (e.g. Orange push notification), sends
+    /// PushAuthPending first so the UI can show the wait screen, then continues
+    /// polling in the same task.
     fn start_auth(&self, kind: OperatorKind, username: String, password: String) {
         let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
-            if let Err(e) = op.authenticate(&username, &password).await {
-                let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
-                ctx.request_repaint();
+
+            let auth_ok = if op.uses_phased_auth() {
+                match op.begin_auth(&username).await {
+                    Err(e) => {
+                        let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                    Ok(AuthPhase::Password) => {
+                        match op.complete_auth_password(&password).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                                ctx.request_repaint();
+                                return;
+                            }
+                        }
+                    }
+                    Ok(AuthPhase::Push) => {
+                        // Signal the UI to show the push-wait screen, then keep polling.
+                        let _ = tx.send(AsyncMsg::PushAuthPending);
+                        ctx.request_repaint();
+                        match op.wait_for_push_auth().await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                                ctx.request_repaint();
+                                return;
+                            }
+                        }
+                    }
+                }
+            } else {
+                match op.authenticate(&username, &password).await {
+                    Ok(()) => true,
+                    Err(e) => {
+                        let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            };
+
+            if !auth_ok {
                 return;
             }
+
             match op.fetch_channels().await {
                 Ok(channels) => {
                     let shared = Arc::new(Mutex::new(op));
@@ -113,9 +160,21 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AsyncMsg::AuthErr(err) => {
-                    if let Screen::Setup(s) = &mut self.screen {
-                        s.set_error(format!("Connexion échouée : {}", err));
+                    // Show error on setup or push-wait screen; go back to setup if needed.
+                    match &mut self.screen {
+                        Screen::Setup(s) => {
+                            s.set_error(format!("Connexion échouée : {}", err));
+                        }
+                        Screen::PushWait(_) => {
+                            let mut s = SetupScreen::new();
+                            s.set_error(format!("Connexion échouée : {}", err));
+                            self.screen = Screen::Setup(s);
+                        }
+                        _ => {}
                     }
+                }
+                AsyncMsg::PushAuthPending => {
+                    self.screen = Screen::PushWait(PushWaitScreen::new());
                 }
                 AsyncMsg::ChannelsOk { channels, operator } => {
                     self.channels = channels.clone();
@@ -149,6 +208,9 @@ impl eframe::App for App {
                 if let SetupAction::StartAuth { operator, username, password } = setup.show(ctx) {
                     self.start_auth(operator, username, password);
                 }
+            }
+            Screen::PushWait(pw) => {
+                pw.show(ctx);
             }
             Screen::ChannelList(list) => {
                 if let ChannelListAction::SelectChannel(channel) = list.show(ctx) {

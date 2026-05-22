@@ -2,7 +2,7 @@ pub mod bouygues;
 pub mod orange;
 pub mod traits;
 
-pub use traits::Operator;
+pub use traits::{AuthPhase, Operator};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OperatorKind {
