@@ -811,7 +811,7 @@ impl Operator for OrangeOperator {
 
         // Extract Widevine DRM parameters from protectionData array if present.
         // Orange returns: [{"keySystem":"com.widevine.alpha","licenseServerURL":"...","initData":"base64..."}]
-        stream.protection = extract_widevine_protection(&json, &tv_token);
+        stream.protection = extract_widevine_protection(&json, &tv_token, &self.stream_base);
         Ok(stream)
     }
 
@@ -833,7 +833,11 @@ impl Operator for OrangeOperator {
 /// Extract Widevine ProtectionData from the stream-resolution JSON response.
 /// Orange's API returns a `protectionData` array; each entry has a `keySystem`,
 /// `licenseServerURL`, and optionally `initData` (base64-encoded PSSH box).
-fn extract_widevine_protection(json: &serde_json::Value, tv_token: &str) -> Option<ProtectionData> {
+fn extract_widevine_protection(
+    json: &serde_json::Value,
+    tv_token: &str,
+    stream_base: &str,
+) -> Option<ProtectionData> {
     use base64::engine::Engine as _;
 
     let arr = json.get("protectionData")?.as_array()?;
@@ -842,11 +846,25 @@ fn extract_widevine_protection(json: &serde_json::Value, tv_token: &str) -> Opti
         if ks != "com.widevine.alpha" {
             continue;
         }
-        let la_url = entry
+        let raw_url = entry
             .get("licenseServerURL")
             .and_then(|v| v.as_str())
-            .or_else(|| entry.get("laUrl").and_then(|v| v.as_str()))
-            .map(str::to_string)?;
+            .or_else(|| entry.get("laUrl").and_then(|v| v.as_str()))?;
+
+        // Resolve relative URLs (e.g. "/widevine/license?...") against the
+        // stream API host (e.g. "https://mediation-tv.orange.fr/...").
+        let la_url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
+            raw_url.to_string()
+        } else {
+            // Extract scheme://host from stream_base then append the relative path.
+            let host = stream_base
+                .trim_end_matches('/')
+                .splitn(4, '/')   // ["https:", "", "host", "path..."]
+                .take(3)
+                .collect::<Vec<_>>()
+                .join("/");
+            format!("{}{}", host, raw_url)
+        };
 
         let pssh = entry
             .get("initData")

@@ -373,6 +373,15 @@ impl App {
                 }
             };
 
+            tracing::info!(
+                "widevine: protection la_url={} pssh={:?} mpd_len={}",
+                protection.la_url,
+                protection.pssh.as_ref().map(|p| format!("{} bytes", p.len())),
+                mpd_text.len()
+            );
+            // Log the MPD at debug level so we can inspect its ContentProtection structure.
+            tracing::debug!("widevine: MPD text =\n{}", &mpd_text[..mpd_text.len().min(4000)]);
+
             let pssh = if let Some(p) = protection.pssh.as_ref() {
                 p.clone()
             } else {
