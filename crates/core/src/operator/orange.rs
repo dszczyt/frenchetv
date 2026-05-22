@@ -262,6 +262,20 @@ impl Operator for OrangeOperator {
                     &body1_text[..body1_text.len().min(300)]
                 )));
             }
+            "redirect" => {
+                let location = body1
+                    .pointer("/data/location")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(unknown)");
+                let msg = if location.contains("captcha") {
+                    "Orange a détecté un trop grand nombre de tentatives — veuillez patienter \
+                     quelques minutes avant de réessayer."
+                } else {
+                    "Orange a redirigé la connexion vers une page inattendue."
+                };
+                tracing::warn!("Orange /api/access redirect to: {}", location);
+                return Err(OperatorError::AuthFailed(msg.to_string()));
+            }
             "authnByApp" => {
                 // /api/access says the account uses app-based auth.
                 // SPA source: `triggerABA` action → `postAuthentAOM()` → POST /api/aom {}.
