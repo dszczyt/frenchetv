@@ -46,8 +46,9 @@ pub trait Operator: Send + Sync {
     }
 
     /// Phase 2b (push path): poll until the user approves the push notification
-    /// or the attempt times out.
-    async fn wait_for_push_auth(&mut self) -> Result<()> {
+    /// or the attempt times out. The password is forwarded in case account
+    /// selection leads back to a `/api/password` step (e.g. Orange remoteAccounts).
+    async fn wait_for_push_auth(&mut self, _password: &str) -> Result<()> {
         Err(OperatorError::AuthFailed(
             "phased auth not supported by this operator".into(),
         ))

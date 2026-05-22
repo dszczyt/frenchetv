@@ -89,7 +89,7 @@ impl App {
                         // Signal the UI to show the push-wait screen, then keep polling.
                         let _ = tx.send(AsyncMsg::PushAuthPending);
                         ctx.request_repaint();
-                        match op.wait_for_push_auth().await {
+                        match op.wait_for_push_auth(&password).await {
                             Ok(()) => true,
                             Err(e) => {
                                 let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
