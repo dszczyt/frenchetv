@@ -139,23 +139,56 @@ pub async fn acquire_license(
     );
 
     // Step 2: POST challenge to license server.
+    // Disable reqwest's default redirect behaviour: some CDNs redirect POST
+    // requests with a 302, which reqwest would silently convert to GET,
+    // resulting in 405.  We follow redirects manually so we always POST.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
+        .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("reqwest client")?;
 
+    // The drmToken JWT in the URL is the primary auth credential; follow the
+    // CDN's expectations by only adding Content-Type plus whatever the caller
+    // supplies.  Orange/User-Agent/Origin/Referer headers are kept because
+    // the CDN validates them for subscriber entitlement.
     let mut req = client
         .post(la_url)
         .header("Content-Type", "application/octet-stream")
-        .body(challenge);
+        .body(challenge.clone());
 
     for (name, value) in license_headers {
         req = req.header(name.as_str(), value.as_str());
     }
 
     let resp = req.send().await.context("license POST")?;
+
+    // Manual redirect: follow 3xx while always re-posting the challenge.
+    let resp = if resp.status().is_redirection() {
+        if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+            let redirect_url = loc.to_str().unwrap_or("").to_string();
+            tracing::info!("widevine: license server redirected to {}", redirect_url);
+            let mut req2 = client
+                .post(&redirect_url)
+                .header("Content-Type", "application/octet-stream")
+                .body(challenge);
+            for (name, value) in license_headers {
+                req2 = req2.header(name.as_str(), value.as_str());
+            }
+            req2.send().await.context("license POST (after redirect)")?
+        } else {
+            resp
+        }
+    } else {
+        resp
+    };
+
     if !resp.status().is_success() {
         let status = resp.status();
+        // Log all response headers to aid debugging.
+        for (k, v) in resp.headers() {
+            tracing::debug!("widevine: license error header: {}: {}", k, v.to_str().unwrap_or("?"));
+        }
         let body = resp.text().await.unwrap_or_default();
         bail!("license server returned {}: {}", status, body);
     }
