@@ -21,10 +21,6 @@ quick-xml = "0.36"
 flate2 = "1"
 bytes = "1"
 tokio-stream = "0.1"
-keyring = { version = "3", optional = true }
-
-[features]
-default = ["keyring"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["full", "test-util"] }
