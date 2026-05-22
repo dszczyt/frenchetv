@@ -152,78 +152,144 @@ impl Operator for OrangeOperator {
     }
 
     async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
+        let login_base = self.login_base.clone();
+        let referer = format!("{}/", login_base);
+
+        // Step 0 — Seed session cookies by visiting the login page.
+        // Errors suppressed: the API calls below will fail clearly if the host is down.
+        let _ = self
+            .client
+            .get(&referer)
+            .header(
+                "Accept",
+                "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            )
+            .send()
+            .await;
+
         // Step 1 — POST /api/access
-        let resp = self.client
-            .post(format!("{}/api/access", self.login_base))
+        let resp = self
+            .client
+            .post(format!("{}/api/access", login_base))
+            .header("Origin", &login_base)
+            .header("Referer", &referer)
+            .header("Accept", "application/json, text/plain, */*")
             .json(&serde_json::json!({}))
             .send()
             .await?;
 
-        let status = resp.status().as_u16();
-        if status == 401 || status == 400 {
-            return Err(OperatorError::InvalidCredentials);
-        }
-        if !resp.status().is_success() {
+        // Capture XSRF-TOKEN before consuming the body (double-submit cookie pattern).
+        let xsrf_token: Option<String> = resp
+            .cookies()
+            .find(|c| c.name().eq_ignore_ascii_case("xsrf-token"))
+            .map(|c| c.value().to_string());
+
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::UnexpectedResponse { status, body });
+            return Err(OperatorError::UnexpectedResponse {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        // `nextStep == "feedback"` means Orange rejected the request (CSRF/bot-check).
+        let body1: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if matches!(
+            body1.get("nextStep").and_then(|v| v.as_str()),
+            Some("feedback")
+        ) {
+            return Err(OperatorError::AuthFailed(
+                "orange.fr rejected /api/access (CSRF or bot-check failed)".into(),
+            ));
         }
 
         // Step 2 — POST /api/login
-        let resp = self.client
-            .post(format!("{}/api/login", self.login_base))
+        let mut builder = self
+            .client
+            .post(format!("{}/api/login", login_base))
+            .header("Origin", &login_base)
+            .header("Referer", &referer)
+            .header("Accept", "application/json, text/plain, */*")
             .json(&serde_json::json!({
                 "login": username,
                 "loginOrigin": "input"
-            }))
-            .send()
-            .await?;
-
-        let status = resp.status().as_u16();
-        if status == 401 || status == 400 {
-            return Err(OperatorError::InvalidCredentials);
+            }));
+        if let Some(ref tok) = xsrf_token {
+            builder = builder.header("X-XSRF-TOKEN", tok);
         }
-        if !resp.status().is_success() {
+        let resp = builder.send().await?;
+
+        let status = resp.status();
+        if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::UnexpectedResponse { status, body });
+            if matches!(status.as_u16(), 400 | 401 | 403) {
+                return Err(OperatorError::InvalidCredentials);
+            }
+            return Err(OperatorError::UnexpectedResponse {
+                status: status.as_u16(),
+                body,
+            });
+        }
+        let body2: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        if matches!(
+            body2.get("nextStep").and_then(|v| v.as_str()),
+            Some("feedback")
+        ) {
+            return Err(OperatorError::InvalidCredentials);
         }
 
         // Step 3 — POST /api/password
-        let resp = self.client
-            .post(format!("{}/api/password", self.login_base))
+        let mut builder = self
+            .client
+            .post(format!("{}/api/password", login_base))
+            .header("Origin", &login_base)
+            .header("Referer", &referer)
+            .header("Accept", "application/json, text/plain, */*")
             .json(&serde_json::json!({
                 "password": password,
                 "remember": true
-            }))
-            .send()
-            .await?;
-
-        let status = resp.status().as_u16();
-        if status == 401 || status == 400 {
-            return Err(OperatorError::InvalidCredentials);
+            }));
+        if let Some(ref tok) = xsrf_token {
+            builder = builder.header("X-XSRF-TOKEN", tok);
         }
-        if !resp.status().is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(OperatorError::UnexpectedResponse { status, body });
-        }
+        let resp = builder.send().await?;
 
-        // Extract the `wassup` cookie from the password response
+        let status = resp.status();
+        // Read cookies before consuming the body.
         let wassup = resp
             .cookies()
             .find(|c| c.name() == "wassup")
             .map(|c| c.value().to_string());
 
-        match wassup {
-            Some(v) => {
-                self.wassup = Some(v);
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            if matches!(status.as_u16(), 400 | 401 | 403) {
+                return Err(OperatorError::InvalidCredentials);
             }
+            return Err(OperatorError::UnexpectedResponse {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        match wassup {
+            Some(v) => self.wassup = Some(v),
             None => {
-                return Err(OperatorError::AuthFailed(
-                    "wassup cookie not received".into(),
-                ));
+                // `nextStep == "feedback"` with 200 means bad password.
+                let body3: serde_json::Value =
+                    resp.json().await.unwrap_or(serde_json::Value::Null);
+                if matches!(
+                    body3.get("nextStep").and_then(|v| v.as_str()),
+                    Some("feedback")
+                ) {
+                    return Err(OperatorError::InvalidCredentials);
+                }
+                return Err(OperatorError::AuthFailed("wassup cookie not received".into()));
             }
         }
 
-        // Immediately fetch the tv_token
+        // Immediately fetch the tv_token while the session is fresh.
         self.ensure_tv_token().await?;
 
         Ok(())
