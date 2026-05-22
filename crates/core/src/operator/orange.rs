@@ -470,17 +470,16 @@ impl Operator for OrangeOperator {
                         .to_string();
                     tracing::info!("Orange: selecting account {:?}", login);
 
-                    // POST /api/login to select the account (same endpoint as normal login).
+                    // POST /api/login with the account object the server sent us.
+                    // The SPA posts the whole account entry back; server uses the `api`
+                    // field to know this comes from the remoteAccounts list.
                     let builder = self
                         .client
                         .post(format!("{}/api/login", login_base))
                         .header("Origin", &login_base)
                         .header("Referer", &referer)
                         .header("Accept", "application/json, text/plain, */*")
-                        .json(&serde_json::json!({
-                            "login": login,
-                            "loginOrigin": "list"
-                        }));
+                        .json(first);
                     let login_resp = match self.with_xsrf(builder).send().await {
                         Ok(r) => r,
                         Err(e) => {
