@@ -369,11 +369,14 @@ impl Operator for OrangeOperator {
         let login_base = self.login_base.clone();
         let referer = format!("{}/", login_base);
 
-        // Choose endpoint and body based on which push variant was detected.
-        let (poll_url, poll_body) = if let Some(ref id) = self.authn_tracking_id {
+        // Choose endpoint based on which push variant was detected.
+        // authnByApp: re-poll /api/access — the SPA keeps calling the same endpoint
+        //   until nextStep changes from "authnByApp" to something else (approval or error).
+        // Legacy push: poll /api/push.
+        let (poll_url, poll_body) = if self.authn_tracking_id.is_some() {
             (
-                format!("{}/api/authnByApp", login_base),
-                serde_json::json!({ "idTracking": id }),
+                format!("{}/api/access", login_base),
+                serde_json::json!({}),
             )
         } else {
             (
@@ -438,8 +441,10 @@ impl Operator for OrangeOperator {
                         &body_text[..body_text.len().min(300)]
                     )));
                 }
-                // "authnByApp" or "push" — still waiting; keep polling
-                _ => {}
+                // "authnByApp" / "push" / unknown — still pending; keep polling
+                other => {
+                    tracing::debug!("push poll {}: still waiting (nextStep={:?})", attempt + 1, other);
+                }
             }
         }
 
