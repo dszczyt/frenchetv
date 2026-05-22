@@ -95,13 +95,12 @@ impl OrangeOperator {
             return Ok(());
         }
 
-        let wassup = self.wassup.as_deref().unwrap_or("").to_string();
-
-        let resp = self.client
-            .get(&self.homepage_url)
-            .header("Cookie", format!("wassup={}", wassup))
-            .send()
-            .await?;
+        // Use explicit wassup if we have it; otherwise rely on cookie_store (AOM flow).
+        let mut req = self.client.get(&self.homepage_url);
+        if let Some(w) = &self.wassup {
+            req = req.header("Cookie", format!("wassup={}", w));
+        }
+        let resp = req.send().await?;
 
         let status = resp.status();
         if !status.is_success() {
@@ -457,13 +456,24 @@ impl Operator for OrangeOperator {
             }
 
             match next_step {
-                "end" => {
+                // Authentication complete — cookie may arrive here or already be in jar.
+                "end" | "final" => {
                     if let Some(w) = wassup { self.wassup = Some(w); }
+                    tracing::info!("Orange: AOM approved (nextStep={:?}); fetching tv_token", next_step);
                     return self.ensure_tv_token().await;
                 }
                 "feedback" => {
                     return Err(OperatorError::AuthFailed(format!(
                         "push auth rejected: {}", body_text
+                    )));
+                }
+                "redirect" => {
+                    let location = body
+                        .pointer("/data/location")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(unknown)");
+                    return Err(OperatorError::AuthFailed(format!(
+                        "AOM auth redirect to error page: {}", location
                     )));
                 }
                 "remoteAccounts" => {
@@ -553,15 +563,14 @@ impl Operator for OrangeOperator {
                 return Ok(parse_m3u(FALLBACK_M3U));
             }
         };
-        let wassup = self.wassup.as_deref().unwrap_or("").to_string();
-
-        let resp = self.client
+        let mut req = self.client
             .get(&self.channels_url)
             .header("tv_token", format!("Bearer {}", tv_token))
-            .header("Cookie", format!("wassup={}", wassup))
-            .timeout(std::time::Duration::from_secs(5))
-            .send()
-            .await;
+            .timeout(std::time::Duration::from_secs(5));
+        if let Some(w) = &self.wassup {
+            req = req.header("Cookie", format!("wassup={}", w));
+        }
+        let resp = req.send().await;
 
         match resp {
             Ok(r) if r.status().is_success() => {
@@ -617,19 +626,19 @@ impl Operator for OrangeOperator {
         }
 
         let tv_token = self.tv_token.as_deref().unwrap_or("");
-        let wassup = self.wassup.as_deref().unwrap_or("");
 
         let stream_url = format!(
             "{}/{}?deviceModel=WEB_PC&customerOrangePopulation=OTT_Metro",
             self.stream_base, channel.id
         );
 
-        let resp = self.client
+        let mut req = self.client
             .get(&stream_url)
-            .header("tv_token", format!("Bearer {}", tv_token))
-            .header("Cookie", format!("wassup={}", wassup))
-            .send()
-            .await?;
+            .header("tv_token", format!("Bearer {}", tv_token));
+        if let Some(w) = &self.wassup {
+            req = req.header("Cookie", format!("wassup={}", w));
+        }
+        let resp = req.send().await?;
 
         let status = resp.status();
         if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::BAD_REQUEST
