@@ -174,8 +174,8 @@ impl Operator for OrangeOperator {
         let login_base = self.login_base.clone();
         let referer = format!("{}/", login_base);
 
-        // Step 0 — Seed session cookies by visiting the login page.
-        let _ = self
+        // Step 0 — Seed session cookies; SPAs typically set XSRF-TOKEN here.
+        if let Ok(r) = self
             .client
             .get(&referer)
             .header(
@@ -183,42 +183,51 @@ impl Operator for OrangeOperator {
                 "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
             )
             .send()
-            .await;
+            .await
+        {
+            if let Some(c) = r.cookies().find(|c| c.name().eq_ignore_ascii_case("xsrf-token")) {
+                self.xsrf_token = Some(c.value().to_string());
+                tracing::debug!("Orange: XSRF captured from step 0 (len={})", c.value().len());
+            }
+        }
 
-        // Step 1 — POST /api/access
-        let resp = self
+        // Step 1 — POST /api/access (send XSRF if we have it; capture any rotation).
+        let builder = self
             .client
             .post(format!("{}/api/access", login_base))
             .header("Origin", &login_base)
             .header("Referer", &referer)
             .header("Accept", "application/json, text/plain, */*")
-            .json(&serde_json::json!({}))
-            .send()
-            .await?;
+            .json(&serde_json::json!({}));
+        let resp = self.with_xsrf(builder).send().await?;
 
-        // Capture XSRF-TOKEN before consuming the body (double-submit cookie pattern).
-        self.xsrf_token = resp
-            .cookies()
-            .find(|c| c.name().eq_ignore_ascii_case("xsrf-token"))
-            .map(|c| c.value().to_string());
+        // Update XSRF-TOKEN if the server rotated it.
+        if let Some(c) = resp.cookies().find(|c| c.name().eq_ignore_ascii_case("xsrf-token")) {
+            self.xsrf_token = Some(c.value().to_string());
+            tracing::debug!("Orange: XSRF updated from step 1 (len={})", c.value().len());
+        }
 
         let status = resp.status();
+        let body1_text = resp.text().await.unwrap_or_default();
+        tracing::debug!("Orange /api/access: {} — {:.200}", status, body1_text);
+
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(OperatorError::UnexpectedResponse {
                 status: status.as_u16(),
-                body,
+                body: body1_text,
             });
         }
 
-        let body1: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
+        let body1: serde_json::Value =
+            serde_json::from_str(&body1_text).unwrap_or(serde_json::Value::Null);
         if matches!(
             body1.get("nextStep").and_then(|v| v.as_str()),
             Some("feedback")
         ) {
-            return Err(OperatorError::AuthFailed(
-                "orange.fr rejected /api/access (CSRF or bot-check failed)".into(),
-            ));
+            return Err(OperatorError::AuthFailed(format!(
+                "orange.fr rejected /api/access: {}",
+                &body1_text[..body1_text.len().min(300)]
+            )));
         }
 
         // Step 2 — POST /api/login
@@ -235,21 +244,28 @@ impl Operator for OrangeOperator {
         let resp = self.with_xsrf(builder).send().await?;
 
         let status = resp.status();
+        let body2_text = resp.text().await.unwrap_or_default();
+        tracing::debug!("Orange /api/login: {} — {:.300}", status, body2_text);
+
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            if matches!(status.as_u16(), 400 | 401 | 403) {
-                return Err(OperatorError::InvalidCredentials);
-            }
-            return Err(OperatorError::UnexpectedResponse {
-                status: status.as_u16(),
-                body,
-            });
+            return Err(OperatorError::AuthFailed(format!(
+                "login rejected (HTTP {}): {}",
+                status,
+                &body2_text[..body2_text.len().min(300)]
+            )));
         }
 
-        let body2: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-        match body2.get("nextStep").and_then(|v| v.as_str()) {
-            Some("feedback") => Err(OperatorError::InvalidCredentials),
-            Some("push") | Some("push_notification") => {
+        let body2: serde_json::Value =
+            serde_json::from_str(&body2_text).unwrap_or(serde_json::Value::Null);
+        let next_step = body2.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+        tracing::info!("Orange /api/login nextStep={:?}", next_step);
+
+        match next_step {
+            "feedback" => Err(OperatorError::AuthFailed(format!(
+                "account not recognized: {}",
+                &body2_text[..body2_text.len().min(300)]
+            ))),
+            "push" | "push_notification" => {
                 tracing::info!("Orange: push auth required; waiting for mobile approval");
                 Ok(AuthPhase::Push)
             }
@@ -283,27 +299,34 @@ impl Operator for OrangeOperator {
 
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
-            if matches!(status.as_u16(), 400 | 401 | 403) {
-                return Err(OperatorError::InvalidCredentials);
-            }
-            return Err(OperatorError::UnexpectedResponse {
-                status: status.as_u16(),
-                body,
-            });
+            tracing::debug!("Orange /api/password: {} — {:.300}", status, body);
+            return Err(OperatorError::AuthFailed(format!(
+                "password rejected (HTTP {}): {}",
+                status,
+                &body[..body.len().min(300)]
+            )));
         }
 
         match wassup {
             Some(v) => self.wassup = Some(v),
             None => {
+                let body3_text = resp.text().await.unwrap_or_default();
+                tracing::debug!("Orange /api/password no wassup: {:.300}", body3_text);
                 let body3: serde_json::Value =
-                    resp.json().await.unwrap_or(serde_json::Value::Null);
-                if matches!(
-                    body3.get("nextStep").and_then(|v| v.as_str()),
-                    Some("feedback")
-                ) {
-                    return Err(OperatorError::InvalidCredentials);
+                    serde_json::from_str(&body3_text).unwrap_or(serde_json::Value::Null);
+                let next = body3.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+                tracing::info!("Orange /api/password nextStep={:?} (no wassup cookie)", next);
+                if next == "feedback" {
+                    return Err(OperatorError::AuthFailed(format!(
+                        "password rejected: {}",
+                        &body3_text[..body3_text.len().min(300)]
+                    )));
                 }
-                return Err(OperatorError::AuthFailed("wassup cookie not received".into()));
+                return Err(OperatorError::AuthFailed(format!(
+                    "wassup cookie not received (nextStep={:?}): {}",
+                    next,
+                    &body3_text[..body3_text.len().min(200)]
+                )));
             }
         }
 
@@ -634,7 +657,12 @@ mod tests {
             .authenticate("bad@example.com", "wrong")
             .await
             .unwrap_err();
-        assert!(matches!(err, OperatorError::InvalidCredentials));
+        // 401 from /api/login maps to AuthFailed with the HTTP status in the message.
+        assert!(
+            matches!(&err, OperatorError::AuthFailed(msg) if msg.contains("401")),
+            "expected AuthFailed(401 ...), got {:?}",
+            err
+        );
     }
 
     // ---------------------------------------------------------------------------
