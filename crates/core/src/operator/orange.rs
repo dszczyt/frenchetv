@@ -15,6 +15,12 @@ const FALLBACK_M3U: &str = include_str!("../../../../assets/channels/orange.m3u"
 /// Placeholder URL used for channels fetched from the live API (stream resolved separately).
 const PLACEHOLDER_URL: &str = "https://placeholder.invalid/";
 
+/// Orange mediation API base for Widevine license requests.
+/// Relative `laUrl` values from `protectionData` are appended directly to this.
+/// (plugin.video.orange.fr: `_LICENSE_ENDPOINT + system.get("laUrl")`)
+const LICENSE_ENDPOINT: &str =
+    "https://mediation-tv.orange.fr/all/api-gw/license/v1/auth/accountToken";
+
 pub struct OrangeOperator {
     client: reqwest::Client,
     login_base: String,
@@ -840,7 +846,7 @@ impl Operator for OrangeOperator {
 fn extract_widevine_protection(
     json: &serde_json::Value,
     tv_token: &str,
-    mpd_url: &str,
+    _mpd_url: &str,
     wassup: &str,
 ) -> Option<ProtectionData> {
     use base64::engine::Engine as _;
@@ -857,18 +863,12 @@ fn extract_widevine_protection(
             .or_else(|| entry.get("laUrl").and_then(|v| v.as_str()))?;
 
         // Resolve relative URLs (e.g. "/widevine/license?...") against the
-        // MPD URL's origin — the license server lives on the same CDN host as the MPD.
+        // Orange mediation license endpoint (not the MPD CDN host).
+        // per plugin.video.orange.fr: full_url = LICENSE_ENDPOINT + laUrl
         let la_url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
             raw_url.to_string()
         } else {
-            // Extract scheme://host from the MPD URL then append the relative path.
-            let origin = mpd_url
-                .trim_end_matches('/')
-                .splitn(4, '/')   // ["https:", "", "host", "path..."]
-                .take(3)
-                .collect::<Vec<_>>()
-                .join("/");
-            format!("{}{}", origin, raw_url)
+            format!("{}{}", LICENSE_ENDPOINT, raw_url)
         };
 
         tracing::info!("widevine: resolved la_url = {}", la_url);

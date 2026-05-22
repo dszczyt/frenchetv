@@ -114,39 +114,52 @@ pub fn build_pssh_from_kid(kid: &[u8; 16]) -> Vec<u8> {
     out
 }
 
-/// Send the Widevine challenge to a license endpoint.
+/// POST the Widevine challenge to the license server and return the raw license response.
 ///
-/// Orange's CDN exposes a GET-only license endpoint.  The Widevine challenge
-/// (binary protobuf) is base64url-encoded (no padding) and appended as the
-/// `body` query parameter, matching the pattern used by many EME proxies.
+/// Orange's mediation API (`mediation-tv.orange.fr/all/api-gw/license/v1/...`) accepts
+/// standard POST with `Content-Type: application/octet-stream` and raw binary challenge.
+/// Auth is via `tv_token: Bearer <token>` and `Cookie: wassup=<value>` headers.
 ///
-/// If the CDN returns JSON, we try to extract the `license` / `data` /
-/// `rawLicenseResponse` field (also base64url-decoded) before feeding it to
-/// the CDM.  Raw binary responses are used directly.
+/// If the server returns JSON, we attempt to extract a base64-encoded license from
+/// well-known field names before falling back to the raw bytes.
 async fn send_challenge(
     client: &reqwest::Client,
     la_url: &str,
     challenge: &[u8],
     license_headers: &[(String, String)],
 ) -> Result<Vec<u8>> {
-    // Encode challenge as base64url without padding.
-    let challenge_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge);
+    tracing::debug!("widevine: POST license to {}", la_url);
 
-    // Append to URL as `body=` parameter (common Orange/OTT pattern).
-    let url_with_challenge = if la_url.contains('?') {
-        format!("{}&body={}", la_url, challenge_b64)
-    } else {
-        format!("{}?body={}", la_url, challenge_b64)
-    };
+    let mut req = client
+        .post(la_url)
+        .header("Content-Type", "application/octet-stream")
+        .body(challenge.to_vec());
 
-    tracing::debug!("widevine: GET license URL length={}", url_with_challenge.len());
-
-    let mut req = client.get(&url_with_challenge);
     for (name, value) in license_headers {
         req = req.header(name.as_str(), value.as_str());
     }
 
-    let resp = req.send().await.context("license GET")?;
+    let resp = req.send().await.context("license POST")?;
+
+    // Follow redirect while preserving POST (reqwest converts POST→GET on 302).
+    let resp = if resp.status().is_redirection() {
+        if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
+            let redirect_url = loc.to_str().unwrap_or("").to_string();
+            tracing::info!("widevine: license redirect → {}", redirect_url);
+            let mut req2 = client
+                .post(&redirect_url)
+                .header("Content-Type", "application/octet-stream")
+                .body(challenge.to_vec());
+            for (name, value) in license_headers {
+                req2 = req2.header(name.as_str(), value.as_str());
+            }
+            req2.send().await.context("license POST (after redirect)")?
+        } else {
+            resp
+        }
+    } else {
+        resp
+    };
 
     if !resp.status().is_success() {
         let status = resp.status();
@@ -167,7 +180,7 @@ async fn send_challenge(
     let raw = resp.bytes().await.context("license response body")?.to_vec();
     tracing::info!("widevine: license response {} bytes (content-type: {})", raw.len(), content_type);
 
-    // If response is JSON, extract the nested license bytes.
+    // If JSON, try to extract base64-encoded license from known field names.
     if content_type.contains("json") || raw.first() == Some(&b'{') {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&raw) {
             for field in &["license", "data", "rawLicenseResponse", "licenseResponse"] {
@@ -175,7 +188,7 @@ async fn send_challenge(
                     if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64)
                         .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64))
                     {
-                        tracing::debug!("widevine: extracted license from JSON field '{}'", field);
+                        tracing::debug!("widevine: license from JSON field '{}'", field);
                         return Ok(decoded);
                     }
                 }
