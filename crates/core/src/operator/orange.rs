@@ -27,8 +27,11 @@ pub struct OrangeOperator {
     pub(crate) tv_token: Option<String>,
     /// When the current `tv_token` expires (25 min after extraction).
     tv_token_expires: Option<std::time::Instant>,
-    /// XSRF token captured from `/api/access`; forwarded to subsequent steps.
+    /// XSRF token captured from step-0 GET or `/api/access`; forwarded via X-XSRF-TOKEN.
     xsrf_token: Option<String>,
+    /// Tracking ID returned when `/api/access` responds with `authnByApp`.
+    /// Used to poll `POST /api/authnByApp` until the user approves on their phone.
+    authn_tracking_id: Option<String>,
 }
 
 impl OrangeOperator {
@@ -63,6 +66,7 @@ impl OrangeOperator {
             tv_token: None,
             tv_token_expires: None,
             xsrf_token: None,
+            authn_tracking_id: None,
         }
     }
 
@@ -220,17 +224,35 @@ impl Operator for OrangeOperator {
 
         let body1: serde_json::Value =
             serde_json::from_str(&body1_text).unwrap_or(serde_json::Value::Null);
-        if matches!(
-            body1.get("nextStep").and_then(|v| v.as_str()),
-            Some("feedback")
-        ) {
-            return Err(OperatorError::AuthFailed(format!(
-                "orange.fr rejected /api/access: {}",
-                &body1_text[..body1_text.len().min(300)]
-            )));
+        let access_next = body1.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+        tracing::info!("Orange /api/access nextStep={:?}", access_next);
+
+        match access_next {
+            "feedback" => {
+                return Err(OperatorError::AuthFailed(format!(
+                    "orange.fr rejected /api/access: {}",
+                    &body1_text[..body1_text.len().min(300)]
+                )));
+            }
+            "authnByApp" => {
+                // Orange already sent a push to the mobile app.
+                // Extract the tracking ID so the poll loop can call /api/authnByApp.
+                let tracking_id = body1
+                    .pointer("/data/authnByAppScreen/idTracking")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                tracing::info!(
+                    "Orange: authnByApp push sent (idTracking={:?}); waiting for approval",
+                    tracking_id
+                );
+                self.authn_tracking_id = Some(tracking_id);
+                return Ok(AuthPhase::Push);
+            }
+            _ => {} // continue to /api/login
         }
 
-        // Step 2 — POST /api/login
+        // Step 2 — POST /api/login (only reached when /api/access does NOT return authnByApp)
         let builder = self
             .client
             .post(format!("{}/api/login", login_base))
@@ -266,7 +288,7 @@ impl Operator for OrangeOperator {
                 &body2_text[..body2_text.len().min(300)]
             ))),
             "push" | "push_notification" => {
-                tracing::info!("Orange: push auth required; waiting for mobile approval");
+                tracing::info!("Orange: push auth required after login; waiting for approval");
                 Ok(AuthPhase::Push)
             }
             _ => Ok(AuthPhase::Password),
@@ -333,12 +355,11 @@ impl Operator for OrangeOperator {
         self.ensure_tv_token().await
     }
 
-    /// Phase 2b: poll `POST /api/push` every 3 s until Orange signals approval
-    /// (`nextStep == "end"`) or the 90-second window expires.
+    /// Phase 2b: poll until Orange signals push approval, then fetch tv_token.
     ///
-    /// The exact polling endpoint is inferred from the `/api/*` pattern used by the
-    /// Orange login SPA. If Orange uses a different path the debug log will show what
-    /// the server actually returns, making the adjustment straightforward.
+    /// Two polling modes:
+    ///  - `authnByApp` flow: POST `/api/authnByApp` with `{"idTracking": "…"}`
+    ///  - Legacy push flow: POST `/api/push` with `{}`
     async fn wait_for_push_auth(&mut self) -> Result<()> {
         use std::time::Duration;
 
@@ -348,20 +369,34 @@ impl Operator for OrangeOperator {
         let login_base = self.login_base.clone();
         let referer = format!("{}/", login_base);
 
+        // Choose endpoint and body based on which push variant was detected.
+        let (poll_url, poll_body) = if let Some(ref id) = self.authn_tracking_id {
+            (
+                format!("{}/api/authnByApp", login_base),
+                serde_json::json!({ "idTracking": id }),
+            )
+        } else {
+            (
+                format!("{}/api/push", login_base),
+                serde_json::json!({}),
+            )
+        };
+        tracing::info!("Orange: polling {}", poll_url);
+
         for attempt in 0..MAX_ATTEMPTS {
             tokio::time::sleep(POLL_INTERVAL).await;
 
             let builder = self
                 .client
-                .post(format!("{}/api/push", login_base))
+                .post(&poll_url)
                 .header("Origin", &login_base)
                 .header("Referer", &referer)
                 .header("Accept", "application/json, text/plain, */*")
-                .json(&serde_json::json!({}));
+                .json(&poll_body);
             let resp = match self.with_xsrf(builder).send().await {
                 Ok(r) => r,
                 Err(e) => {
-                    tracing::warn!("push poll attempt {}: network error: {}", attempt + 1, e);
+                    tracing::warn!("push poll {}: network error: {}", attempt + 1, e);
                     continue;
                 }
             };
@@ -372,20 +407,23 @@ impl Operator for OrangeOperator {
                 .find(|c| c.name() == "wassup")
                 .map(|c| c.value().to_string());
 
+            let body_text = resp.text().await.unwrap_or_default();
+            tracing::debug!(
+                "push poll {}: {} — {:.300}",
+                attempt + 1,
+                status,
+                body_text
+            );
+
             if !status.is_success() {
-                let body = resp.text().await.unwrap_or_default();
-                tracing::debug!(
-                    "push poll attempt {}: HTTP {} — {}",
-                    attempt + 1,
-                    status,
-                    body
-                );
+                // Non-2xx — log and keep polling (transient errors are common)
                 continue;
             }
 
-            let body: serde_json::Value = resp.json().await.unwrap_or(serde_json::Value::Null);
-            let next_step = body.get("nextStep").and_then(|v| v.as_str()).unwrap_or("");
-            tracing::debug!("push poll attempt {}: nextStep={:?}", attempt + 1, next_step);
+            let body: serde_json::Value =
+                serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
+            let next_step = body.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+            tracing::info!("push poll {}: nextStep={:?}", attempt + 1, next_step);
 
             match next_step {
                 "end" => {
@@ -395,13 +433,13 @@ impl Operator for OrangeOperator {
                     return self.ensure_tv_token().await;
                 }
                 "feedback" => {
-                    return Err(OperatorError::AuthFailed(
-                        "push notification was rejected or expired".into(),
-                    ));
+                    return Err(OperatorError::AuthFailed(format!(
+                        "push auth rejected: {}",
+                        &body_text[..body_text.len().min(300)]
+                    )));
                 }
-                _ => {
-                    // "push" or unknown — still pending, keep polling
-                }
+                // "authnByApp" or "push" — still waiting; keep polling
+                _ => {}
             }
         }
 
