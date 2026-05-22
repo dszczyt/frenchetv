@@ -811,7 +811,9 @@ impl Operator for OrangeOperator {
 
         // Extract Widevine DRM parameters from protectionData array if present.
         // Orange returns: [{"keySystem":"com.widevine.alpha","licenseServerURL":"...","initData":"base64..."}]
-        stream.protection = extract_widevine_protection(&json, &tv_token, &self.stream_base);
+        stream.protection = extract_widevine_protection(
+            &json, &tv_token, &self.stream_base, self.wassup.as_deref().unwrap_or(""),
+        );
         Ok(stream)
     }
 
@@ -837,6 +839,7 @@ fn extract_widevine_protection(
     json: &serde_json::Value,
     tv_token: &str,
     stream_base: &str,
+    wassup: &str,
 ) -> Option<ProtectionData> {
     use base64::engine::Engine as _;
 
@@ -876,11 +879,17 @@ fn extract_widevine_protection(
                     .ok()
             });
 
-        // Pass tv_token as a license request header so the license server
-        // can validate the subscriber's entitlement.
+        // License request headers — same origin as the stream API calls.
         let mut license_headers = Vec::new();
+        license_headers.push(("Origin".to_string(),     "https://tv.orange.fr".to_string()));
+        license_headers.push(("Referer".to_string(),    "https://tv.orange.fr/".to_string()));
+        license_headers.push(("User-Agent".to_string(),
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36".to_string()));
         if !tv_token.is_empty() {
             license_headers.push(("tv_token".to_string(), format!("Bearer {}", tv_token)));
+        }
+        if !wassup.is_empty() {
+            license_headers.push(("Cookie".to_string(), format!("wassup={}", wassup)));
         }
 
         return Some(ProtectionData { la_url, pssh, license_headers });
