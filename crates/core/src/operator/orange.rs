@@ -122,10 +122,14 @@ impl OrangeOperator {
     }
 
     /// Attempt to trigger the Orange push notification.
-    /// Orange uses `"api":"triggerABA"` as the action key; the actual HTTP path
-    /// is NOT `/api/triggerABA` (that returns 404).  Try two candidates in order:
-    ///   1. `POST {login_base}/triggerABA`  (no /api/ prefix)
-    ///   2. `POST {login_base}/api/access`  with the submitField object as body
+    ///
+    /// Orange uses `"api":"triggerABA"` in submitField.  The actual HTTP path is
+    /// `/triggerABA` (no `/api/` prefix).  POST returns 405 from nginx, so the
+    /// route exists but only accepts GET.  We try four candidates in order:
+    ///   1. `GET  {login_base}/triggerABA`              (likely correct)
+    ///   2. `GET  {login_base}/triggerABA?idTracking=…` (with tracking id)
+    ///   3. `POST {login_base}/triggerABA` + idTracking body
+    ///   4. `POST {login_base}/api/access` + submitField body  (last resort)
     async fn try_trigger_aba(
         &self,
         login_base: &str,
@@ -137,34 +141,91 @@ impl OrangeOperator {
             .cloned()
             .unwrap_or(serde_json::json!({}));
 
-        // Candidate 1: /triggerABA (no /api prefix)
+        let tracking_id = self
+            .authn_tracking_id
+            .as_deref()
+            .unwrap_or("");
+
+        // Candidate 1: GET /triggerABA (nginx rejected POST with 405 → route exists, try GET)
         let url1 = format!("{}/triggerABA", login_base);
-        tracing::info!("Orange: trying push trigger at {}", url1);
+        tracing::info!("Orange: trying push trigger GET {}", url1);
         let builder = self
             .client
-            .post(&url1)
+            .get(&url1)
             .header("Origin", login_base)
             .header("Referer", referer)
-            .header("Accept", "application/json, text/plain, */*")
-            .json(&serde_json::json!({}));
+            .header("Accept", "application/json, text/plain, */*");
         match self.with_xsrf(builder).send().await {
             Ok(r) => {
                 let s = r.status();
                 let b = r.text().await.unwrap_or_default();
-                tracing::info!("Orange {}: {} — {}", url1, s, b);
+                tracing::info!("Orange GET {}: {} — {:.200}", url1, s, b);
                 if s.is_success() {
-                    return; // worked
+                    tracing::info!("Orange: push trigger succeeded (GET /triggerABA)");
+                    return;
                 }
             }
-            Err(e) => tracing::warn!("Orange {}: {}", url1, e),
+            Err(e) => tracing::warn!("Orange GET {}: {}", url1, e),
         }
 
-        // Candidate 2: POST /api/access with the submitField as body
-        let url2 = format!("{}/api/access", login_base);
-        tracing::info!("Orange: trying push trigger at {} (submitField body)", url2);
+        // Candidate 2: GET /triggerABA?idTracking=… (session may need tracking id)
+        if !tracking_id.is_empty() {
+            let url2 = format!("{}/triggerABA?idTracking={}", login_base, tracking_id);
+            tracing::info!("Orange: trying push trigger GET {}", url2);
+            let builder = self
+                .client
+                .get(&url2)
+                .header("Origin", login_base)
+                .header("Referer", referer)
+                .header("Accept", "application/json, text/plain, */*");
+            match self.with_xsrf(builder).send().await {
+                Ok(r) => {
+                    let s = r.status();
+                    let b = r.text().await.unwrap_or_default();
+                    tracing::info!("Orange GET {} (idTracking): {} — {:.200}", url2, s, b);
+                    if s.is_success() {
+                        tracing::info!("Orange: push trigger succeeded (GET /triggerABA?idTracking)");
+                        return;
+                    }
+                }
+                Err(e) => tracing::warn!("Orange GET {} (idTracking): {}", url2, e),
+            }
+        }
+
+        // Candidate 3: POST /triggerABA with idTracking body (maybe empty {} was wrong)
+        let url3 = format!("{}/triggerABA", login_base);
+        tracing::info!("Orange: trying push trigger POST {} + idTracking body", url3);
+        let body3 = if tracking_id.is_empty() {
+            serde_json::json!({})
+        } else {
+            serde_json::json!({ "idTracking": tracking_id })
+        };
         let builder = self
             .client
-            .post(&url2)
+            .post(&url3)
+            .header("Origin", login_base)
+            .header("Referer", referer)
+            .header("Accept", "application/json, text/plain, */*")
+            .json(&body3);
+        match self.with_xsrf(builder).send().await {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.text().await.unwrap_or_default();
+                tracing::info!("Orange POST {} (idTracking body): {} — {:.200}", url3, s, b);
+                if s.is_success() {
+                    tracing::info!("Orange: push trigger succeeded (POST /triggerABA + body)");
+                    return;
+                }
+            }
+            Err(e) => tracing::warn!("Orange POST {} (body): {}", url3, e),
+        }
+
+        // Candidate 4: POST /api/access with the submitField as body (last resort)
+        let url4 = format!("{}/api/access", login_base);
+        tracing::info!("Orange: trying push trigger POST {} (submitField body)", url4);
+        let builder = self
+            .client
+            .post(&url4)
             .header("Origin", login_base)
             .header("Referer", referer)
             .header("Accept", "application/json, text/plain, */*")
@@ -173,9 +234,9 @@ impl OrangeOperator {
             Ok(r) => {
                 let s = r.status();
                 let b = r.text().await.unwrap_or_default();
-                tracing::info!("Orange {} (triggerABA body): {} — {:.200}", url2, s, b);
+                tracing::info!("Orange POST {} (submitField): {} — {:.200}", url4, s, b);
             }
-            Err(e) => tracing::warn!("Orange {} trigger: {}", url2, e),
+            Err(e) => tracing::warn!("Orange POST {} (submitField): {}", url4, e),
         }
     }
 
