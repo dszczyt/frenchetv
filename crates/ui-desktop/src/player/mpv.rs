@@ -32,16 +32,25 @@ impl MpvPlayer {
             cmd.arg(format!("--http-header-fields=Authorization: {}", header));
         }
 
-        // Extra headers forwarded to FFmpeg's lavf DASH demuxer.
-        // Format: "Key: Value\r\nKey: Value\r\n"  (literal backslash-r-n;
-        // FFmpeg interprets the two-char sequence as CRLF between headers).
-        if !extra_headers.is_empty() {
-            let joined = extra_headers
-                .iter()
-                .map(|(k, v)| format!("{}: {}", k, v))
-                .collect::<Vec<_>>()
-                .join("\\r\\n");
-            cmd.arg(format!("--stream-lavf-o=headers={}\\r\\n", joined));
+        // Extra headers.  mpv's --stream-lavf-o key-value parser splits on
+        // spaces, so we can't use it for headers with URL values.  Instead:
+        //   Referer   → --referrer=<url>
+        //   User-Agent→ --user-agent=<ua>
+        //   anything else → --http-header-fields=Name: value
+        // --http-header-fields is a string-list (not key-value list), so
+        // spaces in the value are fine.
+        for (name, value) in extra_headers {
+            match name.to_lowercase().as_str() {
+                "referer" | "referrer" => {
+                    cmd.arg(format!("--referrer={}", value));
+                }
+                "user-agent" => {
+                    cmd.arg(format!("--user-agent={}", value));
+                }
+                _ => {
+                    cmd.arg(format!("--http-header-fields={}: {}", name, value));
+                }
+            }
         }
 
         // If the Widevine CDM was downloaded, point mpv at it.
