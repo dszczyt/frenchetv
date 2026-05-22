@@ -387,6 +387,9 @@ impl Operator for OrangeOperator {
         };
         tracing::info!("Orange: polling {}", poll_url);
 
+        // Guard: only trigger the push once even if remoteAccounts appears again.
+        let mut trigger_sent = false;
+
         for attempt in 0..MAX_ATTEMPTS {
             tokio::time::sleep(POLL_INTERVAL).await;
 
@@ -506,7 +509,6 @@ impl Operator for OrangeOperator {
 
                     match login_next {
                         "password" => {
-                            // Need to submit the password now.
                             return self.complete_auth_password(password).await;
                         }
                         "end" => {
@@ -517,6 +519,51 @@ impl Operator for OrangeOperator {
                                 "account selection rejected: {}",
                                 login_body
                             )));
+                        }
+                        "authnByApp" if !trigger_sent => {
+                            // /api/login returned authnByApp with submitField.api="triggerABA".
+                            // Call that endpoint to ACTUALLY send the push notification.
+                            let trigger_api = login_json
+                                .pointer("/data/authnByAppScreen/submitField/api")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("");
+
+                            if trigger_api == "triggerABA" {
+                                tracing::info!(
+                                    "Orange: sending push via /api/triggerABA"
+                                );
+                                let builder = self
+                                    .client
+                                    .post(format!("{}/api/triggerABA", login_base))
+                                    .header("Origin", &login_base)
+                                    .header("Referer", &referer)
+                                    .header("Accept", "application/json, text/plain, */*")
+                                    .json(&serde_json::json!({}));
+                                match self.with_xsrf(builder).send().await {
+                                    Ok(r) => {
+                                        let s = r.status();
+                                        let b = r.text().await.unwrap_or_default();
+                                        tracing::info!(
+                                            "Orange /api/triggerABA: {} — {}",
+                                            s,
+                                            b
+                                        );
+                                        trigger_sent = true;
+                                    }
+                                    Err(e) => {
+                                        tracing::warn!(
+                                            "Orange /api/triggerABA error: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            } else {
+                                tracing::warn!(
+                                    "Orange: unexpected submitField.api={:?}",
+                                    trigger_api
+                                );
+                            }
+                            // Keep polling — user needs to approve on phone.
                         }
                         _ => {
                             tracing::warn!(
