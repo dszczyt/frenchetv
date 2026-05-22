@@ -809,11 +809,16 @@ impl Operator for OrangeOperator {
             OperatorError::ParseChannels(format!("invalid stream URL '{}': {}", url_str, e))
         })?;
 
-        // Orange's CDN requires Origin/Referer on every segment request.
+        // Orange's CDN validates segment requests via session cookie + CORS headers.
         let mut stream = StreamUrl::direct(parsed)
             .with_header("Origin",     "https://tv.orange.fr")
             .with_header("Referer",    "https://tv.orange.fr/")
             .with_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
+
+        // Pass the session cookie so the CDN can authenticate the signed URL.
+        if let Some(ref wassup) = self.wassup {
+            stream = stream.with_header("Cookie", &format!("wassup={}", wassup));
+        }
 
         // Extract Widevine DRM parameters from protectionData array if present.
         // Orange returns: [{"keySystem":"com.widevine.alpha","licenseServerURL":"...","initData":"base64..."}]
