@@ -114,9 +114,81 @@ pub fn build_pssh_from_kid(kid: &[u8; 16]) -> Vec<u8> {
     out
 }
 
+/// Send the Widevine challenge to a license endpoint.
+///
+/// Orange's CDN exposes a GET-only license endpoint.  The Widevine challenge
+/// (binary protobuf) is base64url-encoded (no padding) and appended as the
+/// `body` query parameter, matching the pattern used by many EME proxies.
+///
+/// If the CDN returns JSON, we try to extract the `license` / `data` /
+/// `rawLicenseResponse` field (also base64url-decoded) before feeding it to
+/// the CDM.  Raw binary responses are used directly.
+async fn send_challenge(
+    client: &reqwest::Client,
+    la_url: &str,
+    challenge: &[u8],
+    license_headers: &[(String, String)],
+) -> Result<Vec<u8>> {
+    // Encode challenge as base64url without padding.
+    let challenge_b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(challenge);
+
+    // Append to URL as `body=` parameter (common Orange/OTT pattern).
+    let url_with_challenge = if la_url.contains('?') {
+        format!("{}&body={}", la_url, challenge_b64)
+    } else {
+        format!("{}?body={}", la_url, challenge_b64)
+    };
+
+    tracing::debug!("widevine: GET license URL length={}", url_with_challenge.len());
+
+    let mut req = client.get(&url_with_challenge);
+    for (name, value) in license_headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+
+    let resp = req.send().await.context("license GET")?;
+
+    if !resp.status().is_success() {
+        let status = resp.status();
+        for (k, v) in resp.headers() {
+            tracing::debug!("widevine: license error header: {}: {}", k, v.to_str().unwrap_or("?"));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        bail!("license server returned {}: {}", status, body);
+    }
+
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
+    let raw = resp.bytes().await.context("license response body")?.to_vec();
+    tracing::info!("widevine: license response {} bytes (content-type: {})", raw.len(), content_type);
+
+    // If response is JSON, extract the nested license bytes.
+    if content_type.contains("json") || raw.first() == Some(&b'{') {
+        if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&raw) {
+            for field in &["license", "data", "rawLicenseResponse", "licenseResponse"] {
+                if let Some(b64) = json.get(field).and_then(|v| v.as_str()) {
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64)
+                        .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64))
+                    {
+                        tracing::debug!("widevine: extracted license from JSON field '{}'", field);
+                        return Ok(decoded);
+                    }
+                }
+            }
+        }
+    }
+
+    Ok(raw)
+}
+
 /// Perform the full license exchange:
 /// 1. CDM generates a challenge from `pssh`.
-/// 2. Challenge is POSTed to `la_url` (with `license_headers`).
+/// 2. Challenge is sent to `la_url` (Orange uses GET with base64url body param).
 /// 3. Response is fed back into the CDM.
 ///
 /// Returns the session ID.
@@ -138,62 +210,14 @@ pub async fn acquire_license(
         session_id
     );
 
-    // Step 2: POST challenge to license server.
-    // Disable reqwest's default redirect behaviour: some CDNs redirect POST
-    // requests with a 302, which reqwest would silently convert to GET,
-    // resulting in 405.  We follow redirects manually so we always POST.
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(15))
         .redirect(reqwest::redirect::Policy::none())
         .build()
         .context("reqwest client")?;
 
-    // The drmToken JWT in the URL is the primary auth credential; follow the
-    // CDN's expectations by only adding Content-Type plus whatever the caller
-    // supplies.  Orange/User-Agent/Origin/Referer headers are kept because
-    // the CDN validates them for subscriber entitlement.
-    let mut req = client
-        .post(la_url)
-        .header("Content-Type", "application/octet-stream")
-        .body(challenge.clone());
-
-    for (name, value) in license_headers {
-        req = req.header(name.as_str(), value.as_str());
-    }
-
-    let resp = req.send().await.context("license POST")?;
-
-    // Manual redirect: follow 3xx while always re-posting the challenge.
-    let resp = if resp.status().is_redirection() {
-        if let Some(loc) = resp.headers().get(reqwest::header::LOCATION) {
-            let redirect_url = loc.to_str().unwrap_or("").to_string();
-            tracing::info!("widevine: license server redirected to {}", redirect_url);
-            let mut req2 = client
-                .post(&redirect_url)
-                .header("Content-Type", "application/octet-stream")
-                .body(challenge);
-            for (name, value) in license_headers {
-                req2 = req2.header(name.as_str(), value.as_str());
-            }
-            req2.send().await.context("license POST (after redirect)")?
-        } else {
-            resp
-        }
-    } else {
-        resp
-    };
-
-    if !resp.status().is_success() {
-        let status = resp.status();
-        // Log all response headers to aid debugging.
-        for (k, v) in resp.headers() {
-            tracing::debug!("widevine: license error header: {}: {}", k, v.to_str().unwrap_or("?"));
-        }
-        let body = resp.text().await.unwrap_or_default();
-        bail!("license server returned {}: {}", status, body);
-    }
-    let license_response = resp.bytes().await.context("license response body")?;
-    tracing::info!("widevine: license response {} bytes", license_response.len());
+    // Step 2: send challenge to license server.
+    let license_response: Vec<u8> = send_challenge(&client, la_url, &challenge, license_headers).await?;
 
     // Step 3: feed response to CDM.
     {
