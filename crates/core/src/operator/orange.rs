@@ -191,7 +191,7 @@ struct OrangeChannelList {
 #[serde(rename_all = "camelCase")]
 struct OrangeChannel {
     #[serde(rename = "idEPG")]
-    id_epg: String,
+    id_epg: u32,
     name: String,
     #[serde(default)]
     display_order: Option<u32>,
@@ -639,7 +639,7 @@ impl Operator for OrangeOperator {
                             .into_iter()
                             .find_map(|l| l.url_service);
                         Channel {
-                            id: c.id_epg,
+                            id: c.id_epg.to_string(),
                             name: c.name,
                             logo_url,
                             number: c.display_order,
@@ -933,13 +933,13 @@ mod tests {
                 ResponseTemplate::new(200).set_body_json(json!({
                     "channels": [
                         {
-                            "idEPG": "TF1",
+                            "idEPG": 1,
                             "name": "TF1",
                             "displayOrder": 1,
                             "logos": [{"urlService": "https://logos.example.com/tf1.png"}]
                         },
                         {
-                            "idEPG": "BFMTV",
+                            "idEPG": 15,
                             "name": "BFM TV",
                             "displayOrder": 15
                         }
@@ -962,13 +962,13 @@ mod tests {
 
         let channels = op.fetch_channels().await.unwrap();
         assert_eq!(channels.len(), 2);
-        assert_eq!(channels[0].id, "TF1");
+        assert_eq!(channels[0].id, "1");
         assert_eq!(channels[0].number, Some(1));
         assert_eq!(
             channels[0].logo_url.as_deref(),
             Some("https://logos.example.com/tf1.png")
         );
-        assert_eq!(channels[1].id, "BFMTV");
+        assert_eq!(channels[1].id, "15");
         assert_eq!(channels[1].number, Some(15));
     }
 
