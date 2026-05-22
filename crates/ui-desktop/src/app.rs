@@ -356,18 +356,33 @@ impl App {
             for (k, v) in &stream.headers {
                 req = req.header(k.as_str(), v.as_str());
             }
-            let mpd_resp = req.send().await;
-            let mpd_text = match mpd_resp {
-                Ok(r) => match r.text().await {
-                    Ok(t) => t,
-                    Err(e) => {
-                        let _ = tx.send(AsyncMsg::DrmProxyErr(format!("MPD read failed: {}", e)));
-                        ctx.request_repaint();
-                        return;
-                    }
-                },
+            let mpd_resp = match req.send().await {
+                Ok(r) => r,
                 Err(e) => {
                     let _ = tx.send(AsyncMsg::DrmProxyErr(format!("MPD fetch failed: {}", e)));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            // Capture Set-Cookie headers from the MPD response — Broadpeak CDN may set a
+            // session cookie during the MPD fetch that must accompany segment requests.
+            let mut cdn_cookies: Vec<String> = Vec::new();
+            for value in mpd_resp.headers().get_all(reqwest::header::SET_COOKIE) {
+                if let Ok(cookie_str) = value.to_str() {
+                    // Parse "name=value; Path=/; ..." → take only "name=value"
+                    let pair = cookie_str.split(';').next().unwrap_or("").trim();
+                    if !pair.is_empty() {
+                        tracing::debug!("DRM: captured Set-Cookie from MPD response: {}", pair);
+                        cdn_cookies.push(pair.to_string());
+                    }
+                }
+            }
+
+            let mpd_text = match mpd_resp.text().await {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!("MPD read failed: {}", e)));
                     ctx.request_repaint();
                     return;
                 }
@@ -403,7 +418,18 @@ impl App {
             }
 
             // --- 4. Start proxy ---
-            let cdn_headers = stream.headers.clone();
+            // Merge stream headers with any session cookies captured from the MPD response.
+            let mut cdn_headers = stream.headers.clone();
+            if !cdn_cookies.is_empty() {
+                // Append captured cookies to any existing Cookie header (or add a new one).
+                let new_cookies = cdn_cookies.join("; ");
+                if let Some(pos) = cdn_headers.iter().position(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+                    cdn_headers[pos].1 = format!("{}; {}", cdn_headers[pos].1, new_cookies);
+                } else {
+                    cdn_headers.push(("Cookie".to_string(), new_cookies));
+                }
+                tracing::debug!("DRM: forwarding {} cookie(s) to proxy CDN requests", cdn_cookies.len());
+            }
             let drm_proxy = match proxy::start(cdm, mpd_text, mpd_url, cdn_headers).await {
                 Ok(p) => p,
                 Err(e) => {

@@ -158,17 +158,21 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     let real_url = cdn_path_to_url(cdn_path)?;
     tracing::debug!("DRM proxy → {}", real_url);
 
-    // Orange's CDN uses signed URLs (token embedded in path).  Sending
-    // Origin/Referer/Cookie headers triggers CDN CORS rules and returns 400;
-    // Kodi's inputstream.adaptive fetches segments with no extra headers.
-    // Only forward a browser-like User-Agent so the CDN recognises the request.
+    // Orange's CDN uses Broadpeak signed URLs (token embedded in path).
+    // Sending Origin/Referer headers from the browser triggers CDN CORS validation
+    // against the signature and returns 400.  We send only User-Agent (for browser
+    // recognition) plus any session Cookie captured from the MPD response — Broadpeak
+    // may use cookies for session continuity in addition to the signed URL token.
     let user_agent = state.cdn_headers.iter()
         .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
         .map(|(_, v)| v.as_str())
         .unwrap_or("Mozilla/5.0");
-    let resp = state.client.get(&real_url)
-        .header("User-Agent", user_agent)
-        .send().await.context("CDN fetch")?;
+    let mut req = state.client.get(&real_url).header("User-Agent", user_agent);
+    if let Some((_, cookie)) = state.cdn_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
+        tracing::debug!("DRM proxy CDN request: forwarding Cookie header");
+        req = req.header("Cookie", cookie.as_str());
+    }
+    let resp = req.send().await.context("CDN fetch")?;
     if !resp.status().is_success() {
         let status = resp.status();
         for (k, v) in resp.headers() {
