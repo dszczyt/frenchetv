@@ -51,6 +51,7 @@ pub async fn start(
     let port = addr.port();
 
     let rewritten_mpd = rewrite_mpd(&mpd_text, &mpd_base_url, port);
+    tracing::debug!("DRM proxy rewritten MPD (first 2000 chars):\n{}", &rewritten_mpd[..rewritten_mpd.len().min(2000)]);
 
     let state = Arc::new(ProxyState {
         cdm,
@@ -114,7 +115,11 @@ async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<
         if line == "\r\n" || line == "\n" || line.is_empty() { break; }
     }
 
+    tracing::debug!("DRM proxy request: {}", path);
     let (status, content_type, body) = dispatch(path, &state).await;
+    if status != "200 OK" {
+        tracing::warn!("DRM proxy {} → {}", path, status);
+    }
 
     let stream = reader.into_inner();
     let mut stream = tokio::io::BufWriter::new(stream);
@@ -234,16 +239,77 @@ fn cdn_path_to_url(cdn_path: &str) -> Result<String> {
 fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> String {
     let proxy_base = format!("http://127.0.0.1:{}/cdn/", proxy_port);
 
-    // Step 1: Remove ContentProtection blocks (they span multiple lines).
+    // Step 1: Remove ContentProtection blocks.
     let mpd_no_drm = remove_content_protection(mpd);
 
-    // Step 2: Rewrite all https://... and http://... CDN URLs.
-    // We replace `https://HOST` → `http://127.0.0.1:PORT/cdn/https/HOST`
-    // and `http://HOST` → `http://127.0.0.1:PORT/cdn/http/HOST`.
-    // Template variables stay intact because they appear AFTER the host/path prefix.
-    let rewritten = rewrite_cdn_urls(&mpd_no_drm, &proxy_base, mpd_base_url);
+    // Step 2: Resolve relative <BaseURL> elements against the MPD fetch URL.
+    // e.g. <BaseURL>dash/</BaseURL> + MPD at https://cdn.host/live/ch1/manifest.mpd
+    //      → <BaseURL>https://cdn.host/live/ch1/dash/</BaseURL>
+    // Without this, mpv resolves segment paths relative to the proxy root (/dash/...)
+    // which the proxy can't map to the CDN.
+    let mpd_abs = resolve_relative_base_urls(&mpd_no_drm, mpd_base_url);
 
-    rewritten
+    // Step 3: Rewrite all https://... and http://... CDN URLs through the proxy.
+    rewrite_cdn_urls(&mpd_abs, &proxy_base, mpd_base_url)
+}
+
+/// Resolve all relative `<BaseURL>` element contents against the MPD's own URL.
+///
+/// The MPD directory is everything up to (and including) the last `/` in
+/// `mpd_base_url`.  A relative value like `dash/` becomes
+/// `https://cdn.host/live/ch1/dash/`.
+fn resolve_relative_base_urls(mpd: &str, mpd_base_url: &str) -> String {
+    // Directory of the MPD URL.
+    let mpd_dir = if let Some(pos) = mpd_base_url.rfind('/') {
+        &mpd_base_url[..pos + 1]
+    } else {
+        mpd_base_url
+    };
+
+    let mut out = String::with_capacity(mpd.len() + 128);
+    let mut remaining = mpd;
+
+    while !remaining.is_empty() {
+        if let Some(tag_start) = remaining.find("<BaseURL") {
+            out.push_str(&remaining[..tag_start]);
+            remaining = &remaining[tag_start..];
+
+            // Find end of opening tag (may have attributes like serviceLocation="…").
+            if let Some(tag_end) = remaining.find('>') {
+                let open_tag = &remaining[..tag_end + 1];
+                out.push_str(open_tag);
+                remaining = &remaining[tag_end + 1..];
+
+                if let Some(close) = remaining.find("</BaseURL>") {
+                    let content = remaining[..close].trim();
+                    // Only resolve truly relative values (not empty, not already absolute).
+                    if !content.is_empty()
+                        && !content.starts_with("http://")
+                        && !content.starts_with("https://")
+                    {
+                        out.push_str(mpd_dir);
+                        tracing::debug!(
+                            "DRM proxy: resolved relative BaseURL {:?} → {}{}",
+                            content, mpd_dir, content
+                        );
+                    }
+                    out.push_str(content);
+                    out.push_str("</BaseURL>");
+                    remaining = &remaining[close + "</BaseURL>".len()..];
+                } else {
+                    out.push_str(remaining);
+                    break;
+                }
+            } else {
+                out.push_str(remaining);
+                break;
+            }
+        } else {
+            out.push_str(remaining);
+            break;
+        }
+    }
+    out
 }
 
 fn remove_content_protection(mpd: &str) -> String {
