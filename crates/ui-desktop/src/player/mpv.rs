@@ -5,11 +5,25 @@
 /// For the v0.1 scaffold, we spawn `mpv --force-window` in its own window.
 pub struct MpvPlayer {
     handle: Option<std::process::Child>,
+    /// true when the installed mpv was compiled with --enable-cdm (e.g. mpv-widevine AUR).
+    has_cdm_support: bool,
 }
 
 impl MpvPlayer {
     pub fn new() -> Self {
-        Self { handle: None }
+        // Probe once whether this mpv binary was compiled with --enable-cdm.
+        // mpv-widevine (AUR) adds the --cdm-store option; stock Arch mpv does not.
+        let has_cdm_support = std::process::Command::new("mpv")
+            .arg("--list-options")
+            .output()
+            .map(|o| String::from_utf8_lossy(&o.stdout).contains("cdm-store"))
+            .unwrap_or(false);
+        if has_cdm_support {
+            tracing::info!("mpv: CDM support detected (--cdm-store available)");
+        } else {
+            tracing::debug!("mpv: no CDM support (standard build); DRM streams require mpv-widevine");
+        }
+        Self { handle: None, has_cdm_support }
     }
 
     /// Start playing a stream URL (opens mpv in its own window).

@@ -1,16 +1,44 @@
 /// Widevine CDM installer.
 ///
-/// Strategy (in order):
+/// Strategies (tried in order):
 ///   1. Copy `libwidevinecdm.so` from a locally-installed Chrome/Chromium.
 ///   2. Download via Google's Omaha update server (XML POST → ZIP extract).
+///   3. Download a Chrome OS recovery image, parse its GPT, and extract the CDM
+///      from ROOT-A (partition 3, squashfs) using `unsquashfs`.
 ///
 /// The CDM is stored at `~/.local/share/frenchetv/widevine/libwidevinecdm.so`.
 /// mpv picks it up via `--cdm-store=<dir>` when compiled with `--enable-cdm`.
 
-use std::path::PathBuf;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::{Path, PathBuf};
 use anyhow::{bail, Context, Result};
 
 const WIDEVINE_COMPONENT_ID: &str = "oimompecagnajdejgnnjijobebaeigek";
+
+/// Chrome OS recovery manifest.
+const RECOVERY_MANIFEST_URL: &str =
+    "https://dl.google.com/dl/edgedl/chromeos/recovery/recovery.json";
+
+/// Board name substrings that identify ARM boards in the recovery manifest.
+/// Sorted roughly by image size (smallest first) so the filter picks the
+/// smallest matching entry.
+const ARM_BOARDS: &[&str] = &[
+    "veyron", "nyan", "daisy", "snow", "kevin", "trogdor",
+    "kukui", "jacuzzi", "corsola", "strongbad",
+];
+
+/// Board name substrings for small x86_64 boards (Haswell era).
+const X86_BOARDS: &[&str] = &[
+    "link", "peppy", "falco", "wolf", "clapper", "squawks",
+];
+
+/// Known paths of `libwidevinecdm.so` inside the Chrome OS root filesystem.
+const CDM_PATHS_IN_IMAGE: &[&str] = &[
+    "opt/google/chrome/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so",
+    "opt/google/chrome/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so",
+    "opt/google/chrome/WidevineCdm/_platform_specific/linux_arm/libwidevinecdm.so",
+    "opt/google/chrome/libwidevinecdm.so",
+];
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
@@ -34,7 +62,6 @@ pub fn is_installed() -> bool {
 
 // ── Architecture ──────────────────────────────────────────────────────────────
 
-/// Platform subdirectory as Google names it inside the CRX/ZIP.
 fn platform_dir() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "linux_arm64",
@@ -42,7 +69,6 @@ fn platform_dir() -> &'static str {
     }
 }
 
-/// Arch tag used in Omaha requests and ZIP package names.
 fn arch_tag() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -50,7 +76,6 @@ fn arch_tag() -> &'static str {
     }
 }
 
-/// nacl_arch used in Omaha requests.
 fn nacl_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",
@@ -95,7 +120,6 @@ fn try_copy_from_system() -> Option<()> {
 
 // ── Strategy 2: Omaha XML download ───────────────────────────────────────────
 
-/// POST to Google's Omaha update server; parse codebase + package name.
 async fn omaha_fetch_url(client: &reqwest::Client) -> Result<String> {
     let arch = arch_tag();
     let body = format!(
@@ -113,24 +137,15 @@ async fn omaha_fetch_url(client: &reqwest::Client) -> Result<String> {
     let xml = client
         .post("https://clients2.google.com/service/update2")
         .header("Content-Type", "application/xml")
-        .header(
-            "User-Agent",
-            "GoogleUpdate/1.3.36.372;winhttp;cup-ecdsa",
-        )
+        .header("User-Agent", "GoogleUpdate/1.3.36.372;winhttp;cup-ecdsa")
         .body(body)
-        .send()
-        .await
-        .context("Omaha POST failed")?
-        .text()
-        .await
-        .context("reading Omaha response")?;
+        .send().await.context("Omaha POST failed")?
+        .text().await.context("reading Omaha response")?;
 
     tracing::debug!("widevine omaha response: {}", xml);
 
-    // Extract codebase="..." and name="..." without an XML crate.
     let codebase = xml
-        .split("codebase=\"")
-        .nth(1)
+        .split("codebase=\"").nth(1)
         .and_then(|s| s.split('"').next())
         .ok_or_else(|| anyhow::anyhow!("codebase not found in Omaha response"))?
         .to_string();
@@ -146,7 +161,6 @@ async fn omaha_fetch_url(client: &reqwest::Client) -> Result<String> {
     Ok(format!("{}{}", codebase, package_name))
 }
 
-/// Find `libwidevinecdm.so` anywhere inside a ZIP archive.
 fn extract_cdm_from_zip(bytes: &[u8]) -> Result<Vec<u8>> {
     let cursor  = std::io::Cursor::new(bytes);
     let mut arc = zip::ZipArchive::new(cursor).context("parsing ZIP")?;
@@ -164,18 +178,13 @@ fn extract_cdm_from_zip(bytes: &[u8]) -> Result<Vec<u8>> {
 
 async fn download_from_omaha(client: &reqwest::Client) -> Result<()> {
     let url = omaha_fetch_url(client).await?;
-    tracing::info!("widevine: downloading ZIP from {}", url);
+    tracing::info!("widevine: Omaha → downloading ZIP from {}", url);
 
     let bytes = client
         .get(&url)
-        .send()
-        .await
-        .context("CDM ZIP download")?
-        .error_for_status()
-        .context("CDM ZIP HTTP error")?
-        .bytes()
-        .await
-        .context("reading CDM ZIP bytes")?;
+        .send().await.context("CDM ZIP download")?
+        .error_for_status().context("CDM ZIP HTTP error")?
+        .bytes().await.context("reading CDM ZIP bytes")?;
 
     tracing::info!("widevine: downloaded {} bytes", bytes.len());
     if bytes.is_empty() {
@@ -195,7 +204,307 @@ async fn download_from_omaha(client: &reqwest::Client) -> Result<()> {
             .context("setting CDM permissions")?;
     }
 
-    tracing::info!("widevine: installed {} bytes → {}", cdm.len(), cdm_path().display());
+    tracing::info!("widevine: Omaha installed {} bytes → {}", cdm.len(), cdm_path().display());
+    Ok(())
+}
+
+// ── Strategy 3: Chrome OS recovery image (Kodi approach) ─────────────────────
+//
+// Recovery flow:
+//   1. Fetch recovery.json manifest
+//   2. Pick smallest ARM (or x86_64) board image
+//   3. Download recovery zip  (~200 MB for VEYRON)
+//   4. Extract .bin disk image (~2 GB)
+//   5. Verify SHA-1
+//   6. Parse GPT → partition 3 = ROOT-A (squashfs)
+//   7. unsquashfs -offset <ROOT-A offset> recovery.bin <cdm path>
+//   8. Install CDM; clean up temp files
+
+struct RecoveryEntry {
+    url:      String,
+    sha1:     String,    // SHA-1 of the raw .bin file
+    zip_size: u64,
+    name:     String,
+}
+
+async fn fetch_recovery_manifest(client: &reqwest::Client) -> Result<Vec<RecoveryEntry>> {
+    tracing::info!("widevine: fetching Chrome OS recovery manifest");
+    let json: Vec<serde_json::Value> = client
+        .get(RECOVERY_MANIFEST_URL)
+        .send().await.context("GET recovery manifest")?
+        .json().await.context("parse recovery manifest")?;
+
+    let entries: Vec<RecoveryEntry> = json.iter().filter_map(|e| {
+        Some(RecoveryEntry {
+            url:      e.get("url")?.as_str()?.to_string(),
+            sha1:     e.get("sha1")?.as_str()?.to_string(),
+            zip_size: e.get("zipfilesize")?.as_str()
+                        .and_then(|s| s.parse().ok())
+                        .unwrap_or(u64::MAX),
+            name:     e.get("name")?.as_str()?.to_string(),
+        })
+    }).collect();
+
+    tracing::info!("widevine: recovery manifest: {} entries", entries.len());
+    Ok(entries)
+}
+
+fn select_recovery_entry(entries: &[RecoveryEntry]) -> Option<&RecoveryEntry> {
+    let boards: &[&str] = match std::env::consts::ARCH {
+        "aarch64" | "arm" => ARM_BOARDS,
+        _                 => X86_BOARDS,
+    };
+
+    let entry = entries.iter()
+        .filter(|e| {
+            let n = e.name.to_lowercase();
+            boards.iter().any(|b| n.contains(b))
+        })
+        .min_by_key(|e| e.zip_size)?;
+
+    tracing::info!(
+        "widevine: recovery entry '{}' ({} MB zip)",
+        entry.name,
+        entry.zip_size / 1_000_000,
+    );
+    Some(entry)
+}
+
+/// Download `url` to `dest`, retrying with exponential backoff.
+async fn download_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+    label: &str,
+) -> Result<()> {
+    let mut last_err = anyhow::anyhow!("no attempts");
+    for attempt in 1u32..=3 {
+        tracing::info!("widevine: downloading {} (attempt {})", label, attempt);
+        match try_stream_to_file(client, url, dest).await {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                last_err = e;
+                if attempt < 3 {
+                    let wait = std::time::Duration::from_secs(2u64.pow(attempt));
+                    tracing::warn!("widevine: retry in {:?} — {}", wait, last_err);
+                    tokio::time::sleep(wait).await;
+                }
+            }
+        }
+    }
+    Err(last_err)
+}
+
+async fn try_stream_to_file(
+    client: &reqwest::Client,
+    url: &str,
+    dest: &Path,
+) -> Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut resp = client.get(url).send().await.context("GET")?
+        .error_for_status().context("HTTP error")?;
+
+    let mut f = tokio::fs::File::create(dest).await.context("create file")?;
+    while let Some(chunk) = resp.chunk().await.context("streaming")? {
+        f.write_all(&chunk).await.context("write chunk")?;
+    }
+    f.flush().await.context("flush")?;
+    Ok(())
+}
+
+/// Verify the SHA-1 of `path` against `expected_hex` (from the manifest).
+fn verify_sha1(path: &Path, expected_hex: &str) -> Result<()> {
+    use sha1::{Digest, Sha1};
+
+    tracing::info!("widevine: verifying SHA-1 of {} …", path.display());
+    let data = std::fs::read(path).context("read for SHA-1")?;
+    let hash   = Sha1::digest(&data);
+    let actual = format!("{:x}", hash);
+
+    if actual.eq_ignore_ascii_case(expected_hex) {
+        tracing::info!("widevine: SHA-1 OK");
+        Ok(())
+    } else {
+        bail!("SHA-1 mismatch: expected {} got {}", expected_hex, actual)
+    }
+}
+
+/// Extract the single `.bin` file from a recovery zip archive.
+fn extract_bin_from_zip(zip_path: &Path, bin_path: &Path) -> Result<()> {
+    let file    = std::fs::File::open(zip_path).context("open recovery zip")?;
+    let mut arc = zip::ZipArchive::new(file).context("parse recovery zip")?;
+
+    for i in 0..arc.len() {
+        let mut entry = arc.by_index(i).context("zip entry")?;
+        if entry.name().ends_with(".bin") {
+            tracing::info!("widevine: extracting {} from zip…", entry.name());
+            let mut out = std::fs::File::create(bin_path).context("create .bin")?;
+            std::io::copy(&mut entry, &mut out).context("extract .bin")?;
+            return Ok(());
+        }
+    }
+    bail!("no .bin file found in recovery zip")
+}
+
+/// Parse GPT partition table, return (start_byte_offset, size_bytes)
+/// for `part_num` (1-based, as documented in `fdisk`).
+fn gpt_partition_range(bin_path: &Path, part_num: usize) -> Result<(u64, u64)> {
+    let mut f = std::fs::File::open(bin_path).context("open .bin")?;
+
+    // GPT header at LBA 1 = byte offset 512
+    let mut hdr = [0u8; 512];
+    f.seek(SeekFrom::Start(512)).context("seek to GPT header")?;
+    f.read_exact(&mut hdr).context("read GPT header")?;
+
+    if &hdr[0..8] != b"EFI PART" {
+        bail!("not a GPT disk image (bad signature)");
+    }
+
+    let entries_lba = u64::from_le_bytes(hdr[72..80].try_into()?);
+    let num_entries = u32::from_le_bytes(hdr[80..84].try_into()?) as usize;
+    let entry_size  = u32::from_le_bytes(hdr[84..88].try_into()?) as usize;
+
+    let idx = part_num.checked_sub(1).context("part_num must be ≥ 1")?;
+    if idx >= num_entries {
+        bail!("partition {} not found ({} entries)", part_num, num_entries);
+    }
+
+    let entry_off = entries_lba * 512 + (idx * entry_size) as u64;
+    let mut entry = vec![0u8; entry_size];
+    f.seek(SeekFrom::Start(entry_off)).context("seek to partition entry")?;
+    f.read_exact(&mut entry).context("read partition entry")?;
+
+    let start_lba = u64::from_le_bytes(entry[32..40].try_into()?);
+    let end_lba   = u64::from_le_bytes(entry[40..48].try_into()?);
+
+    if start_lba == 0 {
+        bail!("partition {} is empty", part_num);
+    }
+
+    let offset = start_lba * 512;
+    let size   = (end_lba - start_lba + 1) * 512;
+    tracing::debug!("widevine: partition {} at offset {} size {} MB", part_num, offset, size / 1_000_000);
+    Ok((offset, size))
+}
+
+/// Use `unsquashfs -offset OFFSET` to extract `libwidevinecdm.so` directly
+/// from a raw GPT disk image without extracting the full partition first.
+fn extract_cdm_with_unsquashfs(
+    bin_path:  &Path,
+    sq_offset: u64,
+    dest_dir:  &Path,
+) -> Result<PathBuf> {
+    std::fs::create_dir_all(dest_dir).context("create unsquashfs dest dir")?;
+
+    for candidate in CDM_PATHS_IN_IMAGE {
+        let status = std::process::Command::new("unsquashfs")
+            .args([
+                "-q",
+                "-no-progress",
+                "-offset", &sq_offset.to_string(),
+                "-f",
+                "-d", dest_dir.to_str().context("dest_dir not valid UTF-8")?,
+                bin_path.to_str().context("bin_path not valid UTF-8")?,
+                candidate,
+            ])
+            .status();
+
+        match status {
+            Ok(s) if s.success() => {
+                let found = dest_dir.join(candidate);
+                if found.exists() {
+                    tracing::info!("widevine: found CDM at {} inside image", candidate);
+                    return Ok(found);
+                }
+            }
+            Ok(_) => {}  // unsquashfs exit non-zero: path not found, try next
+            Err(e) => bail!("unsquashfs not available ({}). Install squashfs-tools.", e),
+        }
+    }
+    bail!("libwidevinecdm.so not found in ROOT-A squashfs (tried all known paths)")
+}
+
+/// Full Chrome OS recovery download + extraction flow.
+async fn download_from_recovery(client: &reqwest::Client) -> Result<()> {
+    let entries = fetch_recovery_manifest(client).await?;
+    let entry   = select_recovery_entry(&entries)
+        .ok_or_else(|| anyhow::anyhow!(
+            "no suitable Chrome OS recovery image found for arch={}",
+            std::env::consts::ARCH
+        ))?;
+
+    // Temp workspace — cleaned up regardless of success/failure.
+    let ts  = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis()).unwrap_or(0);
+    let tmp = std::env::temp_dir().join(format!("frenchetv_wv_{}", ts));
+    std::fs::create_dir_all(&tmp).context("create temp dir")?;
+
+    let result = recovery_install_inner(client, entry, &tmp).await;
+
+    // Always clean up temp dir.
+    if let Err(e) = std::fs::remove_dir_all(&tmp) {
+        tracing::warn!("widevine: failed to clean up temp dir {}: {}", tmp.display(), e);
+    }
+
+    result
+}
+
+async fn recovery_install_inner(
+    client: &reqwest::Client,
+    entry:  &RecoveryEntry,
+    tmp:    &Path,
+) -> Result<()> {
+    // Step 1 — download recovery zip
+    let zip_path = tmp.join("recovery.zip");
+    download_to_file(client, &entry.url, &zip_path, "Chrome OS recovery zip").await?;
+
+    // Step 2 — extract .bin from zip
+    let bin_path = tmp.join("recovery.bin");
+    tracing::info!("widevine: extracting .bin (this may take a while)…");
+    tokio::task::spawn_blocking({
+        let zip_path = zip_path.clone();
+        let bin_path = bin_path.clone();
+        move || extract_bin_from_zip(&zip_path, &bin_path)
+    }).await.context("spawn_blocking extract_bin")??;
+
+    // Remove zip now to free disk space
+    let _ = std::fs::remove_file(&zip_path);
+
+    // Step 3 — verify SHA-1
+    tokio::task::spawn_blocking({
+        let bin_path = bin_path.clone();
+        let sha1     = entry.sha1.clone();
+        move || verify_sha1(&bin_path, &sha1)
+    }).await.context("spawn_blocking sha1")??;
+
+    // Step 4 — parse GPT, find partition 3 (ROOT-A = squashfs)
+    let (sq_offset, _sq_size) = tokio::task::spawn_blocking({
+        let bin_path = bin_path.clone();
+        move || gpt_partition_range(&bin_path, 3)
+    }).await.context("spawn_blocking gpt")??;
+
+    // Step 5 — extract CDM via unsquashfs -offset
+    let extract_dir = tmp.join("squash_root");
+    let cdm_src = tokio::task::spawn_blocking({
+        let bin_path    = bin_path.clone();
+        let extract_dir = extract_dir.clone();
+        move || extract_cdm_with_unsquashfs(&bin_path, sq_offset, &extract_dir)
+    }).await.context("spawn_blocking unsquashfs")??;
+
+    // Step 6 — install CDM
+    let dest_dir = dir();
+    std::fs::create_dir_all(&dest_dir).context("create widevine dir")?;
+    std::fs::copy(&cdm_src, cdm_path()).context("copy CDM")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cdm_path(), std::fs::Permissions::from_mode(0o755))
+            .context("set CDM permissions")?;
+    }
+
+    tracing::info!("widevine: CDM installed from Chrome OS recovery → {}", cdm_path().display());
     Ok(())
 }
 
@@ -207,12 +516,21 @@ pub async fn install() -> Result<()> {
     if try_copy_from_system().is_some() {
         return Ok(());
     }
-    tracing::info!("widevine: no system CDM found, downloading via Omaha");
 
     let client = reqwest::Client::builder()
-        .timeout(std::time::Duration::from_secs(60))
+        .timeout(std::time::Duration::from_secs(300))  // large downloads
         .build()
         .context("building reqwest client")?;
 
-    download_from_omaha(&client).await
+    // Strategy 2: Omaha XML (~10 MB download, works on x86_64).
+    tracing::info!("widevine: no system CDM; trying Omaha");
+    match download_from_omaha(&client).await {
+        Ok(()) => return Ok(()),
+        Err(e) => tracing::warn!("widevine: Omaha failed ({}); trying Chrome OS recovery", e),
+    }
+
+    // Strategy 3: Chrome OS recovery image (reliable for all architectures;
+    // ~200 MB zip + ~2 GB .bin temporary disk space required).
+    tracing::info!("widevine: downloading Chrome OS recovery image (needs ~2.2 GB temp space)");
+    download_from_recovery(&client).await
 }

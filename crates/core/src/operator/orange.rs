@@ -712,16 +712,6 @@ impl Operator for OrangeOperator {
                 );
                 if let Some(ch) = channels.iter().find(|c| c.logo_url.is_some()) {
                     tracing::debug!("Orange: sample logo_url = {:?}", ch.logo_url);
-                } else {
-                    // Log the raw logos field of the first channel to diagnose missing logos
-                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
-                        if let Some(first) = v["channels"].as_array().and_then(|a| a.first()) {
-                            tracing::debug!(
-                                "Orange: first channel logos field = {}",
-                                first.get("logos").unwrap_or(&serde_json::Value::Null)
-                            );
-                        }
-                    }
                 }
                 Ok(channels)
             }
