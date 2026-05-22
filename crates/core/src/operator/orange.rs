@@ -103,6 +103,12 @@ impl OrangeOperator {
         let resp = req.send().await?;
 
         let status = resp.status();
+        // Capture refreshed wassup before consuming response body.
+        let refreshed_wassup = resp
+            .cookies()
+            .find(|c| c.name() == "wassup")
+            .map(|c| c.value().to_string());
+
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(OperatorError::UnexpectedResponse {
@@ -120,6 +126,12 @@ impl OrangeOperator {
         self.tv_token_expires = Some(
             std::time::Instant::now() + std::time::Duration::from_secs(25 * 60),
         );
+
+        // Orange slides session expiry on use — persist the refreshed token.
+        if let Some(w) = refreshed_wassup {
+            tracing::debug!("Orange: wassup refreshed in ensure_tv_token (len={})", w.len());
+            self.wassup = Some(w);
+        }
 
         Ok(())
     }
