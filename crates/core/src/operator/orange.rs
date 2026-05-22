@@ -196,17 +196,24 @@ struct OrangeChannel {
     #[serde(default)]
     display_order: Option<u32>,
     #[serde(default)]
-    logos: Vec<OrangeLogo>,
+    logos: Vec<OrangeLogoSet>,
     /// Platform availability flags — absence of "W_PC" means locked on desktop.
     #[serde(default)]
     allowed_device_categories: Vec<String>,
 }
 
+/// One logo variant (e.g. "webTVLogo", "webTVSquare", "mobileAppli", …).
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
-struct OrangeLogo {
-    #[serde(rename = "urlService", default)]
-    url_service: Option<String>,
+struct OrangeLogoSet {
+    definition_type: String,
+    #[serde(default)]
+    list_logos: Vec<OrangeLogoItem>,
+}
+
+#[derive(Deserialize)]
+struct OrangeLogoItem {
+    path: String,
 }
 
 #[async_trait]
@@ -622,7 +629,7 @@ impl Operator for OrangeOperator {
                         return Ok(parse_m3u(FALLBACK_M3U));
                     }
                 };
-                tracing::debug!("Orange channels body: {:.500}", body_text);
+                tracing::debug!("Orange channels body: {:.1000}", body_text);
                 let channels_raw: Vec<OrangeChannel> = match serde_json::from_str::<OrangeChannelList>(&body_text) {
                     Ok(wrapper) => wrapper.channels,
                     Err(e) => {
@@ -634,13 +641,20 @@ impl Operator for OrangeOperator {
                 let placeholder = url::Url::parse(PLACEHOLDER_URL)
                     .expect("placeholder URL is valid");
 
-                let channels = channels_raw
+                let channels: Vec<Channel> = channels_raw
                     .into_iter()
                     .map(|c| {
-                        let logo_url = c
-                            .logos
-                            .into_iter()
-                            .find_map(|l| l.url_service);
+                        // Prefer the web TV horizontal logo; fall back to square variant.
+                        // Mobile variants use relative paths — skip those.
+                        let logo_url = ["webTVLogo", "webTVSquare"]
+                            .iter()
+                            .find_map(|&def| {
+                                c.logos.iter()
+                                    .find(|l| l.definition_type == def)
+                                    .and_then(|l| l.list_logos.first())
+                                    .map(|item| item.path.clone())
+                                    .filter(|p| p.starts_with("http"))
+                            });
                         let locked = !c.allowed_device_categories.is_empty()
                             && !c.allowed_device_categories.iter().any(|s| s == "W_PC");
                         Channel {
@@ -655,6 +669,25 @@ impl Operator for OrangeOperator {
                     })
                     .collect();
 
+                let with_logo = channels.iter().filter(|c| c.logo_url.is_some()).count();
+                let locked_count = channels.iter().filter(|c| c.locked).count();
+                tracing::info!(
+                    "Orange: {} channels, {} with logo, {} locked",
+                    channels.len(), with_logo, locked_count
+                );
+                if let Some(ch) = channels.iter().find(|c| c.logo_url.is_some()) {
+                    tracing::debug!("Orange: sample logo_url = {:?}", ch.logo_url);
+                } else {
+                    // Log the raw logos field of the first channel to diagnose missing logos
+                    if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
+                        if let Some(first) = v["channels"].as_array().and_then(|a| a.first()) {
+                            tracing::debug!(
+                                "Orange: first channel logos field = {}",
+                                first.get("logos").unwrap_or(&serde_json::Value::Null)
+                            );
+                        }
+                    }
+                }
                 Ok(channels)
             }
             Ok(r) => {
@@ -942,7 +975,10 @@ mod tests {
                             "idEPG": 1,
                             "name": "TF1",
                             "displayOrder": 1,
-                            "logos": [{"urlService": "https://logos.example.com/tf1.png"}]
+                            "logos": [
+                                {"definitionType": "webTVLogo", "listLogos": [{"path": "https://logos.example.com/tf1.png", "size": "180x96"}]},
+                                {"definitionType": "mobileAppli", "listLogos": [{"path": "%2Flogos%2Ftf1.png", "size": "183x183"}]}
+                            ]
                         },
                         {
                             "idEPG": 15,
