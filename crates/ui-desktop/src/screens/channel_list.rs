@@ -1,11 +1,13 @@
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, Vec2};
 use frenchetv_core::{Channel, ChannelCategory};
+use crate::app::LogoCache;
 
 pub struct ChannelListScreen {
     channels: Vec<Channel>,
     filter: CategoryFilter,
     search: String,
     show_locked: bool,
+    logos: LogoCache,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,13 +23,14 @@ pub enum ChannelListAction {
 }
 
 impl ChannelListScreen {
-    pub fn new(mut channels: Vec<Channel>) -> Self {
+    pub fn new(mut channels: Vec<Channel>, logos: LogoCache) -> Self {
         channels.sort_by_key(|c| c.number.unwrap_or(u32::MAX));
         Self {
             channels,
             filter: CategoryFilter::All,
             search: String::new(),
             show_locked: false,
+            logos,
         }
     }
 
@@ -158,13 +161,19 @@ impl ChannelListScreen {
                                             ui.set_min_size(Vec2::new(tile_width, tile_height));
                                             ui.vertical(|ui| {
                                                 // ── Logo ────────────────────
-                                                if let Some(url) = &channel.logo_url {
+                                                let cached_texture = channel.logo_url.as_ref()
+                                                    .and_then(|url| {
+                                                        self.logos.lock().ok()
+                                                            .and_then(|m| m.get(url.as_str()).cloned())
+                                                    });
+                                                if let Some(texture) = cached_texture {
                                                     ui.add(
-                                                        egui::Image::new(url.as_str())
-                                                            .max_size(logo_size)
-                                                            .maintain_aspect_ratio(true)
-                                                            // Don't let Image consume pointer events
-                                                            .sense(egui::Sense::hover()),
+                                                        egui::Image::from_texture(
+                                                            egui::load::SizedTexture::from_handle(&texture),
+                                                        )
+                                                        .max_size(logo_size)
+                                                        .maintain_aspect_ratio(true)
+                                                        .sense(egui::Sense::hover()),
                                                     );
                                                 } else {
                                                     let (rect, _) = ui.allocate_exact_size(

@@ -1,6 +1,6 @@
-use std::sync::{mpsc, Arc};
-use egui_extras;
-use tokio::sync::Mutex;
+use std::collections::HashMap;
+use std::sync::{mpsc, Arc, Mutex};
+use tokio::sync::Mutex as TokioMutex;
 use frenchetv_core::{AuthPhase, Channel, Config, Operator, OperatorKind, OperatorRegistry, StreamUrl};
 use frenchetv_core::session as keyring_session;
 use crate::screens::{ChannelListScreen, PlayerScreen, PushWaitScreen, SetupScreen};
@@ -8,21 +8,20 @@ use crate::screens::setup::SetupAction;
 use crate::screens::channel_list::ChannelListAction;
 use crate::screens::player::PlayerAction;
 
-type SharedOperator = Arc<Mutex<Box<dyn Operator>>>;
+type SharedOperator = Arc<TokioMutex<Box<dyn Operator>>>;
+/// Shared logo cache: logo_url → decoded egui texture.
+pub type LogoCache = Arc<Mutex<HashMap<String, egui::TextureHandle>>>;
 
 /// Messages sent from Tokio tasks back to the UI thread.
 enum AsyncMsg {
     AuthErr(String),
     /// Operator requires mobile push approval — show the push-wait screen.
     PushAuthPending,
-    /// Authentication + channel fetch both succeeded. Carries the live operator
-    /// (with token set) so it can be reused for resolve_stream.
+    /// Authentication + channel fetch both succeeded.
     ChannelsOk {
         channels: Vec<Channel>,
         operator: SharedOperator,
-        /// Session token to persist (e.g. wassup cookie).
         session_token: Option<String>,
-        /// config_str() key ("orange", "bouygues") — used for keyring + config.
         kind_str: String,
         username: String,
     },
@@ -40,10 +39,10 @@ enum Screen {
 
 pub struct App {
     screen: Screen,
-    /// Channels loaded after setup; kept for channel switching in the player.
     channels: Vec<Channel>,
-    /// The authenticated operator. Holds the session token between calls.
     current_operator: Option<SharedOperator>,
+    /// Decoded channel logos, populated asynchronously after channel list loads.
+    logos: LogoCache,
     tx: mpsc::SyncSender<AsyncMsg>,
     rx: mpsc::Receiver<AsyncMsg>,
     rt: tokio::runtime::Runtime,
@@ -52,23 +51,22 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        egui_extras::install_image_loaders(&cc.egui_ctx);
         let (tx, rx) = mpsc::sync_channel(16);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
-
+        let logos: LogoCache = Arc::new(Mutex::new(HashMap::new()));
         let config = Config::load().unwrap_or_default();
 
         let app = Self {
             screen: Screen::Setup(SetupScreen::new()),
             channels: Vec::new(),
             current_operator: None,
+            logos,
             tx,
             rx,
             rt,
             egui_ctx: cc.egui_ctx.clone(),
         };
 
-        // Attempt silent session restore if we have a saved operator + username.
         let kind_str = config.operator.kind.clone();
         let username  = config.operator.username.clone();
         if !kind_str.is_empty() && !username.is_empty() {
@@ -82,9 +80,54 @@ impl App {
         app
     }
 
-    /// Spawn: restore session from stored token.
-    /// Success → ChannelsOk (skip auth screen).
-    /// Failure → clears stale keyring entry, Setup screen stays (no error shown).
+    /// Spawn concurrent logo fetches (max 20 in-flight) for all channels that
+    /// have a logo_url. Decoded textures are inserted into the shared LogoCache;
+    /// each insertion triggers a repaint so the UI updates incrementally.
+    fn start_fetch_logos(&self, channels: Vec<Channel>) {
+        let logos = Arc::clone(&self.logos);
+        let ctx   = self.egui_ctx.clone();
+        self.rt.spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(10))
+                .build()
+                .unwrap_or_default();
+
+            let sem = Arc::new(tokio::sync::Semaphore::new(20));
+            let mut set = tokio::task::JoinSet::new();
+
+            // Deduplicate URLs across channels.
+            let mut seen = std::collections::HashSet::new();
+            for url in channels.into_iter().filter_map(|c| c.logo_url) {
+                if seen.insert(url.clone()) {
+                    let client = client.clone();
+                    let logos  = Arc::clone(&logos);
+                    let ctx    = ctx.clone();
+                    let sem    = Arc::clone(&sem);
+                    set.spawn(async move {
+                        let _permit = sem.acquire().await.ok()?;
+                        let bytes = client.get(&url).send().await.ok()?.bytes().await.ok()?;
+                        let img   = image::load_from_memory(&bytes).ok()?;
+                        let rgba  = img.to_rgba8();
+                        let (w, h) = rgba.dimensions();
+                        let pixels: Vec<egui::Color32> = rgba
+                            .pixels()
+                            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
+                            .collect();
+                        let texture = ctx.load_texture(
+                            url.as_str(),
+                            egui::ColorImage { size: [w as usize, h as usize], pixels },
+                            egui::TextureOptions::LINEAR,
+                        );
+                        logos.lock().ok()?.insert(url, texture);
+                        ctx.request_repaint();
+                        Some(())
+                    });
+                }
+            }
+            while set.join_next().await.is_some() {}
+        });
+    }
+
     fn start_restore_session(
         &self,
         kind: OperatorKind,
@@ -99,35 +142,26 @@ impl App {
             if let Err(e) = op.restore_session(&token).await {
                 tracing::info!("Session restore failed ({}); showing setup screen", e);
                 keyring_session::clear_session(&kind_str, &username);
-                // Don't send AuthErr — setup screen is already visible, no message needed.
                 ctx.request_repaint();
                 return;
             }
             match op.fetch_channels().await {
                 Ok(channels) => {
                     let session_token = op.session_token().map(str::to_string);
-                    let shared = Arc::new(Mutex::new(op));
+                    let shared = Arc::new(TokioMutex::new(op));
                     let _ = tx.send(AsyncMsg::ChannelsOk {
-                        channels,
-                        operator: shared,
-                        session_token,
-                        kind_str,
-                        username,
+                        channels, operator: shared, session_token, kind_str, username,
                     });
                 }
-                Err(e) => {
-                    let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string()));
-                }
+                Err(e) => { let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string())); }
             }
             ctx.request_repaint();
         });
     }
 
-    /// Spawn: authenticate → fetch_channels → send ChannelsOk (or AuthErr / ChannelsErr).
-    /// For operators with phased auth (Orange push), sends PushAuthPending first.
     fn start_auth(&self, kind: OperatorKind, username: String, password: String) {
-        let tx      = self.tx.clone();
-        let ctx     = self.egui_ctx.clone();
+        let tx       = self.tx.clone();
+        let ctx      = self.egui_ctx.clone();
         let kind_str = kind.config_str().to_string();
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
@@ -139,16 +173,14 @@ impl App {
                         ctx.request_repaint();
                         return;
                     }
-                    Ok(AuthPhase::Password) => {
-                        match op.complete_auth_password(&password).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
-                                ctx.request_repaint();
-                                return;
-                            }
+                    Ok(AuthPhase::Password) => match op.complete_auth_password(&password).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                            ctx.request_repaint();
+                            return;
                         }
-                    }
+                    },
                     Ok(AuthPhase::Push) => {
                         let _ = tx.send(AsyncMsg::PushAuthPending);
                         ctx.request_repaint();
@@ -173,46 +205,31 @@ impl App {
                 }
             };
 
-            if !auth_ok {
-                return;
-            }
+            if !auth_ok { return; }
 
             match op.fetch_channels().await {
                 Ok(channels) => {
                     let session_token = op.session_token().map(str::to_string);
-                    let shared = Arc::new(Mutex::new(op));
+                    let shared = Arc::new(TokioMutex::new(op));
                     let _ = tx.send(AsyncMsg::ChannelsOk {
-                        channels,
-                        operator: shared,
-                        session_token,
-                        kind_str,
-                        username,
+                        channels, operator: shared, session_token, kind_str, username,
                     });
                 }
-                Err(e) => {
-                    let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string()));
-                }
+                Err(e) => { let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string())); }
             }
             ctx.request_repaint();
         });
     }
 
-    /// Spawn: resolve_stream using the stored (authenticated) operator.
     fn start_resolve_stream(&self, channel: Channel) {
         let tx  = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         let op  = match &self.current_operator {
             Some(op) => op.clone(),
-            None => {
-                tracing::error!("resolve_stream called with no operator");
-                return;
-            }
+            None => { tracing::error!("resolve_stream called with no operator"); return; }
         };
         self.rt.spawn(async move {
-            let result = {
-                let op = op.lock().await;
-                op.resolve_stream(&channel).await
-            };
+            let result = { let op = op.lock().await; op.resolve_stream(&channel).await };
             match result {
                 Ok(stream) => { let _ = tx.send(AsyncMsg::StreamOk { channel, stream }); }
                 Err(e)     => { let _ = tx.send(AsyncMsg::StreamErr(e.to_string()));     }
@@ -221,27 +238,26 @@ impl App {
         });
     }
 
+    fn make_channel_list(&self, channels: Vec<Channel>) -> ChannelListScreen {
+        ChannelListScreen::new(channels, Arc::clone(&self.logos))
+    }
+
     fn drain_async_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                AsyncMsg::AuthErr(err) => {
-                    match &mut self.screen {
-                        Screen::Setup(s) => {
-                            s.set_error(format!("Connexion échouée : {}", err));
-                        }
-                        Screen::PushWait(_) => {
-                            let mut s = SetupScreen::new();
-                            s.set_error(format!("Connexion échouée : {}", err));
-                            self.screen = Screen::Setup(s);
-                        }
-                        _ => {}
+                AsyncMsg::AuthErr(err) => match &mut self.screen {
+                    Screen::Setup(s) => { s.set_error(format!("Connexion échouée : {}", err)); }
+                    Screen::PushWait(_) => {
+                        let mut s = SetupScreen::new();
+                        s.set_error(format!("Connexion échouée : {}", err));
+                        self.screen = Screen::Setup(s);
                     }
-                }
+                    _ => {}
+                },
                 AsyncMsg::PushAuthPending => {
                     self.screen = Screen::PushWait(PushWaitScreen::new());
                 }
                 AsyncMsg::ChannelsOk { channels, operator, session_token, kind_str, username } => {
-                    // Persist session token + operator/username for next launch.
                     if let Some(ref token) = session_token {
                         keyring_session::save_session(&kind_str, &username, token);
                         let mut cfg = Config::load().unwrap_or_default();
@@ -252,9 +268,10 @@ impl App {
                         }
                         tracing::info!("Session saved for {}:{}", kind_str, username);
                     }
+                    self.start_fetch_logos(channels.clone());
                     self.channels = channels.clone();
                     self.current_operator = Some(operator);
-                    self.screen = Screen::ChannelList(ChannelListScreen::new(channels));
+                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
                 }
                 AsyncMsg::ChannelsErr(err) => {
                     if let Screen::Setup(s) = &mut self.screen {
@@ -266,7 +283,8 @@ impl App {
                 }
                 AsyncMsg::StreamErr(err) => {
                     tracing::error!("stream resolution failed: {}", err);
-                    self.screen = Screen::ChannelList(ChannelListScreen::new(self.channels.clone()));
+                    let channels = self.channels.clone();
+                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
                 }
             }
             ctx.request_repaint();
@@ -284,20 +302,18 @@ impl eframe::App for App {
                     self.start_auth(operator, username, password);
                 }
             }
-            Screen::PushWait(pw) => {
-                pw.show(ctx);
-            }
+            Screen::PushWait(pw) => { pw.show(ctx); }
             Screen::ChannelList(list) => {
                 if let ChannelListAction::SelectChannel(channel) = list.show(ctx) {
                     self.start_resolve_stream(channel);
                 }
             }
             Screen::Player(player) => {
-                let channels    = self.channels.clone();
-                let current_id  = player.channel.id.clone();
+                let channels   = self.channels.clone();
+                let current_id = player.channel.id.clone();
                 match player.show(ctx) {
                     PlayerAction::Back => {
-                        self.screen = Screen::ChannelList(ChannelListScreen::new(channels));
+                        self.screen = Screen::ChannelList(self.make_channel_list(channels));
                     }
                     PlayerAction::NextChannel => {
                         if let Some(idx) = channels.iter().position(|c| c.id == current_id) {
