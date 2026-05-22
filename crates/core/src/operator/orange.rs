@@ -411,15 +411,9 @@ impl Operator for OrangeOperator {
                 .map(|c| c.value().to_string());
 
             let body_text = resp.text().await.unwrap_or_default();
-            tracing::debug!(
-                "push poll {}: {} — {:.300}",
-                attempt + 1,
-                status,
-                body_text
-            );
 
             if !status.is_success() {
-                // Non-2xx — log and keep polling (transient errors are common)
+                tracing::debug!("push poll {}: {} — {:.500}", attempt + 1, status, body_text);
                 continue;
             }
 
@@ -427,6 +421,11 @@ impl Operator for OrangeOperator {
                 serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
             let next_step = body.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
             tracing::info!("push poll {}: nextStep={:?}", attempt + 1, next_step);
+
+            // Log full body on any step other than still-pending authnByApp.
+            if next_step != "authnByApp" {
+                tracing::debug!("push poll {}: FULL BODY = {}", attempt + 1, body_text);
+            }
 
             match next_step {
                 "end" => {
@@ -437,9 +436,50 @@ impl Operator for OrangeOperator {
                 }
                 "feedback" => {
                     return Err(OperatorError::AuthFailed(format!(
-                        "push auth rejected: {}",
-                        &body_text[..body_text.len().min(300)]
+                        "push auth rejected: {}", body_text
                     )));
+                }
+                "remoteAccounts" => {
+                    // Orange asks user to pick an account (e.g. after mobile approval).
+                    // Extract the first account and auto-select it.
+                    let accounts = body
+                        .pointer("/data/remoteAccountsScreen/accounts")
+                        .and_then(|v| v.as_array())
+                        .cloned()
+                        .unwrap_or_default();
+
+                    tracing::info!(
+                        "Orange remoteAccounts: {} account(s) available",
+                        accounts.len()
+                    );
+
+                    if accounts.is_empty() {
+                        tracing::warn!("Orange remoteAccounts: no accounts in list; full body={}", body_text);
+                        // Keep polling — maybe accounts appear on next poll
+                        continue;
+                    }
+
+                    let first = &accounts[0];
+                    tracing::info!("Orange: auto-selecting account: {}", first);
+
+                    let builder = self
+                        .client
+                        .post(format!("{}/api/remoteAccounts", login_base))
+                        .header("Origin", &login_base)
+                        .header("Referer", &referer)
+                        .header("Accept", "application/json, text/plain, */*")
+                        .json(first);
+                    match self.with_xsrf(builder).send().await {
+                        Ok(r) => {
+                            let s = r.status();
+                            let b = r.text().await.unwrap_or_default();
+                            tracing::info!("Orange /api/remoteAccounts: {} — {}", s, b);
+                        }
+                        Err(e) => {
+                            tracing::warn!("Orange /api/remoteAccounts error: {}", e);
+                        }
+                    }
+                    // Continue polling — next /api/access should advance the step
                 }
                 // "authnByApp" / "push" / unknown — still pending; keep polling
                 other => {
