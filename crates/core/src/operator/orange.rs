@@ -168,6 +168,12 @@ impl Default for OrangeOperator {
     }
 }
 
+/// Top-level Orange channel list response: `{"channels": [...]}`
+#[derive(Deserialize)]
+struct OrangeChannelList {
+    channels: Vec<OrangeChannel>,
+}
+
 /// Shape of one item in the Orange channel list response.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -602,8 +608,8 @@ impl Operator for OrangeOperator {
                     }
                 };
                 tracing::debug!("Orange channels body: {:.500}", body_text);
-                let channels_raw: Vec<OrangeChannel> = match serde_json::from_str(&body_text) {
-                    Ok(v) => v,
+                let channels_raw: Vec<OrangeChannel> = match serde_json::from_str::<OrangeChannelList>(&body_text) {
+                    Ok(wrapper) => wrapper.channels,
                     Err(e) => {
                         warn!("Orange: channel list parse error: {} — body: {:.300}", e, body_text);
                         return Ok(parse_m3u(FALLBACK_M3U));
@@ -912,19 +918,21 @@ mod tests {
         Mock::given(method("GET"))
             .and(path("/channels"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!([
-                    {
-                        "idEPG": "TF1",
-                        "name": "TF1",
-                        "displayOrder": 1,
-                        "logos": [{"urlService": "https://logos.example.com/tf1.png"}]
-                    },
-                    {
-                        "idEPG": "BFMTV",
-                        "name": "BFM TV",
-                        "displayOrder": 15
-                    }
-                ])),
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "channels": [
+                        {
+                            "idEPG": "TF1",
+                            "name": "TF1",
+                            "displayOrder": 1,
+                            "logos": [{"urlService": "https://logos.example.com/tf1.png"}]
+                        },
+                        {
+                            "idEPG": "BFMTV",
+                            "name": "BFM TV",
+                            "displayOrder": 15
+                        }
+                    ]
+                })),
             )
             .mount(&mock)
             .await;
