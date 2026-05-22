@@ -17,6 +17,20 @@ impl OperatorKind {
             Self::Bouygues => "Bouygues Bbox",
         }
     }
+    /// The stable config/keyring identifier string.
+    pub fn config_str(&self) -> &'static str {
+        match self {
+            Self::Orange => "orange",
+            Self::Bouygues => "bouygues",
+        }
+    }
+    pub fn from_config_str(s: &str) -> Option<Self> {
+        match s {
+            "orange"   => Some(Self::Orange),
+            "bouygues" => Some(Self::Bouygues),
+            _ => None,
+        }
+    }
     pub fn requires_auth(&self) -> bool { true }
 }
 

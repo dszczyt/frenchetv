@@ -19,10 +19,10 @@ enum AsyncMsg {
     ChannelsOk {
         channels: Vec<Channel>,
         operator: SharedOperator,
-        /// Session token to persist (wassup / equivalent).
+        /// Session token to persist (e.g. wassup cookie).
         session_token: Option<String>,
-        /// Operator name and username for keyring key.
-        operator_name: String,
+        /// config_str() key ("orange", "bouygues") — used for keyring + config.
+        kind_str: String,
         username: String,
     },
     ChannelsErr(String),
@@ -55,10 +55,9 @@ impl App {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
         let config = Config::load().unwrap_or_default();
-        let initial_screen = Screen::Setup(SetupScreen::new());
 
         let mut app = Self {
-            screen: initial_screen,
+            screen: Screen::Setup(SetupScreen::new()),
             channels: Vec::new(),
             current_operator: None,
             tx,
@@ -68,12 +67,12 @@ impl App {
         };
 
         // Attempt silent session restore if we have a saved operator + username.
-        let op_kind = &config.operator.kind;
-        let username = &config.operator.username;
-        if !op_kind.is_empty() && !username.is_empty() {
-            if let Some(kind) = Self::parse_operator_kind(op_kind) {
-                if let Some(token) = keyring_session::load_session(op_kind, username) {
-                    app.start_restore_session(kind, username.clone(), token);
+        let kind_str = config.operator.kind.clone();
+        let username  = config.operator.username.clone();
+        if !kind_str.is_empty() && !username.is_empty() {
+            if let Some(kind) = OperatorKind::from_config_str(&kind_str) {
+                if let Some(token) = keyring_session::load_session(&kind_str, &username) {
+                    app.start_restore_session(kind, kind_str, username, token);
                 }
             }
         }
@@ -81,31 +80,24 @@ impl App {
         app
     }
 
-    /// Map config string → OperatorKind.
-    fn parse_operator_kind(s: &str) -> Option<OperatorKind> {
-        match s {
-            "orange"   => Some(OperatorKind::Orange),
-            "bouygues" => Some(OperatorKind::Bouygues),
-            _ => None,
-        }
-    }
-
-    /// Spawn: try to restore session from stored token.
-    /// On success → ChannelsOk (skips auth screen).
-    /// On failure → clears keyring, shows setup screen (via AuthErr).
-    fn start_restore_session(&self, kind: OperatorKind, username: String, token: String) {
-        let tx = self.tx.clone();
+    /// Spawn: restore session from stored token.
+    /// Success → ChannelsOk (skip auth screen).
+    /// Failure → clears stale keyring entry, Setup screen stays (no error shown).
+    fn start_restore_session(
+        &self,
+        kind: OperatorKind,
+        kind_str: String,
+        username: String,
+        token: String,
+    ) {
+        let tx  = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
-            let op_name = op.name().to_string();
             if let Err(e) = op.restore_session(&token).await {
-                tracing::info!("Session restore failed ({}); will re-auth", e);
-                // Clear stale token; user will see setup screen.
-                keyring_session::clear_session(&op_name, &username);
-                let _ = tx.send(AsyncMsg::AuthErr(
-                    format!("Session expirée, veuillez vous reconnecter.")
-                ));
+                tracing::info!("Session restore failed ({}); showing setup screen", e);
+                keyring_session::clear_session(&kind_str, &username);
+                // Don't send AuthErr — setup screen is already visible, no message needed.
                 ctx.request_repaint();
                 return;
             }
@@ -117,7 +109,7 @@ impl App {
                         channels,
                         operator: shared,
                         session_token,
-                        operator_name: op_name,
+                        kind_str,
                         username,
                     });
                 }
@@ -130,15 +122,13 @@ impl App {
     }
 
     /// Spawn: authenticate → fetch_channels → send ChannelsOk (or AuthErr / ChannelsErr).
-    /// For operators that use phased auth (e.g. Orange push notification), sends
-    /// PushAuthPending first so the UI can show the wait screen, then continues
-    /// polling in the same task.
+    /// For operators with phased auth (Orange push), sends PushAuthPending first.
     fn start_auth(&self, kind: OperatorKind, username: String, password: String) {
-        let tx = self.tx.clone();
-        let ctx = self.egui_ctx.clone();
+        let tx      = self.tx.clone();
+        let ctx     = self.egui_ctx.clone();
+        let kind_str = kind.config_str().to_string();
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
-            let op_name = op.name().to_string();
 
             let auth_ok = if op.uses_phased_auth() {
                 match op.begin_auth(&username).await {
@@ -158,7 +148,6 @@ impl App {
                         }
                     }
                     Ok(AuthPhase::Push) => {
-                        // Signal the UI to show the push-wait screen, then keep polling.
                         let _ = tx.send(AsyncMsg::PushAuthPending);
                         ctx.request_repaint();
                         match op.wait_for_push_auth(&password).await {
@@ -194,7 +183,7 @@ impl App {
                         channels,
                         operator: shared,
                         session_token,
-                        operator_name: op_name,
+                        kind_str,
                         username,
                     });
                 }
@@ -208,9 +197,9 @@ impl App {
 
     /// Spawn: resolve_stream using the stored (authenticated) operator.
     fn start_resolve_stream(&self, channel: Channel) {
-        let tx = self.tx.clone();
+        let tx  = self.tx.clone();
         let ctx = self.egui_ctx.clone();
-        let op = match &self.current_operator {
+        let op  = match &self.current_operator {
             Some(op) => op.clone(),
             None => {
                 tracing::error!("resolve_stream called with no operator");
@@ -218,18 +207,13 @@ impl App {
             }
         };
         self.rt.spawn(async move {
-            // Release lock before sending so concurrent resolutions don't block
             let result = {
                 let op = op.lock().await;
                 op.resolve_stream(&channel).await
             };
             match result {
-                Ok(stream) => {
-                    let _ = tx.send(AsyncMsg::StreamOk { channel, stream });
-                }
-                Err(e) => {
-                    let _ = tx.send(AsyncMsg::StreamErr(e.to_string()));
-                }
+                Ok(stream) => { let _ = tx.send(AsyncMsg::StreamOk { channel, stream }); }
+                Err(e)     => { let _ = tx.send(AsyncMsg::StreamErr(e.to_string()));     }
             }
             ctx.request_repaint();
         });
@@ -239,7 +223,6 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AsyncMsg::AuthErr(err) => {
-                    // Show error on setup or push-wait screen; go back to setup if needed.
                     match &mut self.screen {
                         Screen::Setup(s) => {
                             s.set_error(format!("Connexion échouée : {}", err));
@@ -255,22 +238,17 @@ impl App {
                 AsyncMsg::PushAuthPending => {
                     self.screen = Screen::PushWait(PushWaitScreen::new());
                 }
-                AsyncMsg::ChannelsOk { channels, operator, session_token, operator_name, username } => {
-                    // Persist session token + operator config for next launch.
+                AsyncMsg::ChannelsOk { channels, operator, session_token, kind_str, username } => {
+                    // Persist session token + operator/username for next launch.
                     if let Some(ref token) = session_token {
-                        keyring_session::save_session(&operator_name, &username, token);
-                        // Save operator kind + username to config (not the password).
-                        let kind_str = match operator_name.as_str() {
-                            "Orange TV"    => "orange",
-                            "Bouygues Bbox" => "bouygues",
-                            other           => other,
-                        };
+                        keyring_session::save_session(&kind_str, &username, token);
                         let mut cfg = Config::load().unwrap_or_default();
-                        cfg.operator.kind     = kind_str.to_string();
+                        cfg.operator.kind     = kind_str.clone();
                         cfg.operator.username = username.clone();
                         if let Err(e) = cfg.save() {
                             tracing::warn!("Failed to save config: {}", e);
                         }
+                        tracing::info!("Session saved for {}:{}", kind_str, username);
                     }
                     self.channels = channels.clone();
                     self.current_operator = Some(operator);
@@ -313,9 +291,8 @@ impl eframe::App for App {
                 }
             }
             Screen::Player(player) => {
-                let channels = self.channels.clone();
-                // Extract before show() borrows player mutably
-                let current_id = player.channel.id.clone();
+                let channels    = self.channels.clone();
+                let current_id  = player.channel.id.clone();
                 match player.show(ctx) {
                     PlayerAction::Back => {
                         self.screen = Screen::ChannelList(ChannelListScreen::new(channels));
