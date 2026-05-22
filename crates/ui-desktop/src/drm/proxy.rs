@@ -158,13 +158,25 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     let real_url = cdn_path_to_url(cdn_path)?;
     tracing::debug!("DRM proxy → {}", real_url);
 
-    let mut req = state.client.get(&real_url);
-    for (k, v) in &state.cdn_headers {
-        req = req.header(k.as_str(), v.as_str());
-    }
-    let resp = req.send().await.context("CDN fetch")?;
+    // Orange's CDN uses signed URLs (token embedded in path).  Sending
+    // Origin/Referer/Cookie headers triggers CDN CORS rules and returns 400;
+    // Kodi's inputstream.adaptive fetches segments with no extra headers.
+    // Only forward a browser-like User-Agent so the CDN recognises the request.
+    let user_agent = state.cdn_headers.iter()
+        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
+        .map(|(_, v)| v.as_str())
+        .unwrap_or("Mozilla/5.0");
+    let resp = state.client.get(&real_url)
+        .header("User-Agent", user_agent)
+        .send().await.context("CDN fetch")?;
     if !resp.status().is_success() {
-        bail!("CDN returned {}", resp.status());
+        let status = resp.status();
+        for (k, v) in resp.headers() {
+            tracing::debug!("DRM proxy CDN error header: {}: {}", k, v.to_str().unwrap_or("?"));
+        }
+        let body = resp.text().await.unwrap_or_default();
+        tracing::debug!("DRM proxy CDN error body: {}", &body[..body.len().min(500)]);
+        bail!("CDN returned {}", status);
     }
     let data = resp.bytes().await.context("CDN body")?;
 
