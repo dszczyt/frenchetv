@@ -206,6 +206,9 @@ struct OrangeChannel {
     /// Technical stream descriptors — live[0].techChannelId is the stream API key.
     #[serde(default)]
     technical_channels: OrangeTechnicalChannels,
+    /// Human-readable channel identifier used in editorial/content systems.
+    #[serde(default)]
+    edito_channel_id: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -218,8 +221,11 @@ struct OrangeTechnicalChannels {
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OrangeTechLiveChannel {
-    /// The identifier passed to the stream mediation API (`/live/{techChannelId}`).
     tech_channel_id: String,
+    /// Relative path used in stream URL, e.g. "livetv_tf1_ctv".
+    /// JSON key uses uppercase "URL" so we override serde's lowercase conversion.
+    #[serde(rename = "liveTargetURLRelativePath", default)]
+    live_target_url_relative_path: String,
 }
 
 /// One logo variant (e.g. "webTVLogo", "webTVSquare", "mobileAppli", …).
@@ -649,10 +655,19 @@ impl Operator for OrangeOperator {
                         return Ok(parse_m3u(FALLBACK_M3U));
                     }
                 };
-                // Dump first channel's full JSON so we can identify stream ID fields.
+                // Log key channels to identify the correct stream identifier.
                 if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
-                    if let Some(first) = v["channels"].as_array().and_then(|a| a.first()) {
-                        tracing::info!("Orange: first channel raw JSON = {}", first);
+                    if let Some(channels_arr) = v["channels"].as_array() {
+                        for ch in channels_arr {
+                            let name = ch["name"].as_str().unwrap_or("");
+                            if ["TF1","France 2","FRANCE 2","France 3","FRANCE 3","M6"].contains(&name) {
+                                tracing::info!(
+                                    "Orange stream debug: name={} idEPG={} editoChannelId={:?} techLive={}",
+                                    name, ch["idEPG"], ch["editoChannelId"],
+                                    ch["technicalChannels"]["live"]
+                                );
+                            }
+                        }
                     }
                 }
                 let channels_raw: Vec<OrangeChannel> = match serde_json::from_str::<OrangeChannelList>(&body_text) {
@@ -682,9 +697,15 @@ impl Operator for OrangeOperator {
                             });
                         let locked = !c.allowed_device_categories.is_empty()
                             && !c.allowed_device_categories.iter().any(|s| s == "W_PC");
-                        // Use techChannelId for stream resolution; fall back to idEPG.
+                        // Prefer liveTargetURLRelativePath → techChannelId → idEPG.
                         let stream_id = c.technical_channels.live.first()
-                            .map(|tc| tc.tech_channel_id.clone())
+                            .map(|tc| {
+                                if !tc.live_target_url_relative_path.is_empty() {
+                                    tc.live_target_url_relative_path.clone()
+                                } else {
+                                    tc.tech_channel_id.clone()
+                                }
+                            })
                             .unwrap_or_else(|| c.id_epg.to_string());
                         Channel {
                             id: stream_id,
@@ -1017,7 +1038,7 @@ mod tests {
                                 {"definitionType": "mobileAppli", "listLogos": [{"path": "%2Flogos%2Ftf1.png", "size": "183x183"}]}
                             ],
                             "technicalChannels": {
-                                "live": [{"techChannelId": "100001", "type": "DTT", "usi": 100001}]
+                                "live": [{"techChannelId": "100001", "liveTargetURLRelativePath": "livetv_tf1_ctv", "type": "CLOUDTV", "usi": 100001}]
                             }
                         },
                         {
@@ -1044,8 +1065,8 @@ mod tests {
 
         let channels = op.fetch_channels().await.unwrap();
         assert_eq!(channels.len(), 2);
-        // TF1 has technicalChannels → id comes from techChannelId
-        assert_eq!(channels[0].id, "100001");
+        // TF1 has liveTargetURLRelativePath → id comes from that (not techChannelId)
+        assert_eq!(channels[0].id, "livetv_tf1_ctv");
         assert_eq!(channels[0].number, Some(1));
         assert_eq!(
             channels[0].logo_url.as_deref(),
