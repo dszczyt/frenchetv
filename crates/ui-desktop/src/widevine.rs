@@ -1,13 +1,15 @@
-/// Widevine CDM downloader.
+/// Widevine CDM installer.
 ///
-/// Downloads libwidevinecdm.so from Google's component update server and stores
-/// it under `~/.local/share/frenchetv/widevine/`.  mpv 0.40+ can load it via
-/// `--cdm-store=<dir>` when compiled with `--enable-cdm`.
+/// Strategy (in order):
+///   1. Copy `libwidevinecdm.so` from a locally-installed Chrome/Chromium.
+///   2. Download via Google's Omaha update server (XML POST → ZIP extract).
+///
+/// The CDM is stored at `~/.local/share/frenchetv/widevine/libwidevinecdm.so`.
+/// mpv picks it up via `--cdm-store=<dir>` when compiled with `--enable-cdm`.
 
 use std::path::PathBuf;
 use anyhow::{bail, Context, Result};
 
-/// Widevine component ID on Google's update server (architecture-independent key).
 const WIDEVINE_COMPONENT_ID: &str = "oimompecagnajdejgnnjijobebaeigek";
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -20,155 +22,197 @@ pub fn dir() -> PathBuf {
         .join("widevine")
 }
 
-/// Full path to `libwidevinecdm.so` inside the local store.
+/// Full path to the local CDM copy.
 pub fn cdm_path() -> PathBuf {
     dir().join("libwidevinecdm.so")
 }
 
-/// Returns true when the CDM is already present on disk.
+/// `true` when the CDM is already on disk.
 pub fn is_installed() -> bool {
     cdm_path().exists()
 }
 
 // ── Architecture ──────────────────────────────────────────────────────────────
 
+/// Platform subdirectory as Google names it inside the CRX/ZIP.
+fn platform_dir() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "linux_arm64",
+        _         => "linux_x64",
+    }
+}
+
+/// Arch tag used in Omaha requests and ZIP package names.
 fn arch_tag() -> &'static str {
     match std::env::consts::ARCH {
-        "x86_64"  => "x64",
         "aarch64" => "arm64",
         _         => "x64",
     }
 }
 
+/// nacl_arch used in Omaha requests.
 fn nacl_arch() -> &'static str {
     match std::env::consts::ARCH {
-        "x86_64"  => "x86-64",
         "aarch64" => "arm64",
         _         => "x86-64",
     }
 }
 
-// ── Version query ─────────────────────────────────────────────────────────────
+// ── Strategy 1: copy from installed Chrome/Chromium ──────────────────────────
 
-/// Ask Google's Omaha/CRX update endpoint for the current Widevine version.
-/// Returns something like `"4.10.3050.0"`.
-// ── CRX download & extraction ─────────────────────────────────────────────────
-
-/// Download and unpack `libwidevinecdm.so` from Google's servers.
-///
-/// The package is a CRX3 file (Chrome Extension) whose payload is a plain ZIP.
-/// CRX3 header layout:
-///   bytes  0– 3  magic  "Cr24"
-///   bytes  4– 7  version 3  (LE uint32)
-///   bytes  8–11  header_size  (LE uint32)
-///   bytes 12..12+header_size  protobuf header (skipped)
-///   rest         ZIP data containing libwidevinecdm.so
-fn extract_cdm_from_crx(crx: &[u8]) -> Result<Vec<u8>> {
-    if crx.len() < 12 || &crx[0..4] != b"Cr24" {
-        bail!("not a CRX3 file (wrong magic)");
-    }
-    let version = u32::from_le_bytes(crx[4..8].try_into().unwrap());
-    if version != 3 {
-        bail!("unsupported CRX version {version}; expected 3");
-    }
-    let header_size = u32::from_le_bytes(crx[8..12].try_into().unwrap()) as usize;
-    let zip_start   = 12 + header_size;
-    if zip_start >= crx.len() {
-        bail!("CRX header truncated");
-    }
-
-    let cursor = std::io::Cursor::new(&crx[zip_start..]);
-    let mut archive = zip::ZipArchive::new(cursor)
-        .context("parsing inner ZIP")?;
-
-    let mut cdm_bytes = Vec::new();
-    let mut found = false;
-    for i in 0..archive.len() {
-        let mut entry = archive.by_index(i)?;
-        if entry.name().ends_with("libwidevinecdm.so") {
-            std::io::copy(&mut entry, &mut cdm_bytes)
-                .context("extracting libwidevinecdm.so")?;
-            found = true;
-            break;
-        }
-    }
-    if !found {
-        bail!("libwidevinecdm.so not found inside CRX/ZIP");
-    }
-    Ok(cdm_bytes)
+fn system_cdm_candidates() -> Vec<PathBuf> {
+    let plat = platform_dir();
+    [
+        format!("/opt/google/chrome/WidevineCdm/_platform_specific/{plat}/libwidevinecdm.so"),
+        format!("/opt/google/chrome-beta/WidevineCdm/_platform_specific/{plat}/libwidevinecdm.so"),
+        format!("/opt/google/chrome-unstable/WidevineCdm/_platform_specific/{plat}/libwidevinecdm.so"),
+        format!("/usr/lib/chromium/WidevineCdm/_platform_specific/{plat}/libwidevinecdm.so"),
+        format!("/usr/lib/chromium-browser/WidevineCdm/_platform_specific/{plat}/libwidevinecdm.so"),
+        format!("/snap/chromium/current/usr/lib/chromium-browser/WidevineCdm/_platform_specific/{plat}/libwidevinecdm.so"),
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .collect()
 }
 
-// ── Public install entry-point ────────────────────────────────────────────────
+fn try_copy_from_system() -> Option<()> {
+    for src in system_cdm_candidates() {
+        if src.exists() {
+            let dest_dir = dir();
+            std::fs::create_dir_all(&dest_dir).ok()?;
+            std::fs::copy(&src, cdm_path()).ok()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(cdm_path(), std::fs::Permissions::from_mode(0o755));
+            }
+            tracing::info!("widevine: copied CDM from {}", src.display());
+            return Some(());
+        }
+    }
+    None
+}
 
-/// Download the Widevine CDM and store it in the frenchetv local data dir.
-///
-/// No-op if already installed; callers can check [`is_installed`] first.
+// ── Strategy 2: Omaha XML download ───────────────────────────────────────────
+
+/// POST to Google's Omaha update server; parse codebase + package name.
+async fn omaha_fetch_url(client: &reqwest::Client) -> Result<String> {
+    let arch = arch_tag();
+    let body = format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<request protocol="3.0">
+  <os platform="linux" arch="{arch}"/>
+  <app appid="{id}" version="0.0.0.0">
+    <updatecheck/>
+  </app>
+</request>"#,
+        arch = arch,
+        id   = WIDEVINE_COMPONENT_ID,
+    );
+
+    let xml = client
+        .post("https://clients2.google.com/service/update2")
+        .header("Content-Type", "application/xml")
+        .header(
+            "User-Agent",
+            "GoogleUpdate/1.3.36.372;winhttp;cup-ecdsa",
+        )
+        .body(body)
+        .send()
+        .await
+        .context("Omaha POST failed")?
+        .text()
+        .await
+        .context("reading Omaha response")?;
+
+    tracing::debug!("widevine omaha response: {}", xml);
+
+    // Extract codebase="..." and name="..." without an XML crate.
+    let codebase = xml
+        .split("codebase=\"")
+        .nth(1)
+        .and_then(|s| s.split('"').next())
+        .ok_or_else(|| anyhow::anyhow!("codebase not found in Omaha response"))?
+        .to_string();
+
+    let package_name = xml
+        .split("name=\"")
+        .find_map(|s| {
+            let n = s.split('"').next()?;
+            if n.ends_with(".zip") { Some(n.to_string()) } else { None }
+        })
+        .ok_or_else(|| anyhow::anyhow!("package name (.zip) not found in Omaha response"))?;
+
+    Ok(format!("{}{}", codebase, package_name))
+}
+
+/// Find `libwidevinecdm.so` anywhere inside a ZIP archive.
+fn extract_cdm_from_zip(bytes: &[u8]) -> Result<Vec<u8>> {
+    let cursor  = std::io::Cursor::new(bytes);
+    let mut arc = zip::ZipArchive::new(cursor).context("parsing ZIP")?;
+
+    for i in 0..arc.len() {
+        let mut entry = arc.by_index(i)?;
+        if entry.name().ends_with("libwidevinecdm.so") {
+            let mut buf = Vec::new();
+            std::io::copy(&mut entry, &mut buf).context("extracting CDM")?;
+            return Ok(buf);
+        }
+    }
+    bail!("libwidevinecdm.so not found inside ZIP")
+}
+
+async fn download_from_omaha(client: &reqwest::Client) -> Result<()> {
+    let url = omaha_fetch_url(client).await?;
+    tracing::info!("widevine: downloading ZIP from {}", url);
+
+    let bytes = client
+        .get(&url)
+        .send()
+        .await
+        .context("CDM ZIP download")?
+        .error_for_status()
+        .context("CDM ZIP HTTP error")?
+        .bytes()
+        .await
+        .context("reading CDM ZIP bytes")?;
+
+    tracing::info!("widevine: downloaded {} bytes", bytes.len());
+    if bytes.is_empty() {
+        bail!("CDM ZIP download returned 0 bytes");
+    }
+
+    let cdm = extract_cdm_from_zip(&bytes)?;
+
+    let dest_dir = dir();
+    std::fs::create_dir_all(&dest_dir).context("creating widevine dir")?;
+    std::fs::write(cdm_path(), &cdm).context("writing libwidevinecdm.so")?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(cdm_path(), std::fs::Permissions::from_mode(0o755))
+            .context("setting CDM permissions")?;
+    }
+
+    tracing::info!("widevine: installed {} bytes → {}", cdm.len(), cdm_path().display());
+    Ok(())
+}
+
+// ── Public entry-point ────────────────────────────────────────────────────────
+
+/// Install the Widevine CDM.  No-op if already present ([`is_installed`]).
 pub async fn install() -> Result<()> {
+    // Fast path: copy from an already-installed Chrome/Chromium.
+    if try_copy_from_system().is_some() {
+        return Ok(());
+    }
+    tracing::info!("widevine: no system CDM found, downloading via Omaha");
+
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(60))
         .build()
         .context("building reqwest client")?;
 
-    // Build CRX redirect URL — Google resolves the current version and
-    // architecture server-side.  reqwest follows the redirect automatically.
-    let arch  = arch_tag();
-    let nacl  = nacl_arch();
-    let prod  = "110.0.5481.100";
-    let url = format!(
-        "https://clients2.google.com/service/update2/crx\
-         ?response=redirect\
-         &acceptformat=crx3\
-         &prodversion={prod}\
-         &arch={arch}\
-         &nacl_arch={nacl}\
-         &os=linux\
-         &x=id%3D{id}%26v%3D0.0.0.0%26uc",
-        prod = prod,
-        arch = arch,
-        nacl = nacl,
-        id   = WIDEVINE_COMPONENT_ID,
-    );
-    tracing::info!("widevine: downloading from {}", url);
-
-    // Download (follows redirects automatically).
-    let crx_bytes = client
-        .get(&url)
-        .header("User-Agent", format!(
-            "Mozilla/5.0 (X11; Linux {raw}) AppleWebKit/537.36 Chrome/{prod}",
-            raw  = std::env::consts::ARCH,
-            prod = prod,
-        ))
-        .send()
-        .await
-        .context("downloading Widevine CRX")?
-        .error_for_status()
-        .context("Widevine download HTTP error")?
-        .bytes()
-        .await
-        .context("reading Widevine CRX bytes")?;
-
-    tracing::info!("widevine: downloaded {} bytes", crx_bytes.len());
-
-    // Extract.
-    let cdm = extract_cdm_from_crx(&crx_bytes)
-        .context("extracting Widevine CDM from CRX")?;
-
-    // Write to disk.
-    let dest_dir = dir();
-    std::fs::create_dir_all(&dest_dir)
-        .context("creating widevine dir")?;
-    let dest = cdm_path();
-    std::fs::write(&dest, &cdm)
-        .context("writing libwidevinecdm.so")?;
-
-    // Mark executable.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o755))
-            .context("setting CDM permissions")?;
-    }
-
-    tracing::info!("widevine: installed {} bytes → {}", cdm.len(), dest.display());
-    Ok(())
+    download_from_omaha(&client).await
 }

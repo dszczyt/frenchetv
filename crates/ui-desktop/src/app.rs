@@ -282,8 +282,15 @@ impl App {
                     let _ = tx.send(AsyncMsg::SessionExpired);
                 }
                 Err(e) => {
-                    tracing::error!("resolve_stream error: {}", e);
-                    let _ = tx.send(AsyncMsg::StreamErr(e.to_string()));
+                    // Print full source chain to expose the root transport error.
+                    let mut msg = format!("{}", e);
+                    let mut src: Option<&dyn std::error::Error> = std::error::Error::source(&e);
+                    while let Some(cause) = src {
+                        msg.push_str(&format!(" → {}", cause));
+                        src = cause.source();
+                    }
+                    tracing::error!("resolve_stream error: {}", msg);
+                    let _ = tx.send(AsyncMsg::StreamErr(msg));
                 }
             }
             ctx.request_repaint();
