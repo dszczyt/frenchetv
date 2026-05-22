@@ -203,6 +203,23 @@ struct OrangeChannel {
     /// Platform availability flags — absence of "W_PC" means locked on desktop.
     #[serde(default)]
     allowed_device_categories: Vec<String>,
+    /// Technical stream descriptors — live[0].techChannelId is the stream API key.
+    #[serde(default)]
+    technical_channels: OrangeTechnicalChannels,
+}
+
+#[derive(Deserialize, Default)]
+struct OrangeTechnicalChannels {
+    #[serde(default)]
+    live: Vec<OrangeTechLiveChannel>,
+}
+
+/// One live technical channel entry — carries the ID used by the stream mediation API.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrangeTechLiveChannel {
+    /// The identifier passed to the stream mediation API (`/live/{techChannelId}`).
+    tech_channel_id: String,
 }
 
 /// One logo variant (e.g. "webTVLogo", "webTVSquare", "mobileAppli", …).
@@ -632,7 +649,12 @@ impl Operator for OrangeOperator {
                         return Ok(parse_m3u(FALLBACK_M3U));
                     }
                 };
-                tracing::debug!("Orange channels body: {:.1000}", body_text);
+                // Dump first channel's full JSON so we can identify stream ID fields.
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body_text) {
+                    if let Some(first) = v["channels"].as_array().and_then(|a| a.first()) {
+                        tracing::info!("Orange: first channel raw JSON = {}", first);
+                    }
+                }
                 let channels_raw: Vec<OrangeChannel> = match serde_json::from_str::<OrangeChannelList>(&body_text) {
                     Ok(wrapper) => wrapper.channels,
                     Err(e) => {
@@ -660,8 +682,12 @@ impl Operator for OrangeOperator {
                             });
                         let locked = !c.allowed_device_categories.is_empty()
                             && !c.allowed_device_categories.iter().any(|s| s == "W_PC");
+                        // Use techChannelId for stream resolution; fall back to idEPG.
+                        let stream_id = c.technical_channels.live.first()
+                            .map(|tc| tc.tech_channel_id.clone())
+                            .unwrap_or_else(|| c.id_epg.to_string());
                         Channel {
-                            id: c.id_epg.to_string(),
+                            id: stream_id,
                             name: c.name,
                             logo_url,
                             number: c.display_order,
@@ -724,9 +750,13 @@ impl Operator for OrangeOperator {
             self.stream_base, channel.id
         );
 
+        tracing::info!("Orange resolve_stream: GET {} (tv_token len={})", stream_url, tv_token.len());
         let mut req = self.client
             .get(&stream_url)
-            .header("tv_token", format!("Bearer {}", tv_token));
+            .header("tv_token", format!("Bearer {}", tv_token))
+            .header("Accept", "application/json, text/plain, */*")
+            .header("Origin", "https://tv.orange.fr")
+            .header("Referer", "https://tv.orange.fr/");
         if let Some(w) = &self.wassup {
             req = req.header("Cookie", format!("wassup={}", w));
         }
@@ -985,7 +1015,10 @@ mod tests {
                             "logos": [
                                 {"definitionType": "webTVLogo", "listLogos": [{"path": "https://logos.example.com/tf1.png", "size": "180x96"}]},
                                 {"definitionType": "mobileAppli", "listLogos": [{"path": "%2Flogos%2Ftf1.png", "size": "183x183"}]}
-                            ]
+                            ],
+                            "technicalChannels": {
+                                "live": [{"techChannelId": "100001", "type": "DTT", "usi": 100001}]
+                            }
                         },
                         {
                             "idEPG": 15,
@@ -1011,12 +1044,14 @@ mod tests {
 
         let channels = op.fetch_channels().await.unwrap();
         assert_eq!(channels.len(), 2);
-        assert_eq!(channels[0].id, "1");
+        // TF1 has technicalChannels → id comes from techChannelId
+        assert_eq!(channels[0].id, "100001");
         assert_eq!(channels[0].number, Some(1));
         assert_eq!(
             channels[0].logo_url.as_deref(),
             Some("https://logos.example.com/tf1.png")
         );
+        // BFM TV has no technicalChannels → id falls back to idEPG
         assert_eq!(channels[1].id, "15");
         assert_eq!(channels[1].number, Some(15));
     }

@@ -1,6 +1,7 @@
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, Vec2};
 use frenchetv_core::{Channel, ChannelCategory};
 use crate::app::LogoCache;
+use tracing::info;
 
 pub struct ChannelListScreen {
     channels: Vec<Channel>,
@@ -228,6 +229,9 @@ impl ChannelListScreen {
                                     .interact(egui::Sense::click())
                                     .clicked();
 
+                                if clicked {
+                                    info!("tile clicked: '{}' locked={}", channel.name, is_locked);
+                                }
                                 if !is_locked && clicked {
                                     action = ChannelListAction::SelectChannel((*channel).clone());
                                 }

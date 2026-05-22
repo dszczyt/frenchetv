@@ -239,14 +239,22 @@ impl App {
             Some(op) => op.clone(),
             None => { tracing::error!("resolve_stream called with no operator"); return; }
         };
+        tracing::info!("resolve_stream: starting for channel '{}' (id={})", channel.name, channel.id);
         self.rt.spawn(async move {
             let result = { let op = op.lock().await; op.resolve_stream(&channel).await };
             match result {
-                Ok(stream) => { let _ = tx.send(AsyncMsg::StreamOk { channel, stream }); }
+                Ok(stream) => {
+                    tracing::info!("resolve_stream: ok → {}", stream.url);
+                    let _ = tx.send(AsyncMsg::StreamOk { channel, stream });
+                }
                 Err(OperatorError::InvalidCredentials) => {
+                    tracing::warn!("resolve_stream: 401/403 → SessionExpired");
                     let _ = tx.send(AsyncMsg::SessionExpired);
                 }
-                Err(e) => { let _ = tx.send(AsyncMsg::StreamErr(e.to_string())); }
+                Err(e) => {
+                    tracing::error!("resolve_stream: error → {}", e);
+                    let _ = tx.send(AsyncMsg::StreamErr(e.to_string()));
+                }
             }
             ctx.request_repaint();
         });
