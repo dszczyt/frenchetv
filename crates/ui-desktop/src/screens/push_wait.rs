@@ -47,8 +47,10 @@ impl PushWaitScreen {
 
                         ui.label(
                             RichText::new(
-                                "Ouvrez l'application Orange et Mobile\n\
-                                 et approuvez la demande de connexion.",
+                                "Une notification a été envoyée sur votre téléphone.\n\
+                                 Appuyez sur la notification Orange pour approuver,\n\
+                                 ou ouvrez l'appli Orange et cherchez\n\
+                                 une demande de connexion en attente.",
                             )
                             .font(FontId::proportional(15.0))
                             .color(Color32::from_rgb(160, 160, 160)),
