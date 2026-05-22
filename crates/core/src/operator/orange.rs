@@ -32,6 +32,8 @@ pub struct OrangeOperator {
     /// Tracking ID returned when `/api/access` responds with `authnByApp`.
     /// Used to poll `POST /api/authnByApp` until the user approves on their phone.
     authn_tracking_id: Option<String>,
+    /// Set to true once we have fired try_trigger_aba so we don't double-send.
+    trigger_aba_sent: bool,
 }
 
 impl OrangeOperator {
@@ -67,6 +69,7 @@ impl OrangeOperator {
             tv_token_expires: None,
             xsrf_token: None,
             authn_tracking_id: None,
+            trigger_aba_sent: false,
         }
     }
 
@@ -121,122 +124,29 @@ impl OrangeOperator {
         Ok(())
     }
 
-    /// Attempt to trigger the Orange push notification.
+    /// Trigger the Orange AOM (App-based Orange Mobile) push notification.
     ///
-    /// Orange uses `"api":"triggerABA"` in submitField.  The actual HTTP path is
-    /// `/triggerABA` (no `/api/` prefix).  POST returns 405 from nginx, so the
-    /// route exists but only accepts GET.  We try four candidates in order:
-    ///   1. `GET  {login_base}/triggerABA`              (likely correct)
-    ///   2. `GET  {login_base}/triggerABA?idTracking=…` (with tracking id)
-    ///   3. `POST {login_base}/triggerABA` + idTracking body
-    ///   4. `POST {login_base}/api/access` + submitField body  (last resort)
-    async fn try_trigger_aba(
-        &self,
-        login_base: &str,
-        referer: &str,
-        login_json: &serde_json::Value,
-    ) {
-        let submit_field = login_json
-            .pointer("/data/authnByAppScreen/submitField")
-            .cloned()
-            .unwrap_or(serde_json::json!({}));
-
-        let tracking_id = self
-            .authn_tracking_id
-            .as_deref()
-            .unwrap_or("");
-
-        // Candidate 1: GET /triggerABA (nginx rejected POST with 405 → route exists, try GET)
-        let url1 = format!("{}/triggerABA", login_base);
-        tracing::info!("Orange: trying push trigger GET {}", url1);
+    /// Discovered by reading the Orange login SPA source
+    /// (idme.cdn.s.woopic.com/idme-front-1.24.0/static/index-GtMxwKBR.js):
+    ///   `postAuthentAOM()` → `POST ${apiURL}/aom` with body `{}`
+    /// where `apiURL = '/api'` (injected at runtime via VITE_IDME_FRONT_API_URL).
+    async fn trigger_aom_push(&self, login_base: &str, referer: &str) {
+        let url = format!("{}/api/aom", login_base);
+        tracing::info!("Orange: triggering AOM push via POST {}", url);
         let builder = self
             .client
-            .get(&url1)
-            .header("Origin", login_base)
-            .header("Referer", referer)
-            .header("Accept", "application/json, text/plain, */*");
-        match self.with_xsrf(builder).send().await {
-            Ok(r) => {
-                let s = r.status();
-                let b = r.text().await.unwrap_or_default();
-                tracing::info!("Orange GET {}: {} — {:.200}", url1, s, b);
-                if s.is_success() {
-                    tracing::info!("Orange: push trigger succeeded (GET /triggerABA)");
-                    return;
-                }
-            }
-            Err(e) => tracing::warn!("Orange GET {}: {}", url1, e),
-        }
-
-        // Candidate 2: GET /triggerABA?idTracking=… (session may need tracking id)
-        if !tracking_id.is_empty() {
-            let url2 = format!("{}/triggerABA?idTracking={}", login_base, tracking_id);
-            tracing::info!("Orange: trying push trigger GET {}", url2);
-            let builder = self
-                .client
-                .get(&url2)
-                .header("Origin", login_base)
-                .header("Referer", referer)
-                .header("Accept", "application/json, text/plain, */*");
-            match self.with_xsrf(builder).send().await {
-                Ok(r) => {
-                    let s = r.status();
-                    let b = r.text().await.unwrap_or_default();
-                    tracing::info!("Orange GET {} (idTracking): {} — {:.200}", url2, s, b);
-                    if s.is_success() {
-                        tracing::info!("Orange: push trigger succeeded (GET /triggerABA?idTracking)");
-                        return;
-                    }
-                }
-                Err(e) => tracing::warn!("Orange GET {} (idTracking): {}", url2, e),
-            }
-        }
-
-        // Candidate 3: POST /triggerABA with idTracking body (maybe empty {} was wrong)
-        let url3 = format!("{}/triggerABA", login_base);
-        tracing::info!("Orange: trying push trigger POST {} + idTracking body", url3);
-        let body3 = if tracking_id.is_empty() {
-            serde_json::json!({})
-        } else {
-            serde_json::json!({ "idTracking": tracking_id })
-        };
-        let builder = self
-            .client
-            .post(&url3)
+            .post(&url)
             .header("Origin", login_base)
             .header("Referer", referer)
             .header("Accept", "application/json, text/plain, */*")
-            .json(&body3);
+            .json(&serde_json::json!({}));
         match self.with_xsrf(builder).send().await {
             Ok(r) => {
                 let s = r.status();
                 let b = r.text().await.unwrap_or_default();
-                tracing::info!("Orange POST {} (idTracking body): {} — {:.200}", url3, s, b);
-                if s.is_success() {
-                    tracing::info!("Orange: push trigger succeeded (POST /triggerABA + body)");
-                    return;
-                }
+                tracing::info!("Orange POST /api/aom: {} — {:.300}", s, b);
             }
-            Err(e) => tracing::warn!("Orange POST {} (body): {}", url3, e),
-        }
-
-        // Candidate 4: POST /api/access with the submitField as body (last resort)
-        let url4 = format!("{}/api/access", login_base);
-        tracing::info!("Orange: trying push trigger POST {} (submitField body)", url4);
-        let builder = self
-            .client
-            .post(&url4)
-            .header("Origin", login_base)
-            .header("Referer", referer)
-            .header("Accept", "application/json, text/plain, */*")
-            .json(&submit_field);
-        match self.with_xsrf(builder).send().await {
-            Ok(r) => {
-                let s = r.status();
-                let b = r.text().await.unwrap_or_default();
-                tracing::info!("Orange POST {} (submitField): {} — {:.200}", url4, s, b);
-            }
-            Err(e) => tracing::warn!("Orange POST {} (submitField): {}", url4, e),
+            Err(e) => tracing::warn!("Orange POST /api/aom: {}", e),
         }
     }
 
@@ -355,41 +265,19 @@ impl Operator for OrangeOperator {
             }
             "authnByApp" => {
                 // /api/access says the account uses app-based auth.
-                // Immediately select the account via /api/login (the same step that
-                // previously only arrived after 60 s of polling → remoteAccounts).
+                // SPA source: `triggerABA` action → `postAuthentAOM()` → POST /api/aom {}.
+                // Send the push immediately so the user doesn't wait 45 s.
                 let tracking_id = body1
                     .pointer("/data/authnByAppScreen/idTracking")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
                 self.authn_tracking_id = Some(tracking_id);
+                self.trigger_aba_sent = false; // reset in case of re-auth
 
-                // Try /api/login right away — may return authnByApp + triggerABA.
-                let login_builder = self
-                    .client
-                    .post(format!("{}/api/login", login_base))
-                    .header("Origin", &login_base)
-                    .header("Referer", &referer)
-                    .header("Accept", "application/json, text/plain, */*")
-                    .json(&serde_json::json!({ "login": username }));
-                match self.with_xsrf(login_builder).send().await {
-                    Ok(r) if r.status().is_success() => {
-                        let login_body_text = r.text().await.unwrap_or_default();
-                        tracing::info!("Orange /api/login (from authnByApp): {}", &login_body_text[..login_body_text.len().min(400)]);
-                        let login_json: serde_json::Value =
-                            serde_json::from_str(&login_body_text).unwrap_or_default();
-                        let login_next = login_json.get("nextStep").and_then(|v| v.as_str()).unwrap_or("");
-                        if login_next == "authnByApp" {
-                            self.try_trigger_aba(&login_base, &referer, &login_json).await;
-                        }
-                    }
-                    Ok(r) => {
-                        tracing::warn!("Orange /api/login (from authnByApp) non-2xx: {}", r.status());
-                    }
-                    Err(e) => {
-                        tracing::warn!("Orange /api/login (from authnByApp) error: {}", e);
-                    }
-                }
+                self.trigger_aom_push(&login_base, &referer).await;
+                self.trigger_aba_sent = true;
+
                 return Ok(AuthPhase::Push);
             }
             _ => {} // continue to /api/login
@@ -500,10 +388,10 @@ impl Operator for OrangeOperator {
 
     /// Phase 2b: poll until Orange signals push approval, then fetch tv_token.
     ///
-    /// Two polling modes:
-    ///  - `authnByApp` flow: re-poll `/api/access`; on `remoteAccounts` call `/api/login`
-    ///    to select the account, then call `/api/password` if a password step follows.
-    ///  - Legacy push flow: poll `/api/push` with `{}`
+    /// SPA source (idme-front-1.24.0):
+    ///   `pollingABA` → `pollAuthentAOM()` → `GET ${apiURL}/aom`
+    /// where apiURL = '/api' (VITE_IDME_FRONT_API_URL runtime config).
+    /// Legacy push variant falls back to `POST /api/push`.
     async fn wait_for_push_auth(&mut self, password: &str) -> Result<()> {
         use std::time::Duration;
 
@@ -513,41 +401,38 @@ impl Operator for OrangeOperator {
         let login_base = self.login_base.clone();
         let referer = format!("{}/", login_base);
 
-        // Choose endpoint based on which push variant was detected.
-        // authnByApp: re-poll /api/access — the SPA keeps calling the same endpoint
-        //   until nextStep changes from "authnByApp" to something else (approval or error).
-        // Legacy push: poll /api/push.
-        let (poll_url, poll_body) = if self.authn_tracking_id.is_some() {
-            (
-                format!("{}/api/access", login_base),
-                serde_json::json!({}),
-            )
+        let is_aom = self.authn_tracking_id.is_some();
+        let poll_url = if is_aom {
+            format!("{}/api/aom", login_base)
         } else {
-            (
-                format!("{}/api/push", login_base),
-                serde_json::json!({}),
-            )
+            format!("{}/api/push", login_base)
         };
-        tracing::info!("Orange: polling {}", poll_url);
-
-        // Guard: only trigger the push once even if remoteAccounts appears again.
-        let mut trigger_sent = false;
+        tracing::info!("Orange: polling {} ({})", poll_url, if is_aom { "GET" } else { "POST" });
 
         for attempt in 0..MAX_ATTEMPTS {
             tokio::time::sleep(POLL_INTERVAL).await;
 
-            let builder = self
-                .client
-                .post(&poll_url)
-                .header("Origin", &login_base)
-                .header("Referer", &referer)
-                .header("Accept", "application/json, text/plain, */*")
-                .json(&poll_body);
-            let resp = match self.with_xsrf(builder).send().await {
-                Ok(r) => r,
-                Err(e) => {
-                    tracing::warn!("push poll {}: network error: {}", attempt + 1, e);
-                    continue;
+            // AOM flow: GET /api/aom (no body).  Legacy: POST /api/push with {}.
+            let resp = if is_aom {
+                let b = self.client
+                    .get(&poll_url)
+                    .header("Origin", &login_base)
+                    .header("Referer", &referer)
+                    .header("Accept", "application/json, text/plain, */*");
+                match self.with_xsrf(b).send().await {
+                    Ok(r) => r,
+                    Err(e) => { tracing::warn!("aom poll {}: {}", attempt + 1, e); continue; }
+                }
+            } else {
+                let b = self.client
+                    .post(&poll_url)
+                    .header("Origin", &login_base)
+                    .header("Referer", &referer)
+                    .header("Accept", "application/json, text/plain, */*")
+                    .json(&serde_json::json!({}));
+                match self.with_xsrf(b).send().await {
+                    Ok(r) => r,
+                    Err(e) => { tracing::warn!("push poll {}: {}", attempt + 1, e); continue; }
                 }
             };
 
@@ -556,29 +441,24 @@ impl Operator for OrangeOperator {
                 .cookies()
                 .find(|c| c.name() == "wassup")
                 .map(|c| c.value().to_string());
-
             let body_text = resp.text().await.unwrap_or_default();
 
             if !status.is_success() {
-                tracing::debug!("push poll {}: {} — {:.500}", attempt + 1, status, body_text);
+                tracing::debug!("poll {}: {} — {:.500}", attempt + 1, status, body_text);
                 continue;
             }
 
             let body: serde_json::Value =
                 serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
             let next_step = body.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
-            tracing::info!("push poll {}: nextStep={:?}", attempt + 1, next_step);
-
-            // Log full body on any step other than still-pending authnByApp.
-            if next_step != "authnByApp" {
-                tracing::debug!("push poll {}: FULL BODY = {}", attempt + 1, body_text);
+            tracing::info!("poll {}: nextStep={:?}", attempt + 1, next_step);
+            if next_step != "authnByApp" && next_step != "pollingABA" {
+                tracing::debug!("poll {}: FULL BODY = {}", attempt + 1, body_text);
             }
 
             match next_step {
                 "end" => {
-                    if let Some(w) = wassup {
-                        self.wassup = Some(w);
-                    }
+                    if let Some(w) = wassup { self.wassup = Some(w); }
                     return self.ensure_tv_token().await;
                 }
                 "feedback" => {
@@ -587,110 +467,64 @@ impl Operator for OrangeOperator {
                     )));
                 }
                 "remoteAccounts" => {
-                    // Orange presents a list of known accounts to choose from.
-                    // accountList[0].api == "login" → POST /api/login with that login.
+                    // User approved on phone; server shows account list for selection.
                     let account_list = body
                         .pointer("/data/remoteAccountsScreen/accountList")
                         .and_then(|v| v.as_array())
                         .cloned()
                         .unwrap_or_default();
 
-                    tracing::info!(
-                        "Orange remoteAccounts: {} account(s) in list",
-                        account_list.len()
-                    );
+                    tracing::info!("Orange remoteAccounts: {} account(s)", account_list.len());
 
                     if account_list.is_empty() {
-                        tracing::warn!(
-                            "Orange remoteAccounts: empty accountList; body={}",
-                            body_text
-                        );
+                        tracing::warn!("Orange remoteAccounts: empty list; body={}", body_text);
                         continue;
                     }
 
                     let first = &account_list[0];
-                    let login = first
-                        .get("login")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    tracing::info!("Orange: selecting account {:?}", login);
+                    let login_val = first.get("login").and_then(|v| v.as_str()).unwrap_or("");
+                    tracing::info!("Orange: selecting account {:?}", login_val);
 
-                    // POST /api/login with the account object the server sent us.
-                    // The SPA posts the whole account entry back; server uses the `api`
-                    // field to know this comes from the remoteAccounts list.
-                    let builder = self
-                        .client
+                    let b = self.client
                         .post(format!("{}/api/login", login_base))
                         .header("Origin", &login_base)
                         .header("Referer", &referer)
                         .header("Accept", "application/json, text/plain, */*")
                         .json(first);
-                    let login_resp = match self.with_xsrf(builder).send().await {
+                    let login_resp = match self.with_xsrf(b).send().await {
                         Ok(r) => r,
-                        Err(e) => {
-                            tracing::warn!("Orange /api/login (remoteAccounts): {}", e);
-                            continue;
-                        }
+                        Err(e) => { tracing::warn!("Orange /api/login: {}", e); continue; }
                     };
 
                     let login_status = login_resp.status();
                     let login_body = login_resp.text().await.unwrap_or_default();
-                    tracing::info!(
-                        "Orange /api/login (remoteAccounts): {} — {}",
-                        login_status,
-                        login_body
-                    );
+                    tracing::info!("Orange /api/login: {} — {:.300}", login_status, login_body);
 
                     let login_json: serde_json::Value =
                         serde_json::from_str(&login_body).unwrap_or_default();
                     let login_next = login_json
-                        .get("nextStep")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("(none)");
-                    tracing::info!("Orange /api/login nextStep={:?}", login_next);
+                        .get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
 
                     match login_next {
-                        "password" => {
-                            return self.complete_auth_password(password).await;
-                        }
-                        "end" => {
-                            return self.ensure_tv_token().await;
-                        }
-                        "feedback" => {
-                            return Err(OperatorError::AuthFailed(format!(
-                                "account selection rejected: {}",
-                                login_body
-                            )));
-                        }
-                        "authnByApp" if !trigger_sent => {
-                            // /api/login returned authnByApp — try to send push.
-                            let trigger_api = login_json
-                                .pointer("/data/authnByAppScreen/submitField/api")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("");
-                            if trigger_api == "triggerABA" {
-                                self.try_trigger_aba(&login_base, &referer, &login_json).await;
-                                trigger_sent = true;
-                            } else {
-                                tracing::warn!(
-                                    "Orange: unexpected submitField.api={:?}",
-                                    trigger_api
-                                );
-                            }
-                            // Keep polling — user needs to approve on phone.
+                        "password" => return self.complete_auth_password(password).await,
+                        "end"      => return self.ensure_tv_token().await,
+                        "feedback" => return Err(OperatorError::AuthFailed(format!(
+                            "account selection rejected: {}", login_body
+                        ))),
+                        "authnByApp" if !self.trigger_aba_sent => {
+                            // Server wants another AOM trigger after account selection.
+                            tracing::info!("Orange: re-triggering AOM push after remoteAccounts");
+                            self.trigger_aom_push(&login_base, &referer).await;
+                            self.trigger_aba_sent = true;
                         }
                         _ => {
-                            tracing::warn!(
-                                "Orange /api/login unexpected nextStep={:?}; keep polling",
-                                login_next
-                            );
+                            tracing::warn!("Orange /api/login unexpected nextStep={:?}", login_next);
                         }
                     }
                 }
-                // "authnByApp" / "push" / unknown — still pending; keep polling
+                // pollingABA / authnByApp / unknown — still waiting
                 other => {
-                    tracing::debug!("push poll {}: still waiting (nextStep={:?})", attempt + 1, other);
+                    tracing::debug!("poll {}: still waiting ({})", attempt + 1, other);
                 }
             }
         }
