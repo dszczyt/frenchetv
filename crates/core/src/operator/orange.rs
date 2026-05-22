@@ -9,147 +9,240 @@ use crate::error::OperatorError;
 use crate::stream::StreamUrl;
 use super::traits::{Operator, Result};
 
-/// These client credentials identify the Orange TV application.
-/// They are embedded in the official Orange TV app binary.
-const ORANGE_CLIENT_ID: &str = "f9ee4b08-50ec-4dfd-8693-e7a6a27de3cc";
-const ORANGE_CLIENT_SECRET: &str = "secret";
-
 /// Fallback M3U shipped with the binary.
 const FALLBACK_M3U: &str = include_str!("../../../../assets/channels/orange.m3u");
 
+/// Placeholder URL used for channels fetched from the live API (stream resolved separately).
+const PLACEHOLDER_URL: &str = "https://placeholder.invalid/";
+
 pub struct OrangeOperator {
     client: reqwest::Client,
-    api_base: String,
-    sso_base: String,
-    pub(crate) access_token: Option<String>,
-    refresh_token: Option<String>,
+    login_base: String,
+    homepage_url: String,
+    channels_url: String,
+    stream_base: String,
+    /// The `wassup` session cookie extracted after login.
+    pub(crate) wassup: Option<String>,
+    /// The `tv_token` extracted from the homepage HTML.
+    pub(crate) tv_token: Option<String>,
+    /// When the current `tv_token` expires (25 min after extraction).
+    tv_token_expires: Option<std::time::Instant>,
 }
 
 impl OrangeOperator {
     pub fn new() -> Self {
         Self::new_with_bases(
-            "https://rp-iptv.orange.fr",
-            "https://sso.orange.fr",
+            "https://login.orange.fr",
+            "https://tv.orange.fr/",
+            "https://rp-ott-mediation-tv.woopic.com/api-gw/pds/v1/live/ew?everywherePopulation=OTT_Metro",
+            "https://mediation-tv.orange.fr/all/api-gw/stream/v2/auth/accountToken/live",
         )
     }
 
     /// Constructs an operator pointing at custom base URLs — used in tests.
-    pub fn new_with_bases(api_base: &str, sso_base: &str) -> Self {
+    pub fn new_with_bases(
+        login_base: &str,
+        homepage_url: &str,
+        channels_url: &str,
+        stream_base: &str,
+    ) -> Self {
         Self {
             client: reqwest::Client::builder()
                 .cookie_store(true)
+                .user_agent("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/120.0.0.0")
                 .timeout(std::time::Duration::from_secs(10))
                 .build()
                 .expect("reqwest client build"),
-            api_base: api_base.to_string(),
-            sso_base: sso_base.to_string(),
-            access_token: None,
-            refresh_token: None,
+            login_base: login_base.to_string(),
+            homepage_url: homepage_url.to_string(),
+            channels_url: channels_url.to_string(),
+            stream_base: stream_base.to_string(),
+            wassup: None,
+            tv_token: None,
+            tv_token_expires: None,
         }
     }
 
-    /// Try to refresh the access token using the stored refresh token.
-    /// Used in v0.2 transparent token-refresh wrapper.
-    #[allow(dead_code)]
-    async fn refresh_access_token(&mut self) -> Result<()> {
-        let refresh_token = self.refresh_token.as_ref()
-            .ok_or_else(|| OperatorError::TokenRefreshFailed("no refresh token".into()))?
-            .clone();
+    /// Extract `tv_token` from homepage HTML by string search (no regex).
+    fn extract_tv_token(html: &str) -> Option<String> {
+        let key = r#""token":""#;
+        let start = html.find(key)? + key.len();
+        let end = html[start..].find('"')? + start;
+        Some(html[start..end].to_string())
+    }
 
-        let params = [
-            ("grant_type", "refresh_token"),
-            ("refresh_token", refresh_token.as_str()),
-            ("client_id", ORANGE_CLIENT_ID),
-            ("client_secret", ORANGE_CLIENT_SECRET),
-        ];
+    /// Refresh `tv_token` if it is absent or will expire within 5 minutes.
+    async fn ensure_tv_token(&mut self) -> Result<()> {
+        let needs_refresh = match self.tv_token_expires {
+            None => true,
+            Some(exp) => {
+                exp.saturating_duration_since(std::time::Instant::now())
+                    < std::time::Duration::from_secs(5 * 60)
+            }
+        };
+
+        if !needs_refresh {
+            return Ok(());
+        }
+
+        let wassup = self.wassup.as_deref().unwrap_or("").to_string();
 
         let resp = self.client
-            .post(format!("{}/oauth/v2/token", self.sso_base))
-            .form(&params)
+            .get(&self.homepage_url)
+            .header("Cookie", format!("wassup={}", wassup))
             .send()
             .await?;
 
-        if resp.status() == 401 || resp.status() == 400 {
-            return Err(OperatorError::TokenRefreshFailed("refresh token rejected".into()));
+        let status = resp.status();
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OperatorError::UnexpectedResponse {
+                status: status.as_u16(),
+                body,
+            });
         }
 
-        let body: TokenResponse = resp.error_for_status()?.json().await?;
-        self.access_token = Some(body.access_token);
-        if let Some(rt) = body.refresh_token {
-            self.refresh_token = Some(rt);
-        }
+        let html = resp.text().await?;
+        let token = Self::extract_tv_token(&html)
+            .ok_or_else(|| OperatorError::AuthFailed("tv_token not found in homepage HTML".into()))?;
+
+        self.tv_token = Some(token);
+        self.tv_token_expires = Some(
+            std::time::Instant::now() + std::time::Duration::from_secs(25 * 60),
+        );
+
         Ok(())
     }
 }
 
 impl Default for OrangeOperator {
-    fn default() -> Self { Self::new() }
-}
-
-#[derive(Deserialize)]
-struct TokenResponse {
-    access_token: String,
-    refresh_token: Option<String>,
-    #[allow(dead_code)]
-    expires_in: Option<u64>,
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Shape of one item in the Orange channel list response.
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct OrangeChannel {
-    channel_id: String,
+    #[serde(rename = "idEPG")]
+    id_epg: String,
     name: String,
     #[serde(default)]
-    logo_url: Option<String>,
+    display_order: Option<u32>,
     #[serde(default)]
-    channel_number: Option<u32>,
-    #[serde(default)]
-    genre: Option<String>,
-    hls_url: Option<String>,
-    #[serde(default)]
-    dash_url: Option<String>,
+    logos: Vec<OrangeLogo>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct OrangeLogo {
+    #[serde(rename = "urlService", default)]
+    url_service: Option<String>,
 }
 
 #[async_trait]
 impl Operator for OrangeOperator {
-    fn name(&self) -> &'static str { "Orange TV" }
-    fn requires_auth(&self) -> bool { true }
+    fn name(&self) -> &'static str {
+        "Orange TV"
+    }
+
+    fn requires_auth(&self) -> bool {
+        true
+    }
 
     async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
-        let params = [
-            ("grant_type", "password"),
-            ("username", username),
-            ("password", password),
-            ("client_id", ORANGE_CLIENT_ID),
-            ("client_secret", ORANGE_CLIENT_SECRET),
-        ];
-
+        // Step 1 — POST /api/access
         let resp = self.client
-            .post(format!("{}/oauth/v2/token", self.sso_base))
-            .form(&params)
+            .post(format!("{}/api/access", self.login_base))
+            .json(&serde_json::json!({}))
             .send()
             .await?;
 
-        if resp.status() == 401 || resp.status() == 400 {
+        let status = resp.status().as_u16();
+        if status == 401 || status == 400 {
             return Err(OperatorError::InvalidCredentials);
         }
-
-        let status = resp.status().as_u16();
         if !resp.status().is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(OperatorError::UnexpectedResponse { status, body });
         }
 
-        let body: TokenResponse = resp.json().await?;
-        self.access_token = Some(body.access_token);
-        self.refresh_token = body.refresh_token;
+        // Step 2 — POST /api/login
+        let resp = self.client
+            .post(format!("{}/api/login", self.login_base))
+            .json(&serde_json::json!({
+                "login": username,
+                "loginOrigin": "input"
+            }))
+            .send()
+            .await?;
+
+        let status = resp.status().as_u16();
+        if status == 401 || status == 400 {
+            return Err(OperatorError::InvalidCredentials);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OperatorError::UnexpectedResponse { status, body });
+        }
+
+        // Step 3 — POST /api/password
+        let resp = self.client
+            .post(format!("{}/api/password", self.login_base))
+            .json(&serde_json::json!({
+                "password": password,
+                "remember": true
+            }))
+            .send()
+            .await?;
+
+        let status = resp.status().as_u16();
+        if status == 401 || status == 400 {
+            return Err(OperatorError::InvalidCredentials);
+        }
+        if !resp.status().is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OperatorError::UnexpectedResponse { status, body });
+        }
+
+        // Extract the `wassup` cookie from the password response
+        let wassup = resp
+            .cookies()
+            .find(|c| c.name() == "wassup")
+            .map(|c| c.value().to_string());
+
+        match wassup {
+            Some(v) => {
+                self.wassup = Some(v);
+            }
+            None => {
+                return Err(OperatorError::AuthFailed(
+                    "wassup cookie not received".into(),
+                ));
+            }
+        }
+
+        // Immediately fetch the tv_token
+        self.ensure_tv_token().await?;
+
         Ok(())
     }
 
     async fn fetch_channels(&self) -> Result<Vec<Channel>> {
-        let url = format!("{}/EPG/JSON/getChannelList", self.api_base);
-        let resp = self.client.get(&url)
+        let tv_token = match &self.tv_token {
+            Some(t) => t.clone(),
+            None => {
+                warn!("Orange: tv_token not available, using fallback");
+                return Ok(parse_m3u(FALLBACK_M3U));
+            }
+        };
+        let wassup = self.wassup.as_deref().unwrap_or("").to_string();
+
+        let resp = self.client
+            .get(&self.channels_url)
+            .header("tv_token", format!("Bearer {}", tv_token))
+            .header("Cookie", format!("wassup={}", wassup))
             .timeout(std::time::Duration::from_secs(5))
             .send()
             .await;
@@ -164,20 +257,26 @@ impl Operator for OrangeOperator {
                     }
                 };
 
-                let channels = channels_raw.into_iter().filter_map(|c| {
-                    let url_str = c.hls_url.or(c.dash_url)?;
-                    let url = url::Url::parse(&url_str).ok()?;
-                    Some(Channel {
-                        id: c.channel_id,
-                        name: c.name,
-                        logo_url: c.logo_url,
-                        number: c.channel_number,
-                        category: ChannelCategory::from_group_title(
-                            c.genre.as_deref().unwrap_or(""),
-                        ),
-                        stream_template: StreamTemplate::Authenticated { base_url: url },
+                let placeholder = url::Url::parse(PLACEHOLDER_URL)
+                    .expect("placeholder URL is valid");
+
+                let channels = channels_raw
+                    .into_iter()
+                    .map(|c| {
+                        let logo_url = c
+                            .logos
+                            .into_iter()
+                            .find_map(|l| l.url_service);
+                        Channel {
+                            id: c.id_epg,
+                            name: c.name,
+                            logo_url,
+                            number: c.display_order,
+                            category: ChannelCategory::Other("".to_string()),
+                            stream_template: StreamTemplate::Direct(placeholder.clone()),
+                        }
                     })
-                }).collect();
+                    .collect();
 
                 Ok(channels)
             }
@@ -193,13 +292,75 @@ impl Operator for OrangeOperator {
     }
 
     async fn resolve_stream(&self, channel: &Channel) -> Result<StreamUrl> {
-        let token = self.access_token.as_deref().unwrap_or("");
+        // If this channel came from the fallback M3U, return its URL directly.
         match &channel.stream_template {
-            StreamTemplate::Direct(url) => Ok(StreamUrl::direct(url.clone())),
-            StreamTemplate::Authenticated { base_url } => {
-                Ok(StreamUrl::authenticated(base_url.clone(), token))
+            StreamTemplate::Direct(url) if url.as_str() != PLACEHOLDER_URL => {
+                return Ok(StreamUrl::direct(url.clone()));
             }
+            _ => {}
         }
+
+        let tv_token = self.tv_token.as_deref().unwrap_or("");
+        let wassup = self.wassup.as_deref().unwrap_or("");
+
+        let stream_url = format!(
+            "{}/{}?deviceModel=WEB_PC&customerOrangePopulation=OTT_Metro",
+            self.stream_base, channel.id
+        );
+
+        let resp = self.client
+            .get(&stream_url)
+            .header("tv_token", format!("Bearer {}", tv_token))
+            .header("Cookie", format!("wassup={}", wassup))
+            .send()
+            .await?;
+
+        let status = resp.status();
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::BAD_REQUEST
+        {
+            return Err(OperatorError::InvalidCredentials);
+        }
+        if !status.is_success() {
+            let body = resp.text().await.unwrap_or_default();
+            return Err(OperatorError::UnexpectedResponse {
+                status: status.as_u16(),
+                body,
+            });
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+
+        // Try several known paths for the stream URL
+        let url_str = if let Some(s) = json.get("url").and_then(|v| v.as_str()) {
+            s.to_string()
+        } else if let Some(s) = json
+            .get("stream")
+            .and_then(|v| v.get("url"))
+            .and_then(|v| v.as_str())
+        {
+            s.to_string()
+        } else if let Some(s) = json.get("streamUrl").and_then(|v| v.as_str()) {
+            s.to_string()
+        } else if let Some(s) = json.get("hls").and_then(|v| v.as_str()) {
+            s.to_string()
+        } else {
+            // Fallback: first top-level string value that starts with "http"
+            json.as_object()
+                .and_then(|obj| {
+                    obj.values()
+                        .find_map(|v| v.as_str().filter(|s| s.starts_with("http")))
+                        .map(|s| s.to_string())
+                })
+                .ok_or_else(|| {
+                    OperatorError::ParseChannels("stream URL not found in response".into())
+                })?
+        };
+
+        let parsed = url::Url::parse(&url_str).map_err(|e| {
+            OperatorError::ParseChannels(format!("invalid stream URL '{}': {}", url_str, e))
+        })?;
+
+        Ok(StreamUrl::direct(parsed))
     }
 
     async fn fetch_epg(&self, _hours: u8) -> Result<Option<EpgData>> {
@@ -211,123 +372,221 @@ impl Operator for OrangeOperator {
 mod tests {
     use super::*;
     use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path, body_string_contains};
+    use wiremock::matchers::{method, path};
     use serde_json::json;
 
+    // ---------------------------------------------------------------------------
+    // Test 1 — successful authentication sets wassup and tv_token
+    // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_authenticate_success() {
         let mock = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/oauth/v2/token"))
-            .and(body_string_contains("grant_type=password"))
+            .and(path("/api/access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/password"))
             .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "access_token": "tok_abc123",
-                    "token_type": "Bearer",
-                    "expires_in": 3600,
-                    "refresh_token": "refresh_xyz"
-                })),
+                ResponseTemplate::new(200)
+                    .insert_header(
+                        "Set-Cookie",
+                        "wassup=test_wassup_value; Path=/; HttpOnly",
+                    )
+                    .set_body_json(json!({})),
             )
             .mount(&mock)
             .await;
 
-        let mut op = OrangeOperator::new_with_bases(&mock.uri(), &mock.uri());
+        // Homepage returns HTML with embedded tv_token
+        Mock::given(method("GET"))
+            .and(path("/"))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_string(
+                        r#"<!DOCTYPE html><html><head></head><body>some html "token":"test_tv_token_value" more html</body></html>"#,
+                    ),
+            )
+            .mount(&mock)
+            .await;
+
+        let homepage = format!("{}/", mock.uri());
+        let mut op = OrangeOperator::new_with_bases(
+            &mock.uri(),
+            &homepage,
+            &format!("{}/channels", mock.uri()),
+            &format!("{}/stream", mock.uri()),
+        );
+
         op.authenticate("user@orange.fr", "pass1234").await.unwrap();
-        assert_eq!(op.access_token.as_deref(), Some("tok_abc123"));
+
+        assert_eq!(op.wassup.as_deref(), Some("test_wassup_value"));
+        assert_eq!(op.tv_token.as_deref(), Some("test_tv_token_value"));
     }
 
+    // ---------------------------------------------------------------------------
+    // Test 2 — 401 on /api/login returns InvalidCredentials
+    // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_authenticate_invalid_credentials() {
         let mock = MockServer::start().await;
 
         Mock::given(method("POST"))
-            .and(path("/oauth/v2/token"))
+            .and(path("/api/access"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+            .mount(&mock)
+            .await;
+
+        Mock::given(method("POST"))
+            .and(path("/api/login"))
             .respond_with(ResponseTemplate::new(401).set_body_json(json!({
-                "error": "invalid_grant"
+                "error": "invalid_credentials"
             })))
             .mount(&mock)
             .await;
 
-        let mut op = OrangeOperator::new_with_bases(&mock.uri(), &mock.uri());
-        let err = op.authenticate("bad@example.com", "wrong").await.unwrap_err();
+        let mut op = OrangeOperator::new_with_bases(
+            &mock.uri(),
+            &format!("{}/", mock.uri()),
+            &format!("{}/channels", mock.uri()),
+            &format!("{}/stream", mock.uri()),
+        );
+
+        let err = op
+            .authenticate("bad@example.com", "wrong")
+            .await
+            .unwrap_err();
         assert!(matches!(err, OperatorError::InvalidCredentials));
     }
 
+    // ---------------------------------------------------------------------------
+    // Test 3 — 500 from channels endpoint falls back to M3U
+    // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_fetch_channels_falls_back_on_api_error() {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/EPG/JSON/getChannelList"))
+            .and(path("/channels"))
             .respond_with(ResponseTemplate::new(500))
             .mount(&mock)
             .await;
 
-        let op = OrangeOperator::new_with_bases(&mock.uri(), &mock.uri());
+        let mut op = OrangeOperator::new_with_bases(
+            &mock.uri(),
+            &format!("{}/", mock.uri()),
+            &format!("{}/channels", mock.uri()),
+            &format!("{}/stream", mock.uri()),
+        );
+        op.wassup = Some("test_wassup".into());
+        op.tv_token = Some("test_token".into());
+        op.tv_token_expires =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(25 * 60));
+
         let channels = op.fetch_channels().await.unwrap();
-        // Fallback M3U must supply at least 1 channel
-        assert!(!channels.is_empty());
+        assert!(!channels.is_empty(), "fallback M3U must supply at least 1 channel");
     }
 
+    // ---------------------------------------------------------------------------
+    // Test 4 — API response is parsed correctly
+    // ---------------------------------------------------------------------------
     #[tokio::test]
     async fn test_fetch_channels_parses_api_response() {
         let mock = MockServer::start().await;
 
         Mock::given(method("GET"))
-            .and(path("/EPG/JSON/getChannelList"))
+            .and(path("/channels"))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(json!([
                     {
-                        "channelId": "TF1",
+                        "idEPG": "TF1",
                         "name": "TF1",
-                        "logoUrl": "https://logos.example.com/tf1.png",
-                        "channelNumber": 1,
-                        "genre": "Généraliste",
-                        "hlsUrl": "https://iptv.example.com/TF1/playlist.m3u8"
+                        "displayOrder": 1,
+                        "logos": [{"urlService": "https://logos.example.com/tf1.png"}]
                     },
                     {
-                        "channelId": "BFMTV",
+                        "idEPG": "BFMTV",
                         "name": "BFM TV",
-                        "channelNumber": 15,
-                        "genre": "Info",
-                        "hlsUrl": "https://iptv.example.com/BFMTV/playlist.m3u8"
+                        "displayOrder": 15
                     }
                 ])),
             )
             .mount(&mock)
             .await;
 
-        let op = OrangeOperator::new_with_bases(&mock.uri(), &mock.uri());
+        let mut op = OrangeOperator::new_with_bases(
+            &mock.uri(),
+            &format!("{}/", mock.uri()),
+            &format!("{}/channels", mock.uri()),
+            &format!("{}/stream", mock.uri()),
+        );
+        op.wassup = Some("test_wassup".into());
+        op.tv_token = Some("test_token".into());
+        op.tv_token_expires =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(25 * 60));
+
         let channels = op.fetch_channels().await.unwrap();
         assert_eq!(channels.len(), 2);
         assert_eq!(channels[0].id, "TF1");
-        assert_eq!(channels[0].category, ChannelCategory::Generalist);
-        assert_eq!(channels[1].category, ChannelCategory::News);
+        assert_eq!(channels[0].number, Some(1));
+        assert_eq!(
+            channels[0].logo_url.as_deref(),
+            Some("https://logos.example.com/tf1.png")
+        );
+        assert_eq!(channels[1].id, "BFMTV");
+        assert_eq!(channels[1].number, Some(15));
     }
 
+    // ---------------------------------------------------------------------------
+    // Test 5 — stream resolution returns URL from API JSON
+    // ---------------------------------------------------------------------------
     #[tokio::test]
-    async fn test_resolve_stream_authenticated() {
-        let op = OrangeOperator {
-            client: reqwest::Client::new(),
-            api_base: "http://api".into(),
-            sso_base: "http://sso".into(),
-            access_token: Some("mytoken".into()),
-            refresh_token: None,
-        };
+    async fn test_resolve_stream() {
+        let mock = MockServer::start().await;
+
+        Mock::given(method("GET"))
+            .and(path("/stream/TF1"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({
+                    "url": "https://cdn.example.com/TF1/index.mpd"
+                })),
+            )
+            .mount(&mock)
+            .await;
+
+        let mut op = OrangeOperator::new_with_bases(
+            &mock.uri(),
+            &format!("{}/", mock.uri()),
+            &format!("{}/channels", mock.uri()),
+            &format!("{}/stream", mock.uri()),
+        );
+        op.wassup = Some("test_wassup".into());
+        op.tv_token = Some("test_token".into());
+        op.tv_token_expires =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(25 * 60));
 
         let channel = Channel {
             id: "TF1".into(),
             name: "TF1".into(),
             logo_url: None,
             number: Some(1),
-            category: ChannelCategory::Generalist,
-            stream_template: StreamTemplate::Authenticated {
-                base_url: url::Url::parse("https://iptv.example.com/TF1/playlist.m3u8").unwrap(),
-            },
+            category: ChannelCategory::Other("".to_string()),
+            stream_template: StreamTemplate::Direct(
+                url::Url::parse(PLACEHOLDER_URL).unwrap(),
+            ),
         };
 
         let stream = op.resolve_stream(&channel).await.unwrap();
-        assert_eq!(stream.auth_header.as_deref(), Some("Bearer mytoken"));
+        assert_eq!(stream.url.as_str(), "https://cdn.example.com/TF1/index.mpd");
+        assert!(stream.auth_header.is_none());
     }
 }
