@@ -57,4 +57,18 @@ pub trait Operator: Send + Sync {
     async fn fetch_channels(&self) -> Result<Vec<Channel>>;
     async fn resolve_stream(&self, channel: &Channel) -> Result<StreamUrl>;
     async fn fetch_epg(&self, hours: u8) -> Result<Option<EpgData>>;
+
+    /// Returns the current session token (e.g. `wassup` cookie) if authenticated.
+    /// Used to persist the session across app restarts.
+    fn session_token(&self) -> Option<&str> {
+        None
+    }
+
+    /// Restore a previously saved session token and verify it is still valid
+    /// by fetching the tv_token.  Returns Ok if the session is usable.
+    async fn restore_session(&mut self, _token: &str) -> Result<()> {
+        Err(OperatorError::AuthFailed(
+            "session restore not supported by this operator".into(),
+        ))
+    }
 }

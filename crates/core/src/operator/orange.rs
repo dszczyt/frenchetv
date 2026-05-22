@@ -719,6 +719,16 @@ impl Operator for OrangeOperator {
     async fn fetch_epg(&self, _hours: u8) -> Result<Option<EpgData>> {
         Ok(None)
     }
+
+    fn session_token(&self) -> Option<&str> {
+        self.wassup.as_deref()
+    }
+
+    /// Restore `wassup` from keyring and verify the session by fetching tv_token.
+    async fn restore_session(&mut self, token: &str) -> Result<()> {
+        self.wassup = Some(token.to_string());
+        self.ensure_tv_token().await
+    }
 }
 
 #[cfg(test)]

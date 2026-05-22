@@ -3,6 +3,7 @@ pub mod config;
 pub mod epg;
 pub mod error;
 pub mod operator;
+pub mod session;
 pub mod stream;
 
 pub use channel::{Channel, ChannelCategory, StreamTemplate};
