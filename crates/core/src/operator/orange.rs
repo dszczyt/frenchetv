@@ -811,8 +811,10 @@ impl Operator for OrangeOperator {
 
         // Extract Widevine DRM parameters from protectionData array if present.
         // Orange returns: [{"keySystem":"com.widevine.alpha","licenseServerURL":"...","initData":"base64..."}]
+        // Relative licenseServerURLs must be resolved against the MPD URL's origin (url_str),
+        // not the stream API base — the license server lives on the same CDN host as the MPD.
         stream.protection = extract_widevine_protection(
-            &json, &tv_token, &self.stream_base, self.wassup.as_deref().unwrap_or(""),
+            &json, &tv_token, &url_str, self.wassup.as_deref().unwrap_or(""),
         );
         Ok(stream)
     }
@@ -838,7 +840,7 @@ impl Operator for OrangeOperator {
 fn extract_widevine_protection(
     json: &serde_json::Value,
     tv_token: &str,
-    stream_base: &str,
+    mpd_url: &str,
     wassup: &str,
 ) -> Option<ProtectionData> {
     use base64::engine::Engine as _;
@@ -855,19 +857,21 @@ fn extract_widevine_protection(
             .or_else(|| entry.get("laUrl").and_then(|v| v.as_str()))?;
 
         // Resolve relative URLs (e.g. "/widevine/license?...") against the
-        // stream API host (e.g. "https://mediation-tv.orange.fr/...").
+        // MPD URL's origin — the license server lives on the same CDN host as the MPD.
         let la_url = if raw_url.starts_with("http://") || raw_url.starts_with("https://") {
             raw_url.to_string()
         } else {
-            // Extract scheme://host from stream_base then append the relative path.
-            let host = stream_base
+            // Extract scheme://host from the MPD URL then append the relative path.
+            let origin = mpd_url
                 .trim_end_matches('/')
                 .splitn(4, '/')   // ["https:", "", "host", "path..."]
                 .take(3)
                 .collect::<Vec<_>>()
                 .join("/");
-            format!("{}{}", host, raw_url)
+            format!("{}{}", origin, raw_url)
         };
+
+        tracing::info!("widevine: resolved la_url = {}", la_url);
 
         let pssh = entry
             .get("initData")
