@@ -121,6 +121,64 @@ impl OrangeOperator {
         Ok(())
     }
 
+    /// Attempt to trigger the Orange push notification.
+    /// Orange uses `"api":"triggerABA"` as the action key; the actual HTTP path
+    /// is NOT `/api/triggerABA` (that returns 404).  Try two candidates in order:
+    ///   1. `POST {login_base}/triggerABA`  (no /api/ prefix)
+    ///   2. `POST {login_base}/api/access`  with the submitField object as body
+    async fn try_trigger_aba(
+        &self,
+        login_base: &str,
+        referer: &str,
+        login_json: &serde_json::Value,
+    ) {
+        let submit_field = login_json
+            .pointer("/data/authnByAppScreen/submitField")
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+
+        // Candidate 1: /triggerABA (no /api prefix)
+        let url1 = format!("{}/triggerABA", login_base);
+        tracing::info!("Orange: trying push trigger at {}", url1);
+        let builder = self
+            .client
+            .post(&url1)
+            .header("Origin", login_base)
+            .header("Referer", referer)
+            .header("Accept", "application/json, text/plain, */*")
+            .json(&serde_json::json!({}));
+        match self.with_xsrf(builder).send().await {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.text().await.unwrap_or_default();
+                tracing::info!("Orange {}: {} — {}", url1, s, b);
+                if s.is_success() {
+                    return; // worked
+                }
+            }
+            Err(e) => tracing::warn!("Orange {}: {}", url1, e),
+        }
+
+        // Candidate 2: POST /api/access with the submitField as body
+        let url2 = format!("{}/api/access", login_base);
+        tracing::info!("Orange: trying push trigger at {} (submitField body)", url2);
+        let builder = self
+            .client
+            .post(&url2)
+            .header("Origin", login_base)
+            .header("Referer", referer)
+            .header("Accept", "application/json, text/plain, */*")
+            .json(&submit_field);
+        match self.with_xsrf(builder).send().await {
+            Ok(r) => {
+                let s = r.status();
+                let b = r.text().await.unwrap_or_default();
+                tracing::info!("Orange {} (triggerABA body): {} — {:.200}", url2, s, b);
+            }
+            Err(e) => tracing::warn!("Orange {} trigger: {}", url2, e),
+        }
+    }
+
     /// Attach the XSRF token header if we have one.
     fn with_xsrf<'a>(
         &self,
@@ -235,18 +293,42 @@ impl Operator for OrangeOperator {
                 )));
             }
             "authnByApp" => {
-                // Orange already sent a push to the mobile app.
-                // Extract the tracking ID so the poll loop can call /api/authnByApp.
+                // /api/access says the account uses app-based auth.
+                // Immediately select the account via /api/login (the same step that
+                // previously only arrived after 60 s of polling → remoteAccounts).
                 let tracking_id = body1
                     .pointer("/data/authnByAppScreen/idTracking")
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                tracing::info!(
-                    "Orange: authnByApp push sent (idTracking={:?}); waiting for approval",
-                    tracking_id
-                );
                 self.authn_tracking_id = Some(tracking_id);
+
+                // Try /api/login right away — may return authnByApp + triggerABA.
+                let login_builder = self
+                    .client
+                    .post(format!("{}/api/login", login_base))
+                    .header("Origin", &login_base)
+                    .header("Referer", &referer)
+                    .header("Accept", "application/json, text/plain, */*")
+                    .json(&serde_json::json!({ "login": username }));
+                match self.with_xsrf(login_builder).send().await {
+                    Ok(r) if r.status().is_success() => {
+                        let login_body_text = r.text().await.unwrap_or_default();
+                        tracing::info!("Orange /api/login (from authnByApp): {}", &login_body_text[..login_body_text.len().min(400)]);
+                        let login_json: serde_json::Value =
+                            serde_json::from_str(&login_body_text).unwrap_or_default();
+                        let login_next = login_json.get("nextStep").and_then(|v| v.as_str()).unwrap_or("");
+                        if login_next == "authnByApp" {
+                            self.try_trigger_aba(&login_base, &referer, &login_json).await;
+                        }
+                    }
+                    Ok(r) => {
+                        tracing::warn!("Orange /api/login (from authnByApp) non-2xx: {}", r.status());
+                    }
+                    Err(e) => {
+                        tracing::warn!("Orange /api/login (from authnByApp) error: {}", e);
+                    }
+                }
                 return Ok(AuthPhase::Push);
             }
             _ => {} // continue to /api/login
@@ -521,42 +603,14 @@ impl Operator for OrangeOperator {
                             )));
                         }
                         "authnByApp" if !trigger_sent => {
-                            // /api/login returned authnByApp with submitField.api="triggerABA".
-                            // Call that endpoint to ACTUALLY send the push notification.
+                            // /api/login returned authnByApp — try to send push.
                             let trigger_api = login_json
                                 .pointer("/data/authnByAppScreen/submitField/api")
                                 .and_then(|v| v.as_str())
                                 .unwrap_or("");
-
                             if trigger_api == "triggerABA" {
-                                tracing::info!(
-                                    "Orange: sending push via /api/triggerABA"
-                                );
-                                let builder = self
-                                    .client
-                                    .post(format!("{}/api/triggerABA", login_base))
-                                    .header("Origin", &login_base)
-                                    .header("Referer", &referer)
-                                    .header("Accept", "application/json, text/plain, */*")
-                                    .json(&serde_json::json!({}));
-                                match self.with_xsrf(builder).send().await {
-                                    Ok(r) => {
-                                        let s = r.status();
-                                        let b = r.text().await.unwrap_or_default();
-                                        tracing::info!(
-                                            "Orange /api/triggerABA: {} — {}",
-                                            s,
-                                            b
-                                        );
-                                        trigger_sent = true;
-                                    }
-                                    Err(e) => {
-                                        tracing::warn!(
-                                            "Orange /api/triggerABA error: {}",
-                                            e
-                                        );
-                                    }
-                                }
+                                self.try_trigger_aba(&login_base, &referer, &login_json).await;
+                                trigger_sent = true;
                             } else {
                                 tracing::warn!(
                                     "Orange: unexpected submitField.api={:?}",
