@@ -13,19 +13,44 @@ impl MpvPlayer {
     }
 
     /// Start playing a stream URL (opens mpv in its own window).
-    pub fn play(&mut self, url: &str, auth_header: Option<&str>) {
+    ///
+    /// * `auth_header` — `Authorization: <value>` sent by mpv's own HTTP layer.
+    /// * `extra_headers` — additional headers forwarded to FFmpeg's lavf demuxer
+    ///   (needed for DASH segment requests: Origin, Referer, User-Agent …).
+    pub fn play(
+        &mut self,
+        url: &str,
+        auth_header: Option<&str>,
+        extra_headers: &[(String, String)],
+    ) {
         let _ = self.stop();
         let mut cmd = std::process::Command::new("mpv");
         cmd.arg("--force-window=yes");
+
+        // Authorization header for mpv's own HTTP requests.
         if let Some(header) = auth_header {
             cmd.arg(format!("--http-header-fields=Authorization: {}", header));
         }
+
+        // Extra headers forwarded to FFmpeg's lavf DASH demuxer.
+        // Format: "Key: Value\r\nKey: Value\r\n"  (literal backslash-r-n;
+        // FFmpeg interprets the two-char sequence as CRLF between headers).
+        if !extra_headers.is_empty() {
+            let joined = extra_headers
+                .iter()
+                .map(|(k, v)| format!("{}: {}", k, v))
+                .collect::<Vec<_>>()
+                .join("\\r\\n");
+            cmd.arg(format!("--stream-lavf-o=headers={}\\r\\n", joined));
+        }
+
         // If the Widevine CDM was downloaded, point mpv at it.
         // Requires mpv compiled with --enable-cdm (e.g. mpv-widevine AUR).
         let cdm_dir = crate::widevine::dir();
         if cdm_dir.join("libwidevinecdm.so").exists() {
             cmd.arg(format!("--cdm-store={}", cdm_dir.display()));
         }
+
         cmd.arg(url);
         match cmd.spawn() {
             Ok(child) => self.handle = Some(child),

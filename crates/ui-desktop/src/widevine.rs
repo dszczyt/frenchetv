@@ -52,57 +52,6 @@ fn nacl_arch() -> &'static str {
 
 /// Ask Google's Omaha/CRX update endpoint for the current Widevine version.
 /// Returns something like `"4.10.3050.0"`.
-async fn fetch_version(client: &reqwest::Client) -> Result<String> {
-    let arch   = arch_tag();
-    let nacl   = nacl_arch();
-    let prod   = "110.0.5481.100";   // chrome prodversion to satisfy the API
-    let url = format!(
-        "https://clients2.google.com/service/update2/crx\
-         ?response=updatecheck\
-         &acceptformat=crx3\
-         &prodversion={prod}\
-         &arch={arch}\
-         &nacl_arch={nacl}\
-         &os=linux\
-         &x=id%3D{id}%26v%3D0.0.0.0%26uc",
-        prod = prod,
-        arch = arch,
-        nacl = nacl,
-        id   = WIDEVINE_COMPONENT_ID,
-    );
-
-    let xml = client
-        .get(&url)
-        .header("User-Agent", format!(
-            "Mozilla/5.0 (X11; Linux {raw}) AppleWebKit/537.36 Chrome/{prod}",
-            raw  = std::env::consts::ARCH,
-            prod = prod,
-        ))
-        .send()
-        .await
-        .context("update check request failed")?
-        .text()
-        .await
-        .context("reading update check response")?;
-
-    tracing::debug!("widevine update XML: {}", xml);
-
-    // Locate  manifest version="4.10.xxxx.0"  inside the XML response.
-    // We avoid pulling in an XML crate to keep the dependency footprint small.
-    for part in xml.split("version=\"") {
-        if let Some(ver) = part.split('"').next() {
-            // Ignore the protocol version attribute (value "3.1") and any
-            // obviously wrong strings — a real Widevine version has 4 fields.
-            let dots = ver.chars().filter(|c| *c == '.').count();
-            if dots == 3 {
-                return Ok(ver.to_string());
-            }
-        }
-    }
-
-    bail!("could not parse Widevine version from update response:\n{}", xml)
-}
-
 // ── CRX download & extraction ─────────────────────────────────────────────────
 
 /// Download and unpack `libwidevinecdm.so` from Google's servers.
@@ -160,13 +109,8 @@ pub async fn install() -> Result<()> {
         .build()
         .context("building reqwest client")?;
 
-    // 1. Resolve current version.
-    let version = fetch_version(&client).await
-        .context("fetching Widevine version")?;
-    tracing::info!("widevine: latest version = {}", version);
-
-    // 2. Build CRX redirect URL (Google serves the right arch automatically
-    //    from the component ID; we also pass os/arch explicitly).
+    // Build CRX redirect URL — Google resolves the current version and
+    // architecture server-side.  reqwest follows the redirect automatically.
     let arch  = arch_tag();
     let nacl  = nacl_arch();
     let prod  = "110.0.5481.100";
@@ -186,7 +130,7 @@ pub async fn install() -> Result<()> {
     );
     tracing::info!("widevine: downloading from {}", url);
 
-    // 3. Download (follows redirects automatically).
+    // Download (follows redirects automatically).
     let crx_bytes = client
         .get(&url)
         .header("User-Agent", format!(
@@ -205,11 +149,11 @@ pub async fn install() -> Result<()> {
 
     tracing::info!("widevine: downloaded {} bytes", crx_bytes.len());
 
-    // 4. Extract.
+    // Extract.
     let cdm = extract_cdm_from_crx(&crx_bytes)
         .context("extracting Widevine CDM from CRX")?;
 
-    // 5. Write to disk.
+    // Write to disk.
     let dest_dir = dir();
     std::fs::create_dir_all(&dest_dir)
         .context("creating widevine dir")?;

@@ -813,7 +813,12 @@ impl Operator for OrangeOperator {
             OperatorError::ParseChannels(format!("invalid stream URL '{}': {}", url_str, e))
         })?;
 
-        Ok(StreamUrl::direct(parsed))
+        // Orange's CDN requires Origin/Referer on every segment request.
+        let stream = StreamUrl::direct(parsed)
+            .with_header("Origin",     "https://tv.orange.fr")
+            .with_header("Referer",    "https://tv.orange.fr/")
+            .with_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
+        Ok(stream)
     }
 
     async fn fetch_epg(&self, _hours: u8) -> Result<Option<EpgData>> {

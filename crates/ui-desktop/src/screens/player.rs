@@ -38,7 +38,11 @@ impl PlayerScreen {
 
     /// Called when the stream has been resolved — starts mpv playback.
     pub fn start_playing(&mut self, stream: &StreamUrl) {
-        self.player.play(stream.url.as_str(), stream.auth_header.as_deref());
+        self.player.play(
+            stream.url.as_str(),
+            stream.auth_header.as_deref(),
+            &stream.headers,
+        );
         self.state = PlayerState::Playing;
         self.info_visible = true;
         self.info_hide_timer = 3.0;
