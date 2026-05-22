@@ -109,6 +109,9 @@ impl OrangeOperator {
             .find(|c| c.name() == "wassup")
             .map(|c| c.value().to_string());
 
+        if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+            return Err(OperatorError::InvalidCredentials);
+        }
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(OperatorError::UnexpectedResponse {
@@ -689,6 +692,10 @@ impl Operator for OrangeOperator {
                     }
                 }
                 Ok(channels)
+            }
+            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                   || r.status() == reqwest::StatusCode::FORBIDDEN => {
+                Err(OperatorError::InvalidCredentials)
             }
             Ok(r) => {
                 warn!("Orange: channel list returned {}, using fallback", r.status());

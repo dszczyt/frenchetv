@@ -129,6 +129,10 @@ impl Operator for BouyguesOperator {
 
                 Ok(channels)
             }
+            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                   || r.status() == reqwest::StatusCode::FORBIDDEN => {
+                Err(OperatorError::InvalidCredentials)
+            }
             Ok(r) => {
                 warn!("Bouygues: channels returned {}, using fallback", r.status());
                 Ok(parse_m3u(FALLBACK_M3U))

@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
-use frenchetv_core::{AuthPhase, Channel, Config, Operator, OperatorKind, OperatorRegistry, StreamUrl};
+use frenchetv_core::{AuthPhase, Channel, Config, Operator, OperatorError, OperatorKind, OperatorRegistry, StreamUrl};
 use frenchetv_core::session as keyring_session;
 use crate::screens::{ChannelListScreen, PlayerScreen, PushWaitScreen, SetupScreen};
 use crate::screens::setup::SetupAction;
@@ -28,6 +28,8 @@ enum AsyncMsg {
     ChannelsErr(String),
     StreamOk { channel: Channel, stream: StreamUrl },
     StreamErr(String),
+    /// A 401/403 was received after login — session is invalid, must re-authenticate.
+    SessionExpired,
 }
 
 enum Screen {
@@ -41,6 +43,8 @@ pub struct App {
     screen: Screen,
     channels: Vec<Channel>,
     current_operator: Option<SharedOperator>,
+    /// (kind_str, username) of the active session — used to clear credentials on expiry.
+    current_session: Option<(String, String)>,
     /// Decoded channel logos, populated asynchronously after channel list loads.
     logos: LogoCache,
     tx: mpsc::SyncSender<AsyncMsg>,
@@ -60,6 +64,7 @@ impl App {
             screen: Screen::Setup(SetupScreen::new()),
             channels: Vec::new(),
             current_operator: None,
+            current_session: None,
             logos,
             tx,
             rx,
@@ -153,6 +158,9 @@ impl App {
                         channels, operator: shared, session_token, kind_str, username,
                     });
                 }
+                Err(OperatorError::InvalidCredentials) => {
+                    let _ = tx.send(AsyncMsg::SessionExpired);
+                }
                 Err(e) => { let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string())); }
             }
             ctx.request_repaint();
@@ -215,6 +223,9 @@ impl App {
                         channels, operator: shared, session_token, kind_str, username,
                     });
                 }
+                Err(OperatorError::InvalidCredentials) => {
+                    let _ = tx.send(AsyncMsg::SessionExpired);
+                }
                 Err(e) => { let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string())); }
             }
             ctx.request_repaint();
@@ -232,7 +243,10 @@ impl App {
             let result = { let op = op.lock().await; op.resolve_stream(&channel).await };
             match result {
                 Ok(stream) => { let _ = tx.send(AsyncMsg::StreamOk { channel, stream }); }
-                Err(e)     => { let _ = tx.send(AsyncMsg::StreamErr(e.to_string()));     }
+                Err(OperatorError::InvalidCredentials) => {
+                    let _ = tx.send(AsyncMsg::SessionExpired);
+                }
+                Err(e) => { let _ = tx.send(AsyncMsg::StreamErr(e.to_string())); }
             }
             ctx.request_repaint();
         });
@@ -268,6 +282,7 @@ impl App {
                         }
                         tracing::info!("Session saved for {}:{}", kind_str, username);
                     }
+                    self.current_session = Some((kind_str, username));
                     self.start_fetch_logos(channels.clone());
                     self.channels = channels.clone();
                     self.current_operator = Some(operator);
@@ -285,6 +300,17 @@ impl App {
                     tracing::error!("stream resolution failed: {}", err);
                     let channels = self.channels.clone();
                     self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                }
+                AsyncMsg::SessionExpired => {
+                    tracing::info!("Session expired — clearing credentials, returning to setup");
+                    if let Some((kind_str, username)) = self.current_session.take() {
+                        keyring_session::clear_session(&kind_str, &username);
+                    }
+                    self.current_operator = None;
+                    self.channels = Vec::new();
+                    let mut s = SetupScreen::new();
+                    s.set_error("Session expirée. Veuillez vous reconnecter.".to_string());
+                    self.screen = Screen::Setup(s);
                 }
             }
             ctx.request_repaint();
