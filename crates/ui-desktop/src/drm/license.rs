@@ -60,7 +60,7 @@ pub fn extract_pssh_from_mpd(mpd_text: &str) -> Option<Vec<u8>> {
                 if let Some(kid) = parse_uuid_to_bytes(kid_str) {
                     let pssh = build_pssh_from_kid(&kid);
                     tracing::debug!(
-                        "widevine: PSSH built from default_KID {} ({} bytes)",
+                        "widevine: PSSH v0+WidevineCencHeader built from default_KID {} ({} bytes)",
                         kid_str, pssh.len()
                     );
                     return Some(pssh);
@@ -87,30 +87,55 @@ fn parse_uuid_to_bytes(uuid: &str) -> Option<[u8; 16]> {
     Some(out)
 }
 
-/// Build a minimal Widevine PSSH box (version 1) containing a single KID.
+/// Encode a minimal `WidevineCencHeader` protobuf for one KID.
+///
+/// Proto schema (relevant fields only):
+/// ```
+/// message WidevineCencHeader {
+///   enum Algorithm { UNENCRYPTED=0; AESCTR=1; }
+///   optional Algorithm algorithm = 1;   // wire: varint
+///   repeated bytes    key_id     = 2;   // wire: length-delimited
+/// }
+/// ```
+/// Encoded: `\x08\x01\x12\x10<16-byte KID>` = 20 bytes.
+fn build_widevine_cenc_header(kid: &[u8; 16]) -> Vec<u8> {
+    let mut pb = Vec::with_capacity(20);
+    pb.push(0x08); // field 1, wire type 0 (varint) = algorithm
+    pb.push(0x01); // AESCTR
+    pb.push(0x12); // field 2, wire type 2 (bytes) = key_id
+    pb.push(0x10); // length 16
+    pb.extend_from_slice(kid);
+    pb
+}
+
+/// Build a Widevine PSSH **version 0** box with a `WidevineCencHeader` payload.
+///
+/// Version 0 (data-carrying) is required by many Widevine license servers;
+/// version 1 (key-list only, no data) causes servers to return 500 because
+/// the challenge lacks the `content_id` / `algorithm` fields they expect.
 ///
 /// Box layout:
 /// ```
-/// 4B  size (= 52)
+/// 4B  size
 /// 4B  'pssh'
-/// 1B  version (= 1)
-/// 3B  flags (= 0)
+/// 1B  version (= 0)
+/// 3B  flags   (= 0)
 /// 16B system_id (Widevine UUID)
-/// 4B  key_id_count (= 1)
-/// 16B key_id
-/// 4B  data_size (= 0)
+/// 4B  data_size (= 20)
+/// 20B WidevineCencHeader protobuf
 /// ```
 /// Total: 52 bytes.
 pub fn build_pssh_from_kid(kid: &[u8; 16]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(52);
-    out.extend_from_slice(&52u32.to_be_bytes());   // size
-    out.extend_from_slice(b"pssh");                 // type
-    out.push(1);                                    // version 1
-    out.extend_from_slice(&[0u8; 3]);               // flags
-    out.extend_from_slice(&WV_SYSTEM_ID);           // system_id
-    out.extend_from_slice(&1u32.to_be_bytes());     // key_id_count
-    out.extend_from_slice(kid);                     // key_id[0]
-    out.extend_from_slice(&0u32.to_be_bytes());     // data_size
+    let data = build_widevine_cenc_header(kid);
+    let total = (4 + 4 + 1 + 3 + 16 + 4 + data.len()) as u32;
+    let mut out = Vec::with_capacity(total as usize);
+    out.extend_from_slice(&total.to_be_bytes());            // size
+    out.extend_from_slice(b"pssh");                         // type
+    out.push(0);                                            // version 0
+    out.extend_from_slice(&[0u8; 3]);                       // flags
+    out.extend_from_slice(&WV_SYSTEM_ID);                   // system_id
+    out.extend_from_slice(&(data.len() as u32).to_be_bytes()); // data_size
+    out.extend_from_slice(&data);                           // WidevineCencHeader
     out
 }
 
@@ -163,10 +188,12 @@ async fn send_challenge(
 
     if !resp.status().is_success() {
         let status = resp.status();
+        tracing::debug!("widevine: license HTTP status = {}", status);
         for (k, v) in resp.headers() {
             tracing::debug!("widevine: license error header: {}: {}", k, v.to_str().unwrap_or("?"));
         }
         let body = resp.text().await.unwrap_or_default();
+        tracing::debug!("widevine: license error body = {}", body);
         bail!("license server returned {}: {}", status, body);
     }
 
