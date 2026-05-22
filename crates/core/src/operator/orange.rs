@@ -115,6 +115,7 @@ impl OrangeOperator {
         let token = Self::extract_tv_token(&html)
             .ok_or_else(|| OperatorError::AuthFailed("tv_token not found in homepage HTML".into()))?;
 
+        tracing::info!("Orange: tv_token extracted (len={})", token.len());
         self.tv_token = Some(token);
         self.tv_token_expires = Some(
             std::time::Instant::now() + std::time::Duration::from_secs(25 * 60),
@@ -472,7 +473,12 @@ impl Operator for OrangeOperator {
             match next_step {
                 // Authentication complete — cookie may arrive here or already be in jar.
                 "end" | "final" => {
-                    if let Some(w) = wassup { self.wassup = Some(w); }
+                    if let Some(ref w) = wassup {
+                        tracing::info!("Orange: wassup cookie received in {:?} response (len={})", next_step, w.len());
+                        self.wassup = Some(w.clone());
+                    } else {
+                        tracing::info!("Orange: no wassup in {:?} response — relying on cookie_store", next_step);
+                    }
                     tracing::info!("Orange: AOM approved (nextStep={:?}); fetching tv_token", next_step);
                     return self.ensure_tv_token().await;
                 }
@@ -588,10 +594,18 @@ impl Operator for OrangeOperator {
 
         match resp {
             Ok(r) if r.status().is_success() => {
-                let channels_raw: Vec<OrangeChannel> = match r.json().await {
+                let body_text = match r.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        warn!("Orange: channel list read error: {}, using fallback", e);
+                        return Ok(parse_m3u(FALLBACK_M3U));
+                    }
+                };
+                tracing::debug!("Orange channels body: {:.500}", body_text);
+                let channels_raw: Vec<OrangeChannel> = match serde_json::from_str(&body_text) {
                     Ok(v) => v,
                     Err(e) => {
-                        warn!("Orange: channel list parse error: {}, using fallback", e);
+                        warn!("Orange: channel list parse error: {} — body: {:.300}", e, body_text);
                         return Ok(parse_m3u(FALLBACK_M3U));
                     }
                 };
