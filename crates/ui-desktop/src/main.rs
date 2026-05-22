@@ -4,6 +4,7 @@ use tracing_subscriber::EnvFilter;
 mod app;
 mod player;
 mod screens;
+pub(crate) mod widevine;
 
 fn main() -> Result<()> {
     tracing_subscriber::fmt()

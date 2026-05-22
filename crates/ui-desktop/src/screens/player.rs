@@ -3,9 +3,15 @@ use frenchetv_core::Channel;
 use crate::player::mpv::MpvPlayer;
 use frenchetv_core::StreamUrl;
 
+enum PlayerState {
+    Loading,
+    Playing,
+}
+
 pub struct PlayerScreen {
     pub channel: Channel,
     player: MpvPlayer,
+    state: PlayerState,
     info_visible: bool,
     info_hide_timer: f32,  // seconds remaining to show info overlay
 }
@@ -19,19 +25,23 @@ pub enum PlayerAction {
 }
 
 impl PlayerScreen {
-    /// `stream` is the resolved stream to play.
-    pub fn new(channel: Channel, stream: &StreamUrl) -> Self {
-        let mut player = MpvPlayer::new();
-        player.play(
-            stream.url.as_str(),
-            stream.auth_header.as_deref(),
-        );
+    /// Create a loading player screen — stream resolution is in flight.
+    pub fn new(channel: Channel) -> Self {
         Self {
             channel,
-            player,
-            info_visible: true,
-            info_hide_timer: 3.0,
+            player: MpvPlayer::new(),
+            state: PlayerState::Loading,
+            info_visible: false,
+            info_hide_timer: 0.0,
         }
+    }
+
+    /// Called when the stream has been resolved — starts mpv playback.
+    pub fn start_playing(&mut self, stream: &StreamUrl) {
+        self.player.play(stream.url.as_str(), stream.auth_header.as_deref());
+        self.state = PlayerState::Playing;
+        self.info_visible = true;
+        self.info_hide_timer = 3.0;
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> PlayerAction {
@@ -70,14 +80,33 @@ impl PlayerScreen {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| {
-                // "mpv plays in a separate window" note — shown always in v0.1
-                ui.centered_and_justified(|ui| {
-                    ui.label(
-                        RichText::new("▶  Lecture en cours dans la fenêtre mpv")
-                            .font(FontId::proportional(18.0))
-                            .color(Color32::from_rgb(80, 80, 80)),
-                    );
-                });
+                match self.state {
+                    PlayerState::Loading => {
+                        ui.centered_and_justified(|ui| {
+                            ui.vertical_centered(|ui| {
+                                ui.add_space(ui.available_height() / 2.0 - 32.0);
+                                ui.add(egui::Spinner::new().size(40.0).color(Color32::WHITE));
+                                ui.add_space(16.0);
+                                ui.label(
+                                    RichText::new(format!("Chargement de {}…", self.channel.name))
+                                        .font(FontId::proportional(16.0))
+                                        .color(Color32::from_rgb(160, 160, 160)),
+                                );
+                            });
+                        });
+                        ctx.request_repaint();
+                    }
+                    PlayerState::Playing => {
+                        // "mpv plays in a separate window" note — shown always in v0.1
+                        ui.centered_and_justified(|ui| {
+                            ui.label(
+                                RichText::new("▶  Lecture en cours dans la fenêtre mpv")
+                                    .font(FontId::proportional(18.0))
+                                    .color(Color32::from_rgb(80, 80, 80)),
+                            );
+                        });
+                    }
+                }
 
                 // Info overlay
                 if self.info_visible {

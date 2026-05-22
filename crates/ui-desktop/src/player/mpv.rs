@@ -16,9 +16,15 @@ impl MpvPlayer {
     pub fn play(&mut self, url: &str, auth_header: Option<&str>) {
         let _ = self.stop();
         let mut cmd = std::process::Command::new("mpv");
-        cmd.arg("--no-terminal").arg("--force-window=yes");
+        cmd.arg("--force-window=yes");
         if let Some(header) = auth_header {
             cmd.arg(format!("--http-header-fields=Authorization: {}", header));
+        }
+        // If the Widevine CDM was downloaded, point mpv at it.
+        // Requires mpv compiled with --enable-cdm (e.g. mpv-widevine AUR).
+        let cdm_dir = crate::widevine::dir();
+        if cdm_dir.join("libwidevinecdm.so").exists() {
+            cmd.arg(format!("--cdm-store={}", cdm_dir.display()));
         }
         cmd.arg(url);
         match cmd.spawn() {

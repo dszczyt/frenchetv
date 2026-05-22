@@ -13,6 +13,8 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg",
 # libmpv2 = "3"  # requires libmpv system library; re-enable when libmpv-dev is installed
 tokio = { version = "1", features = ["full"] }
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+zip = { version = "2", default-features = false, features = ["deflate"] }
+dirs = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

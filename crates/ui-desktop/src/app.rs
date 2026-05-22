@@ -26,10 +26,14 @@ enum AsyncMsg {
         username: String,
     },
     ChannelsErr(String),
-    StreamOk { channel: Channel, stream: StreamUrl },
+    StreamOk { stream: StreamUrl },
     StreamErr(String),
     /// A 401/403 was received after login — session is invalid, must re-authenticate.
     SessionExpired,
+    /// Background Widevine CDM download finished.
+    WidevineDone,
+    /// Background Widevine CDM download failed.
+    WidevineErr(String),
 }
 
 enum Screen {
@@ -82,6 +86,13 @@ impl App {
             }
         }
 
+        // Download Widevine CDM in the background if not already present.
+        if !crate::widevine::is_installed() {
+            app.start_download_widevine();
+        } else {
+            tracing::debug!("widevine: CDM already present at {:?}", crate::widevine::cdm_path());
+        }
+
         app
     }
 
@@ -130,6 +141,25 @@ impl App {
                 }
             }
             while set.join_next().await.is_some() {}
+        });
+    }
+
+    fn start_download_widevine(&self) {
+        let tx  = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
+        self.rt.spawn(async move {
+            tracing::info!("widevine: starting CDM download");
+            match crate::widevine::install().await {
+                Ok(()) => {
+                    tracing::info!("widevine: CDM installed successfully");
+                    let _ = tx.send(AsyncMsg::WidevineDone);
+                }
+                Err(e) => {
+                    tracing::warn!("widevine: CDM download failed: {}", e);
+                    let _ = tx.send(AsyncMsg::WidevineErr(e.to_string()));
+                }
+            }
+            ctx.request_repaint();
         });
     }
 
@@ -245,7 +275,7 @@ impl App {
             match result {
                 Ok(stream) => {
                     tracing::debug!("resolve_stream: ok → {}", stream.url);
-                    let _ = tx.send(AsyncMsg::StreamOk { channel, stream });
+                    let _ = tx.send(AsyncMsg::StreamOk { stream });
                 }
                 Err(OperatorError::InvalidCredentials) => {
                     tracing::warn!("resolve_stream: 401/403 → SessionExpired");
@@ -301,8 +331,11 @@ impl App {
                         s.set_error(format!("Erreur chargement chaînes : {}", err));
                     }
                 }
-                AsyncMsg::StreamOk { channel, stream } => {
-                    self.screen = Screen::Player(PlayerScreen::new(channel, &stream));
+                AsyncMsg::StreamOk { stream } => {
+                    if let Screen::Player(player) = &mut self.screen {
+                        player.start_playing(&stream);
+                    }
+                    // If user navigated back before stream resolved, silently drop.
                 }
                 AsyncMsg::StreamErr(err) => {
                     tracing::error!("stream resolution failed: {}", err);
@@ -319,6 +352,15 @@ impl App {
                     let mut s = SetupScreen::new();
                     s.set_error("Session expirée. Veuillez vous reconnecter.".to_string());
                     self.screen = Screen::Setup(s);
+                }
+                AsyncMsg::WidevineDone => {
+                    // CDM is now on disk; mpv will pick it up on next play().
+                    tracing::info!("widevine: CDM ready at {:?}", crate::widevine::cdm_path());
+                }
+                AsyncMsg::WidevineErr(err) => {
+                    // Non-fatal — DRM streams will fail to play, but the app
+                    // continues working for non-DRM content.
+                    tracing::warn!("widevine: install failed: {}", err);
                 }
             }
             ctx.request_repaint();
@@ -339,7 +381,8 @@ impl eframe::App for App {
             Screen::PushWait(pw) => { pw.show(ctx); }
             Screen::ChannelList(list) => {
                 if let ChannelListAction::SelectChannel(channel) = list.show(ctx) {
-                    self.start_resolve_stream(channel);
+                    self.start_resolve_stream(channel.clone());
+                    self.screen = Screen::Player(PlayerScreen::new(channel));
                 }
             }
             Screen::Player(player) => {
