@@ -11,6 +11,10 @@ pub struct Channel {
     pub number: Option<u32>,
     pub category: ChannelCategory,
     pub stream_template: StreamTemplate,
+    /// True when the channel is not available on this platform (e.g. W_PC absent
+    /// from allowedDeviceCategories). Hidden by default; shown via toggle.
+    #[serde(default)]
+    pub locked: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]

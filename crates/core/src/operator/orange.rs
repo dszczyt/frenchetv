@@ -197,6 +197,9 @@ struct OrangeChannel {
     display_order: Option<u32>,
     #[serde(default)]
     logos: Vec<OrangeLogo>,
+    /// Platform availability flags — absence of "W_PC" means locked on desktop.
+    #[serde(default)]
+    allowed_device_categories: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -638,6 +641,8 @@ impl Operator for OrangeOperator {
                             .logos
                             .into_iter()
                             .find_map(|l| l.url_service);
+                        let locked = !c.allowed_device_categories.is_empty()
+                            && !c.allowed_device_categories.iter().any(|s| s == "W_PC");
                         Channel {
                             id: c.id_epg.to_string(),
                             name: c.name,
@@ -645,6 +650,7 @@ impl Operator for OrangeOperator {
                             number: c.display_order,
                             category: ChannelCategory::Other("".to_string()),
                             stream_template: StreamTemplate::Direct(placeholder.clone()),
+                            locked,
                         }
                     })
                     .collect();
@@ -1009,6 +1015,7 @@ mod tests {
             stream_template: StreamTemplate::Direct(
                 url::Url::parse(PLACEHOLDER_URL).unwrap(),
             ),
+            locked: false,
         };
 
         let stream = op.resolve_stream(&channel).await.unwrap();

@@ -72,6 +72,7 @@ pub fn parse_m3u(content: &str) -> Vec<Channel> {
             number: tvg_chno,
             category: ChannelCategory::from_group_title(&group_title),
             stream_template: StreamTemplate::Direct(url),
+            locked: false,
         });
     }
 

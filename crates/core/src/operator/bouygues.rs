@@ -123,6 +123,7 @@ impl Operator for BouyguesOperator {
                             c.category.as_deref().unwrap_or(""),
                         ),
                         stream_template: StreamTemplate::Authenticated { base_url: url },
+                        locked: false,
                     })
                 }).collect();
 
@@ -270,6 +271,7 @@ mod tests {
             stream_template: StreamTemplate::Authenticated {
                 base_url: url::Url::parse("https://bbox.example.com/tf1/index.m3u8").unwrap(),
             },
+            locked: false,
         };
 
         let stream = op.resolve_stream(&channel).await.unwrap();

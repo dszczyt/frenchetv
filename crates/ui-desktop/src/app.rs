@@ -1,4 +1,5 @@
 use std::sync::{mpsc, Arc};
+use egui_extras;
 use tokio::sync::Mutex;
 use frenchetv_core::{AuthPhase, Channel, Config, Operator, OperatorKind, OperatorRegistry, StreamUrl};
 use frenchetv_core::session as keyring_session;
@@ -51,12 +52,13 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        egui_extras::install_image_loaders(&cc.egui_ctx);
         let (tx, rx) = mpsc::sync_channel(16);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
 
         let config = Config::load().unwrap_or_default();
 
-        let mut app = Self {
+        let app = Self {
             screen: Screen::Setup(SetupScreen::new()),
             channels: Vec::new(),
             current_operator: None,
