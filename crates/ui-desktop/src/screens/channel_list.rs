@@ -175,7 +175,20 @@ impl ChannelListScreen {
                                                         .maintain_aspect_ratio(true)
                                                         .sense(egui::Sense::hover()),
                                                     );
+                                                } else if channel.logo_url.is_some() {
+                                                    // URL known but fetch not yet complete — spinner
+                                                    let (rect, _) = ui.allocate_exact_size(
+                                                        logo_size,
+                                                        egui::Sense::hover(),
+                                                    );
+                                                    ui.painter().rect_filled(rect, 4.0, placeholder_color);
+                                                    let spin_rect = egui::Rect::from_center_size(
+                                                        rect.center(),
+                                                        egui::Vec2::splat(24.0),
+                                                    );
+                                                    ui.put(spin_rect, egui::Spinner::new().size(16.0));
                                                 } else {
+                                                    // No logo for this channel
                                                     let (rect, _) = ui.allocate_exact_size(
                                                         logo_size,
                                                         egui::Sense::hover(),
