@@ -2,6 +2,7 @@ use anyhow::Result;
 use tracing_subscriber::EnvFilter;
 
 mod app;
+pub(crate) mod drm;
 mod player;
 mod screens;
 pub(crate) mod widevine;

@@ -68,9 +68,10 @@ impl MpvPlayer {
         }
 
         // --cdm-store only works with mpv compiled with --enable-cdm
-        // (e.g. the mpv-widevine AUR package).  The standard Arch mpv does
-        // not support it, so we skip the flag.  The CDM is already on disk
-        // at widevine::cdm_path() for when a CDM-capable mpv is in use.
+        // (e.g. the mpv-widevine AUR package).  Skip on standard Arch mpv.
+        if self.has_cdm_support {
+            cmd.arg(format!("--cdm-store={}", crate::widevine::dir().display()));
+        }
 
         cmd.arg(url);
         match cmd.spawn() {

@@ -68,6 +68,7 @@ fn arch_tag() -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 fn nacl_arch() -> &'static str {
     match std::env::consts::ARCH {
         "aarch64" => "arm64",

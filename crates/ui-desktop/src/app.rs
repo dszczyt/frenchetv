@@ -3,6 +3,7 @@ use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
 use frenchetv_core::{AuthPhase, Channel, Config, Operator, OperatorError, OperatorKind, OperatorRegistry, StreamUrl};
 use frenchetv_core::session as keyring_session;
+use crate::drm::DrmProxy;
 use crate::screens::{ChannelListScreen, PlayerScreen, PushWaitScreen, SetupScreen};
 use crate::screens::setup::SetupAction;
 use crate::screens::channel_list::ChannelListAction;
@@ -28,6 +29,9 @@ enum AsyncMsg {
     ChannelsErr(String),
     StreamOk { stream: StreamUrl },
     StreamErr(String),
+    /// DRM proxy started; pass proxy_mpd_url to mpv instead of the real stream URL.
+    DrmProxyReady { proxy_mpd_url: String, proxy: Box<DrmProxy> },
+    DrmProxyErr(String),
     /// A 401/403 was received after login — session is invalid, must re-authenticate.
     SessionExpired,
     /// Background Widevine CDM download finished.
@@ -55,6 +59,8 @@ pub struct App {
     rx: mpsc::Receiver<AsyncMsg>,
     rt: tokio::runtime::Runtime,
     egui_ctx: egui::Context,
+    /// Keep the DRM proxy alive while playback is active (Drop aborts the listener).
+    _drm_proxy: Option<Box<DrmProxy>>,
 }
 
 impl App {
@@ -74,6 +80,7 @@ impl App {
             rx,
             rt,
             egui_ctx: cc.egui_ctx.clone(),
+            _drm_proxy: None,
         };
 
         let kind_str = config.operator.kind.clone();
@@ -90,7 +97,7 @@ impl App {
         if !crate::widevine::is_installed() {
             app.start_download_widevine();
         } else {
-            tracing::debug!("widevine: CDM already present at {:?}", crate::widevine::cdm_path());
+            tracing::info!("widevine: CDM already present at {:?}", crate::widevine::cdm_path());
         }
 
         app
@@ -297,6 +304,112 @@ impl App {
         });
     }
 
+    /// Start the Widevine DRM pipeline for a protected stream:
+    /// 1. Open CDM, initialize it.
+    /// 2. Fetch the DASH MPD to get the PSSH (or use `protection.pssh` if available).
+    /// 3. Do the license exchange.
+    /// 4. Start the local HTTP proxy.
+    /// 5. Send `DrmProxyReady` so the player can start mpv against the proxy URL.
+    fn start_drm_proxy(&self, stream: StreamUrl) {
+        use crate::drm::cdm::CdmHandle;
+        use crate::drm::{license, proxy};
+
+        let tx  = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
+
+        self.rt.spawn(async move {
+            let protection = match stream.protection.as_ref() {
+                Some(p) => p.clone(),
+                None => {
+                    let _ = tx.send(AsyncMsg::DrmProxyErr("stream has no protection data".into()));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            // --- 1. Open and initialize CDM ---
+            let cdm_path = crate::widevine::cdm_path();
+            let cdm_path_str = cdm_path.to_string_lossy().into_owned();
+            let mut cdm_handle = match CdmHandle::open(&cdm_path_str) {
+                Ok(h) => h,
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!("CDM open failed: {}", e)));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+            if let Err(e) = cdm_handle.initialize() {
+                let _ = tx.send(AsyncMsg::DrmProxyErr(format!("CDM init failed: {}", e)));
+                ctx.request_repaint();
+                return;
+            }
+            let cdm = std::sync::Arc::new(std::sync::Mutex::new(cdm_handle));
+
+            // --- 2. Fetch MPD and extract PSSH ---
+            let mpd_url = stream.url.to_string();
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(15))
+                .build()
+                .unwrap_or_default();
+
+            let mut req = client.get(&mpd_url);
+            for (k, v) in &stream.headers {
+                req = req.header(k.as_str(), v.as_str());
+            }
+            let mpd_resp = req.send().await;
+            let mpd_text = match mpd_resp {
+                Ok(r) => match r.text().await {
+                    Ok(t) => t,
+                    Err(e) => {
+                        let _ = tx.send(AsyncMsg::DrmProxyErr(format!("MPD read failed: {}", e)));
+                        ctx.request_repaint();
+                        return;
+                    }
+                },
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!("MPD fetch failed: {}", e)));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            let pssh = if let Some(p) = protection.pssh.as_ref() {
+                p.clone()
+            } else {
+                match license::extract_pssh_from_mpd(&mpd_text) {
+                    Some(p) => p,
+                    None => {
+                        let _ = tx.send(AsyncMsg::DrmProxyErr("PSSH not found in MPD".into()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                }
+            };
+
+            // --- 3. License exchange ---
+            if let Err(e) = license::acquire_license(&cdm, &pssh, &protection.la_url, &protection.license_headers).await {
+                let _ = tx.send(AsyncMsg::DrmProxyErr(format!("License exchange failed: {}", e)));
+                ctx.request_repaint();
+                return;
+            }
+
+            // --- 4. Start proxy ---
+            let cdn_headers = stream.headers.clone();
+            let drm_proxy = match proxy::start(cdm, mpd_text, mpd_url, cdn_headers).await {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!("Proxy start failed: {}", e)));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
+
+            let proxy_mpd_url = drm_proxy.mpd_url.clone();
+            let _ = tx.send(AsyncMsg::DrmProxyReady { proxy_mpd_url, proxy: Box::new(drm_proxy) });
+            ctx.request_repaint();
+        });
+    }
+
     fn make_channel_list(&self, channels: Vec<Channel>) -> ChannelListScreen {
         ChannelListScreen::new(channels, Arc::clone(&self.logos))
     }
@@ -339,10 +452,27 @@ impl App {
                     }
                 }
                 AsyncMsg::StreamOk { stream } => {
-                    if let Screen::Player(player) = &mut self.screen {
+                    if stream.protection.is_some() {
+                        // DRM stream — start the proxy pipeline before handing off to mpv.
+                        self.start_drm_proxy(stream);
+                    } else if let Screen::Player(player) = &mut self.screen {
                         player.start_playing(&stream);
                     }
-                    // If user navigated back before stream resolved, silently drop.
+                }
+                AsyncMsg::DrmProxyReady { proxy_mpd_url, proxy } => {
+                    // Keep proxy alive; give mpv the local URL.
+                    self._drm_proxy = Some(proxy);
+                    if let Screen::Player(player) = &mut self.screen {
+                        // Build a plain StreamUrl pointing to the proxy.
+                        if let Ok(proxy_url) = proxy_mpd_url.parse::<url::Url>() {
+                            player.start_playing(&StreamUrl::direct(proxy_url));
+                        }
+                    }
+                }
+                AsyncMsg::DrmProxyErr(err) => {
+                    tracing::error!("DRM proxy error: {}", err);
+                    let channels = self.channels.clone();
+                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
                 }
                 AsyncMsg::StreamErr(err) => {
                     tracing::error!("stream resolution failed: {}", err);
@@ -397,6 +527,7 @@ impl eframe::App for App {
                 let current_id = player.channel.id.clone();
                 match player.show(ctx) {
                     PlayerAction::Back => {
+                        self._drm_proxy = None;
                         self.screen = Screen::ChannelList(self.make_channel_list(channels));
                     }
                     PlayerAction::NextChannel => {

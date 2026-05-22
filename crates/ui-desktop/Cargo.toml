@@ -21,3 +21,9 @@ backhand = { version = "0.25", default-features = false, features = ["xz", "gzip
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+quick-xml = "0.36"
+base64 = "0.22"
+url = { version = "2", features = ["serde"] }
+
+[build-dependencies]
+cc = "1"

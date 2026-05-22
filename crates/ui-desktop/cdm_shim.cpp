@@ -1,0 +1,507 @@
+// Minimal C++ CDM host shim for Widevine CDM interface version 10.
+//
+// Defines its own CDM interface types (no Google headers needed) matching
+// the Itanium C++ ABI that libwidevinecdm.so was compiled with.
+// Exposes a plain C API to Rust.
+//
+// Thread safety: CDM callbacks are called synchronously from within
+// CreateSessionAndGenerateRequest / UpdateSession on the calling thread.
+
+#include <stdint.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#include <dlfcn.h>
+#include <stdio.h>
+
+// ─── CDM types (matching chromium CDM interface 10 ABI) ───────────────────────
+
+namespace cdm {
+
+enum class Exception : uint32_t {
+    kExceptionTypeError          = 0,
+    kExceptionNotSupportedError  = 1,
+    kExceptionInvalidStateError  = 2,
+    kExceptionQuotaExceededError = 3,
+};
+
+enum class KeyStatus : uint32_t {
+    kUsable            = 0,
+    kInternalError     = 1,
+    kExpired           = 2,
+    kOutputRestricted  = 3,
+    kOutputDownscaled  = 4,
+    kStatusPending     = 5,
+    kReleased          = 6,
+};
+
+enum class SessionType : uint32_t {
+    kTemporary            = 0,
+    kPersistentLicense    = 1,
+    kPersistentKeyRelease = 2,
+};
+
+enum class InitDataType : uint32_t {
+    kCenc  = 0,
+    kKeyIds = 1,
+    kWebM  = 2,
+};
+
+enum class MessageType : uint32_t {
+    kLicenseRequest          = 0,
+    kLicenseRenewal          = 1,
+    kLicenseRelease          = 2,
+    kIndividualizationRequest = 3,
+};
+
+enum class EncryptionScheme : uint32_t {
+    kUnencrypted = 0,
+    kCenc        = 1,
+    kCbcs        = 2,
+};
+
+enum Status : uint32_t {
+    kSuccess               = 0,
+    kNoKey                 = 1,
+    kNeedMoreData          = 2,
+    kDecryptError          = 3,
+    kDecodeError           = 4,
+    kInitializationError   = 5,
+    kDeferredInitialization = 6,
+};
+
+struct SubsampleEntry {
+    uint32_t clear_bytes;
+    uint32_t cipher_bytes;
+};
+
+struct InputBuffer_2 {
+    const uint8_t*      data;
+    uint32_t            data_size;
+    EncryptionScheme    encryption_scheme;
+    const uint8_t*      key_id;
+    uint32_t            key_id_size;
+    const uint8_t*      iv;
+    uint32_t            iv_size;
+    const SubsampleEntry* subsamples;
+    uint32_t            num_subsamples;
+    int64_t             timestamp;
+    const uint8_t*      side_data;
+    uint32_t            side_data_size;
+};
+
+struct KeyInformation {
+    const uint8_t* key_id;
+    uint32_t       key_id_size;
+    KeyStatus      status;
+    uint32_t       system_code;
+};
+
+struct Policy {
+    uint32_t min_hdcp_version;
+};
+
+// Forward declarations
+class FileIO;
+class FileIOClient;
+
+// ─── Buffer ─────────────────────────────────────────────────────────────────
+
+class Buffer {
+ public:
+    virtual void     Destroy()         = 0;
+    virtual uint32_t Capacity() const  = 0;
+    virtual uint8_t* Data()            = 0;
+    virtual void     SetSize(uint32_t) = 0;
+    virtual uint32_t Size()    const   = 0;
+ protected:
+    Buffer() {}
+    virtual ~Buffer() {}
+};
+
+class SimpleBuffer : public Buffer {
+ public:
+    explicit SimpleBuffer(uint32_t cap)
+        : data_(static_cast<uint8_t*>(malloc(cap))), cap_(cap), size_(0) {}
+    void     Destroy()              override { delete this; }
+    uint32_t Capacity() const       override { return cap_; }
+    uint8_t* Data()                 override { return data_; }
+    void     SetSize(uint32_t s)    override { size_ = s; }
+    uint32_t Size()    const        override { return size_; }
+ private:
+    ~SimpleBuffer() { free(data_); }
+    uint8_t* data_;
+    uint32_t cap_;
+    uint32_t size_;
+};
+
+// ─── DecryptedBlock ──────────────────────────────────────────────────────────
+
+class DecryptedBlock {
+ public:
+    virtual void    SetDecryptedBuffer(Buffer*)  = 0;
+    virtual Buffer* DecryptedBuffer()            = 0;
+    virtual void    SetTimestamp(int64_t)        = 0;
+    virtual int64_t Timestamp() const            = 0;
+ protected:
+    DecryptedBlock() {}
+    virtual ~DecryptedBlock() {}
+};
+
+class SimpleDecryptedBlock : public DecryptedBlock {
+ public:
+    SimpleDecryptedBlock() : buf_(nullptr), ts_(0) {}
+    ~SimpleDecryptedBlock() { if (buf_) buf_->Destroy(); }
+    void    SetDecryptedBuffer(Buffer* b) override { buf_ = b; }
+    Buffer* DecryptedBuffer()             override { return buf_; }
+    void    SetTimestamp(int64_t t)       override { ts_ = t; }
+    int64_t Timestamp() const             override { return ts_; }
+ private:
+    Buffer* buf_;
+    int64_t ts_;
+};
+
+// ─── Host_10 (pure virtual interface we must implement) ──────────────────────
+
+class Host_10 {
+ public:
+    static const int kVersion = 10;
+    virtual Buffer* Allocate(uint32_t capacity)                               = 0;
+    virtual void    SetTimer(int64_t delay_ms, void* context)                 = 0;
+    virtual double  GetCurrentWallTime()                                      = 0;
+    virtual void    OnInitialized(bool success)                               = 0;
+    virtual void    OnResolveKeyStatusPromise(uint32_t, KeyStatus)            = 0;
+    virtual void    OnResolveNewSessionPromise(uint32_t, const char*, uint32_t) = 0;
+    virtual void    OnResolvePromise(uint32_t)                                = 0;
+    virtual void    OnRejectPromise(uint32_t, Exception, uint32_t,
+                                    const char*, uint32_t)                    = 0;
+    virtual void    OnSessionMessage(const char*, uint32_t, MessageType,
+                                     const char*, uint32_t)                   = 0;
+    virtual void    OnSessionKeysChange(const char*, uint32_t, bool,
+                                        const KeyInformation*, uint32_t)      = 0;
+    virtual void    OnExpirationChange(const char*, uint32_t, double)         = 0;
+    virtual void    OnSessionClosed(const char*, uint32_t)                    = 0;
+    virtual void    SendPlatformChallenge(const char*, uint32_t,
+                                          const char*, uint32_t)              = 0;
+    virtual void    EnableOutputProtection(uint32_t)                          = 0;
+    virtual void    QueryOutputProtectionStatus()                             = 0;
+    virtual void    OnDeferredInitializationDone(uint32_t, Status)            = 0;
+    virtual FileIO* CreateFileIO(FileIOClient*)                               = 0;
+    virtual void    RequestStorageId(uint32_t)                                = 0;
+ protected:
+    Host_10() {}
+    virtual ~Host_10() {}
+};
+
+// ─── ContentDecryptionModule_10 (vtable we call INTO the CDM) ────────────────
+
+class ContentDecryptionModule_10 {
+ public:
+    static const int kVersion = 10;
+    virtual void   Initialize(bool allow_distinctive_identifier,
+                              bool allow_persistent_state,
+                              bool use_hw_secure_codecs)                         = 0;
+    virtual void   GetStatusForPolicy(uint32_t promise_id, const Policy& policy) = 0;
+    virtual void   SetServerCertificate(uint32_t, const uint8_t*, uint32_t)      = 0;
+    virtual void   CreateSessionAndGenerateRequest(uint32_t, SessionType,
+                                                   InitDataType,
+                                                   const uint8_t*, uint32_t)     = 0;
+    virtual void   LoadSession(uint32_t, SessionType, const char*, uint32_t)     = 0;
+    virtual void   UpdateSession(uint32_t, const char*, uint32_t,
+                                 const uint8_t*, uint32_t)                       = 0;
+    virtual void   CloseSession(uint32_t, const char*, uint32_t)                 = 0;
+    virtual void   RemoveSession(uint32_t, const char*, uint32_t)                = 0;
+    virtual void   TimerExpired(void* context)                                   = 0;
+    virtual Status Decrypt(const InputBuffer_2& encrypted_buffer,
+                           DecryptedBlock* decrypted_buffer)                     = 0;
+    virtual Status InitializeAudioDecoder(const void*)                           = 0;
+    virtual Status InitializeVideoDecoder(const void*)                           = 0;
+    virtual Status DecryptAndDecodeFrame(const InputBuffer_2&, void*)            = 0;
+    virtual Status DecryptAndDecodeSamples(const InputBuffer_2&, void*)          = 0;
+    virtual void   OnPlatformChallengeResponse(const void*)                      = 0;
+    virtual void   OnQueryOutputProtectionStatus(uint32_t, uint32_t, uint32_t)  = 0;
+    virtual void   OnStorageId(uint32_t, const uint8_t*, uint32_t)               = 0;
+    virtual void   Destroy()                                                     = 0;
+ protected:
+    ContentDecryptionModule_10() {}
+    virtual ~ContentDecryptionModule_10() {}
+};
+
+} // namespace cdm
+
+// ─── Exported CDM function types ─────────────────────────────────────────────
+
+typedef void (*InitCdmFn)();
+typedef void (*DeinitCdmFn)();
+typedef cdm::Host_10* (*GetHostFn)(int, void*);
+typedef cdm::ContentDecryptionModule_10* (*CreateInstanceFn)(
+    int, const char*, uint32_t, GetHostFn, void*);
+
+// ─── C API types (Rust-facing) ───────────────────────────────────────────────
+
+extern "C" {
+
+struct CdmCallbacks {
+    void (*on_initialized)(void* ctx, bool success);
+    // License request is ready — POST these bytes to the license server.
+    void (*on_license_request)(void* ctx,
+                               const char* session_id, uint32_t session_id_len,
+                               const uint8_t* request, uint32_t request_len);
+    // Keys status changed.
+    void (*on_keys_change)(void* ctx,
+                           const char* session_id, uint32_t session_id_len,
+                           bool has_usable_key);
+    // Promise resolved (session created or update accepted).
+    void (*on_promise_ok)(void* ctx, uint32_t promise_id,
+                          const char* session_id, uint32_t session_id_len);
+    // Promise rejected.
+    void (*on_promise_err)(void* ctx, uint32_t promise_id,
+                           const char* msg, uint32_t msg_len);
+    void* ctx;
+};
+
+struct CdmDecryptInput {
+    const uint8_t*             data;
+    uint32_t                   data_size;
+    uint32_t                   encryption_scheme; // 1=cenc, 2=cbcs
+    const uint8_t*             key_id;
+    uint32_t                   key_id_size;
+    const uint8_t*             iv;
+    uint32_t                   iv_size;
+    const cdm::SubsampleEntry* subsamples;
+    uint32_t                   num_subsamples;
+    int64_t                    timestamp;
+};
+
+struct CdmDecryptOutput {
+    uint8_t* data;      // caller must free via cdm_free_output()
+    uint32_t data_size;
+    int      status;    // 0 = kSuccess
+};
+
+} // extern "C"
+
+// ─── Host implementation ─────────────────────────────────────────────────────
+
+class CdmHostImpl : public cdm::Host_10 {
+ public:
+    explicit CdmHostImpl(CdmCallbacks* cbs) : cbs_(cbs) {}
+    ~CdmHostImpl() override {}
+
+    cdm::Buffer* Allocate(uint32_t capacity) override {
+        return new cdm::SimpleBuffer(capacity);
+    }
+    void SetTimer(int64_t, void*) override {}
+
+    double GetCurrentWallTime() override {
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        return static_cast<double>(ts.tv_sec)
+             + static_cast<double>(ts.tv_nsec) / 1.0e9;
+    }
+
+    void OnInitialized(bool success) override {
+        if (cbs_->on_initialized)
+            cbs_->on_initialized(cbs_->ctx, success);
+    }
+
+    void OnResolveKeyStatusPromise(uint32_t, cdm::KeyStatus) override {}
+
+    void OnResolveNewSessionPromise(uint32_t promise_id,
+                                    const char* session_id,
+                                    uint32_t session_id_size) override {
+        if (cbs_->on_promise_ok)
+            cbs_->on_promise_ok(cbs_->ctx, promise_id, session_id, session_id_size);
+    }
+
+    void OnResolvePromise(uint32_t promise_id) override {
+        if (cbs_->on_promise_ok)
+            cbs_->on_promise_ok(cbs_->ctx, promise_id, nullptr, 0);
+    }
+
+    void OnRejectPromise(uint32_t promise_id, cdm::Exception /*ex*/, uint32_t,
+                         const char* msg, uint32_t msg_len) override {
+        if (cbs_->on_promise_err)
+            cbs_->on_promise_err(cbs_->ctx, promise_id, msg, msg_len);
+    }
+
+    void OnSessionMessage(const char* session_id, uint32_t session_id_size,
+                          cdm::MessageType message_type,
+                          const char* message, uint32_t message_size) override {
+        if ((message_type == cdm::MessageType::kLicenseRequest ||
+             message_type == cdm::MessageType::kLicenseRenewal) && cbs_->on_license_request) {
+            cbs_->on_license_request(cbs_->ctx,
+                                     session_id, session_id_size,
+                                     reinterpret_cast<const uint8_t*>(message),
+                                     message_size);
+        }
+    }
+
+    void OnSessionKeysChange(const char* session_id, uint32_t session_id_size,
+                             bool has_additional_usable_key,
+                             const cdm::KeyInformation* keys_info,
+                             uint32_t keys_info_count) override {
+        bool any_usable = has_additional_usable_key;
+        for (uint32_t i = 0; i < keys_info_count && !any_usable; ++i)
+            if (keys_info[i].status == cdm::KeyStatus::kUsable) any_usable = true;
+        if (cbs_->on_keys_change)
+            cbs_->on_keys_change(cbs_->ctx, session_id, session_id_size, any_usable);
+    }
+
+    void OnExpirationChange(const char*, uint32_t, double) override {}
+    void OnSessionClosed(const char*, uint32_t) override {}
+    void SendPlatformChallenge(const char*, uint32_t, const char*, uint32_t) override {}
+    void EnableOutputProtection(uint32_t) override {}
+    void QueryOutputProtectionStatus() override {}
+    void OnDeferredInitializationDone(uint32_t, cdm::Status /*s*/) override {}
+    cdm::FileIO* CreateFileIO(cdm::FileIOClient*) override { return nullptr; }
+    void RequestStorageId(uint32_t) override {}
+
+ private:
+    CdmCallbacks* cbs_;
+};
+
+// ─── CDM state ───────────────────────────────────────────────────────────────
+
+struct CdmState {
+    void*                              lib_handle;
+    DeinitCdmFn                        deinit;
+    cdm::ContentDecryptionModule_10*   cdm;
+    CdmHostImpl*                       host;
+    CdmCallbacks                       callbacks; // owned copy
+};
+
+// ─── C API ───────────────────────────────────────────────────────────────────
+
+static cdm::Host_10* get_host_fn(int version, void* user_data) {
+    if (version == cdm::Host_10::kVersion)
+        return static_cast<CdmHostImpl*>(user_data);
+    return nullptr;
+}
+
+extern "C" {
+
+/// Load libwidevinecdm.so, initialise module, create CDM instance.
+/// Returns null on failure.
+CdmState* cdm_create(const char* lib_path, const CdmCallbacks* callbacks) {
+    void* handle = dlopen(lib_path, RTLD_LAZY | RTLD_LOCAL);
+    if (!handle) {
+        fprintf(stderr, "cdm_create: dlopen(%s): %s\n", lib_path, dlerror());
+        return nullptr;
+    }
+
+    auto init_fn   = reinterpret_cast<InitCdmFn>  (dlsym(handle, "InitializeCdmModule_4"));
+    auto deinit_fn = reinterpret_cast<DeinitCdmFn> (dlsym(handle, "DeinitializeCdmModule"));
+    auto create_fn = reinterpret_cast<CreateInstanceFn>(dlsym(handle, "CreateCdmInstance"));
+
+    if (!init_fn || !create_fn) {
+        fprintf(stderr, "cdm_create: missing CDM symbols\n");
+        dlclose(handle);
+        return nullptr;
+    }
+
+    init_fn();
+
+    auto* state = new CdmState{};
+    state->lib_handle = handle;
+    state->deinit     = deinit_fn;
+    state->callbacks  = *callbacks;
+    state->host       = new CdmHostImpl(&state->callbacks);
+
+    static const char key_system[] = "com.widevine.alpha";
+    state->cdm = create_fn(cdm::ContentDecryptionModule_10::kVersion,
+                            key_system,
+                            static_cast<uint32_t>(sizeof(key_system) - 1),
+                            get_host_fn,
+                            state->host);
+
+    if (!state->cdm) {
+        fprintf(stderr, "cdm_create: CreateCdmInstance(10,...) returned null\n");
+        delete state->host;
+        delete state;
+        if (deinit_fn) deinit_fn();
+        dlclose(handle);
+        return nullptr;
+    }
+
+    return state;
+}
+
+/// Call Initialize on the CDM instance.
+void cdm_initialize(CdmState* state) {
+    if (state && state->cdm)
+        state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
+                               /*allow_persistent_state=*/false,
+                               /*use_hw_secure_codecs=*/false);
+}
+
+/// Start a temporary session with the given PSSH data.
+/// Synchronously calls back on_license_request with the license challenge.
+void cdm_create_session(CdmState* state, uint32_t promise_id,
+                         const uint8_t* pssh, uint32_t pssh_len) {
+    if (state && state->cdm)
+        state->cdm->CreateSessionAndGenerateRequest(
+            promise_id,
+            cdm::SessionType::kTemporary,
+            cdm::InitDataType::kCenc,
+            pssh, pssh_len);
+}
+
+/// Feed the license server response into the CDM.
+/// On success calls back on_keys_change with has_usable_key=true.
+void cdm_update_session(CdmState* state, uint32_t promise_id,
+                         const char* session_id, uint32_t session_id_len,
+                         const uint8_t* response, uint32_t response_len) {
+    if (state && state->cdm)
+        state->cdm->UpdateSession(promise_id,
+                                   session_id, session_id_len,
+                                   response, response_len);
+}
+
+/// Decrypt one MP4 sample.
+CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
+    CdmDecryptOutput out{nullptr, 0, static_cast<int>(cdm::Status::kDecryptError)};
+    if (!state || !state->cdm || !inp) return out;
+
+    cdm::InputBuffer_2 buf{};
+    buf.data              = inp->data;
+    buf.data_size         = inp->data_size;
+    buf.encryption_scheme = static_cast<cdm::EncryptionScheme>(inp->encryption_scheme);
+    buf.key_id            = inp->key_id;
+    buf.key_id_size       = inp->key_id_size;
+    buf.iv                = inp->iv;
+    buf.iv_size           = inp->iv_size;
+    buf.subsamples        = inp->subsamples;
+    buf.num_subsamples    = inp->num_subsamples;
+    buf.timestamp         = inp->timestamp;
+
+    cdm::SimpleDecryptedBlock block;
+    cdm::Status status = state->cdm->Decrypt(buf, &block);
+
+    out.status = static_cast<int>(status);
+    if (status == cdm::Status::kSuccess && block.DecryptedBuffer()) {
+        cdm::Buffer* b = block.DecryptedBuffer();
+        out.data_size  = b->Size();
+        out.data       = static_cast<uint8_t*>(malloc(out.data_size));
+        if (out.data) memcpy(out.data, b->Data(), out.data_size);
+        else          out.status = static_cast<int>(cdm::Status::kDecryptError);
+    }
+    return out;
+}
+
+/// Free memory allocated by cdm_decrypt.
+void cdm_free_output(CdmDecryptOutput* out) {
+    if (out && out->data) { free(out->data); out->data = nullptr; out->data_size = 0; }
+}
+
+/// Close session and unload.
+void cdm_destroy(CdmState* state) {
+    if (!state) return;
+    if (state->cdm)        state->cdm->Destroy();
+    delete state->host;
+    if (state->deinit)     state->deinit();
+    if (state->lib_handle) dlclose(state->lib_handle);
+    delete state;
+}
+
+} // extern "C"

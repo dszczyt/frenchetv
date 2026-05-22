@@ -6,7 +6,7 @@ use crate::channel::{Channel, ChannelCategory, StreamTemplate};
 use crate::channel::m3u::parse_m3u;
 use crate::epg::EpgData;
 use crate::error::OperatorError;
-use crate::stream::StreamUrl;
+use crate::stream::{ProtectionData, StreamUrl};
 use super::traits::{AuthPhase, Operator, Result};
 
 /// Fallback M3U shipped with the binary.
@@ -804,10 +804,14 @@ impl Operator for OrangeOperator {
         })?;
 
         // Orange's CDN requires Origin/Referer on every segment request.
-        let stream = StreamUrl::direct(parsed)
+        let mut stream = StreamUrl::direct(parsed)
             .with_header("Origin",     "https://tv.orange.fr")
             .with_header("Referer",    "https://tv.orange.fr/")
             .with_header("User-Agent", "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36");
+
+        // Extract Widevine DRM parameters from protectionData array if present.
+        // Orange returns: [{"keySystem":"com.widevine.alpha","licenseServerURL":"...","initData":"base64..."}]
+        stream.protection = extract_widevine_protection(&json, &tv_token);
         Ok(stream)
     }
 
@@ -824,6 +828,46 @@ impl Operator for OrangeOperator {
         self.wassup = Some(token.to_string());
         self.ensure_tv_token().await
     }
+}
+
+/// Extract Widevine ProtectionData from the stream-resolution JSON response.
+/// Orange's API returns a `protectionData` array; each entry has a `keySystem`,
+/// `licenseServerURL`, and optionally `initData` (base64-encoded PSSH box).
+fn extract_widevine_protection(json: &serde_json::Value, tv_token: &str) -> Option<ProtectionData> {
+    use base64::engine::Engine as _;
+
+    let arr = json.get("protectionData")?.as_array()?;
+    for entry in arr {
+        let ks = entry.get("keySystem").and_then(|v| v.as_str()).unwrap_or("");
+        if ks != "com.widevine.alpha" {
+            continue;
+        }
+        let la_url = entry
+            .get("licenseServerURL")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.get("laUrl").and_then(|v| v.as_str()))
+            .map(str::to_string)?;
+
+        let pssh = entry
+            .get("initData")
+            .and_then(|v| v.as_str())
+            .and_then(|b64| {
+                base64::engine::general_purpose::STANDARD.decode(b64)
+                    .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64))
+                    .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64))
+                    .ok()
+            });
+
+        // Pass tv_token as a license request header so the license server
+        // can validate the subscriber's entitlement.
+        let mut license_headers = Vec::new();
+        if !tv_token.is_empty() {
+            license_headers.push(("tv_token".to_string(), format!("Bearer {}", tv_token)));
+        }
+
+        return Some(ProtectionData { la_url, pssh, license_headers });
+    }
+    None
 }
 
 #[cfg(test)]
