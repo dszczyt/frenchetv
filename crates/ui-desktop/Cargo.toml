@@ -17,6 +17,7 @@ zip = { version = "2", default-features = false, features = ["deflate"] }
 dirs = "5"
 sha1 = { version = "0.10", default-features = false }
 serde_json = "1"
+backhand = { version = "0.25", default-features = false, features = ["xz", "gzip", "zstd"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"

@@ -4,7 +4,7 @@
 ///   1. Copy `libwidevinecdm.so` from a locally-installed Chrome/Chromium.
 ///   2. Download via Google's Omaha update server (XML POST → ZIP extract).
 ///   3. Download a Chrome OS recovery image, parse its GPT, and extract the CDM
-///      from ROOT-A (partition 3, squashfs) using `unsquashfs`.
+///      from ROOT-A (partition 3, squashfs) using pure-Rust backhand.
 ///
 /// The CDM is stored at `~/.local/share/frenchetv/widevine/libwidevinecdm.so`.
 /// mpv picks it up via `--cdm-store=<dir>` when compiled with `--enable-cdm`.
@@ -30,14 +30,6 @@ const ARM_BOARDS: &[&str] = &[
 /// Board name substrings for small x86_64 boards (Haswell era).
 const X86_BOARDS: &[&str] = &[
     "link", "peppy", "falco", "wolf", "clapper", "squawks",
-];
-
-/// Known paths of `libwidevinecdm.so` inside the Chrome OS root filesystem.
-const CDM_PATHS_IN_IMAGE: &[&str] = &[
-    "opt/google/chrome/WidevineCdm/_platform_specific/linux_x64/libwidevinecdm.so",
-    "opt/google/chrome/WidevineCdm/_platform_specific/linux_arm64/libwidevinecdm.so",
-    "opt/google/chrome/WidevineCdm/_platform_specific/linux_arm/libwidevinecdm.so",
-    "opt/google/chrome/libwidevinecdm.so",
 ];
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -313,13 +305,20 @@ async fn try_stream_to_file(
 }
 
 /// Verify the SHA-1 of `path` against `expected_hex` (from the manifest).
+/// Streams the file in 64 KiB chunks — safe for multi-GB images.
 fn verify_sha1(path: &Path, expected_hex: &str) -> Result<()> {
     use sha1::{Digest, Sha1};
 
     tracing::info!("widevine: verifying SHA-1 of {} …", path.display());
-    let data = std::fs::read(path).context("read for SHA-1")?;
-    let hash   = Sha1::digest(&data);
-    let actual = format!("{:x}", hash);
+    let mut f = std::fs::File::open(path).context("open for SHA-1")?;
+    let mut hasher = Sha1::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut f, &mut buf).context("read for SHA-1")?;
+        if n == 0 { break; }
+        hasher.update(&buf[..n]);
+    }
+    let actual = format!("{:x}", hasher.finalize());
 
     if actual.eq_ignore_ascii_case(expected_hex) {
         tracing::info!("widevine: SHA-1 OK");
@@ -387,41 +386,36 @@ fn gpt_partition_range(bin_path: &Path, part_num: usize) -> Result<(u64, u64)> {
     Ok((offset, size))
 }
 
-/// Use `unsquashfs -offset OFFSET` to extract `libwidevinecdm.so` directly
-/// from a raw GPT disk image without extracting the full partition first.
-fn extract_cdm_with_unsquashfs(
-    bin_path:  &Path,
-    sq_offset: u64,
-    dest_dir:  &Path,
-) -> Result<PathBuf> {
-    std::fs::create_dir_all(dest_dir).context("create unsquashfs dest dir")?;
+/// Extract `libwidevinecdm.so` from a squashfs filesystem embedded at
+/// `sq_offset` bytes inside `bin_path` (a raw GPT disk image).
+///
+/// Uses the `backhand` crate — no external `unsquashfs` binary required.
+fn extract_cdm_from_squashfs(bin_path: &Path, sq_offset: u64) -> Result<Vec<u8>> {
+    use backhand::{FilesystemReader, InnerNode};
 
-    for candidate in CDM_PATHS_IN_IMAGE {
-        let status = std::process::Command::new("unsquashfs")
-            .args([
-                "-q",
-                "-no-progress",
-                "-offset", &sq_offset.to_string(),
-                "-f",
-                "-d", dest_dir.to_str().context("dest_dir not valid UTF-8")?,
-                bin_path.to_str().context("bin_path not valid UTF-8")?,
-                candidate,
-            ])
-            .status();
+    let file   = std::fs::File::open(bin_path).context("open .bin for squashfs")?;
+    let reader = std::io::BufReader::new(file);
 
-        match status {
-            Ok(s) if s.success() => {
-                let found = dest_dir.join(candidate);
-                if found.exists() {
-                    tracing::info!("widevine: found CDM at {} inside image", candidate);
-                    return Ok(found);
-                }
-            }
-            Ok(_) => {}  // unsquashfs exit non-zero: path not found, try next
-            Err(e) => bail!("unsquashfs not available ({}). Install squashfs-tools.", e),
+    let fs = FilesystemReader::from_reader_with_offset(reader, sq_offset)
+        .map_err(|e| anyhow::anyhow!("squashfs open failed: {e}"))?;
+
+    for node in fs.files() {
+        if !node.fullpath.to_string_lossy().ends_with("libwidevinecdm.so") {
+            continue;
+        }
+        if let InnerNode::File(file_reader) = &node.inner {
+            let mut reader = fs.file(file_reader).reader();
+            let mut buf = Vec::new();
+            std::io::Read::read_to_end(&mut reader, &mut buf)
+                .context("reading libwidevinecdm.so from squashfs")?;
+            tracing::info!(
+                "widevine: extracted {} ({} bytes) from squashfs",
+                node.fullpath.display(), buf.len(),
+            );
+            return Ok(buf);
         }
     }
-    bail!("libwidevinecdm.so not found in ROOT-A squashfs (tried all known paths)")
+    bail!("libwidevinecdm.so not found in ROOT-A squashfs")
 }
 
 /// Full Chrome OS recovery download + extraction flow.
@@ -484,18 +478,16 @@ async fn recovery_install_inner(
         move || gpt_partition_range(&bin_path, 3)
     }).await.context("spawn_blocking gpt")??;
 
-    // Step 5 — extract CDM via unsquashfs -offset
-    let extract_dir = tmp.join("squash_root");
-    let cdm_src = tokio::task::spawn_blocking({
-        let bin_path    = bin_path.clone();
-        let extract_dir = extract_dir.clone();
-        move || extract_cdm_with_unsquashfs(&bin_path, sq_offset, &extract_dir)
-    }).await.context("spawn_blocking unsquashfs")??;
+    // Step 5 — extract CDM from ROOT-A squashfs (pure Rust, no external tools)
+    let cdm_bytes = tokio::task::spawn_blocking({
+        let bin_path = bin_path.clone();
+        move || extract_cdm_from_squashfs(&bin_path, sq_offset)
+    }).await.context("spawn_blocking squashfs")??;
 
     // Step 6 — install CDM
     let dest_dir = dir();
     std::fs::create_dir_all(&dest_dir).context("create widevine dir")?;
-    std::fs::copy(&cdm_src, cdm_path()).context("copy CDM")?;
+    std::fs::write(cdm_path(), &cdm_bytes).context("write libwidevinecdm.so")?;
 
     #[cfg(unix)]
     {
