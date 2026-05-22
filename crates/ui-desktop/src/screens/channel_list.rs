@@ -22,7 +22,6 @@ pub enum ChannelListAction {
 
 impl ChannelListScreen {
     pub fn new(mut channels: Vec<Channel>) -> Self {
-        // Sort by channel number ascending; channels without a number go last.
         channels.sort_by_key(|c| c.number.unwrap_or(u32::MAX));
         Self {
             channels,
@@ -54,15 +53,21 @@ impl ChannelListScreen {
                                 .desired_width(200.0),
                         );
                         ui.add_space(12.0);
-                        // Show-locked toggle
-                        let lock_label = if self.show_locked { "🔒 Masquer verrouillés" } else { "🔒 Afficher verrouillés" };
-                        if ui.selectable_label(
-                            self.show_locked,
-                            RichText::new(lock_label)
-                                .font(FontId::proportional(13.0))
-                                .color(Color32::from_rgb(180, 180, 180)),
-                        ).clicked() {
-                            self.show_locked = !self.show_locked;
+                        let locked_count = self.channels.iter().filter(|c| c.locked).count();
+                        if locked_count > 0 {
+                            let lock_label = if self.show_locked {
+                                format!("🔒 Masquer ({} canal(s))", locked_count)
+                            } else {
+                                format!("🔒 Afficher ({} canal(s))", locked_count)
+                            };
+                            if ui.selectable_label(
+                                self.show_locked,
+                                RichText::new(lock_label)
+                                    .font(FontId::proportional(13.0))
+                                    .color(Color32::from_rgb(180, 180, 180)),
+                            ).clicked() {
+                                self.show_locked = !self.show_locked;
+                            }
                         }
                     });
                 });
@@ -115,39 +120,53 @@ impl ChannelListScreen {
                 // ── Grid ─────────────────────────────────────────────────────
                 ScrollArea::vertical().show(ui, |ui| {
                     let available_width = (ui.available_width() - 16.0).max(0.0);
-                    let cols = 4usize;
-                    let tile_width  = (available_width / cols as f32 - 12.0).max(160.0);
-                    let tile_height = 100.0;
-                    let logo_size   = Vec2::new(tile_width - 20.0, 52.0);
+                    const COLS: usize = 4;
+                    let tile_width  = (available_width / COLS as f32 - 12.0).max(160.0);
+                    let tile_height = 100.0f32;
+                    let logo_size   = Vec2::new(tile_width - 20.0, 50.0);
+                    let placeholder_color = Color32::from_rgb(40, 42, 50);
 
                     egui::Grid::new("channel_grid")
-                        .num_columns(cols)
+                        .num_columns(COLS)
                         .spacing([12.0, 12.0])
                         .show(ui, |ui| {
                             for (i, channel) in visible.iter().enumerate() {
-                                let resp = egui::Frame::none()
-                                    .fill(if channel.locked {
-                                        Color32::from_rgb(20, 20, 25)
-                                    } else {
-                                        Color32::from_rgb(25, 27, 34)
-                                    })
-                                    .stroke(egui::Stroke::new(1.0, Color32::from_rgb(50, 50, 60)))
-                                    .rounding(8.0)
-                                    .inner_margin(10.0)
-                                    .show(ui, |ui| {
-                                        ui.set_min_size(Vec2::new(tile_width, tile_height));
-                                        ui.vertical_centered(|ui| {
-                                            // Logo or placeholder
-                                            match &channel.logo_url {
-                                                Some(url) => {
+                                let is_locked = channel.locked;
+                                let bg_color = if is_locked {
+                                    Color32::from_rgb(20, 20, 25)
+                                } else {
+                                    Color32::from_rgb(25, 27, 34)
+                                };
+                                let text_color = if is_locked {
+                                    Color32::from_rgb(100, 100, 110)
+                                } else {
+                                    Color32::WHITE
+                                };
+
+                                // push_id ensures each tile gets a unique ID in egui's
+                                // interaction system — prevents Frame ID collisions.
+                                let tile_resp = ui.push_id(i, |ui| {
+                                    egui::Frame::none()
+                                        .fill(bg_color)
+                                        .stroke(egui::Stroke::new(
+                                            1.0,
+                                            Color32::from_rgb(50, 50, 60),
+                                        ))
+                                        .rounding(8.0)
+                                        .inner_margin(10.0)
+                                        .show(ui, |ui| {
+                                            ui.set_min_size(Vec2::new(tile_width, tile_height));
+                                            ui.vertical(|ui| {
+                                                // ── Logo ────────────────────
+                                                if let Some(url) = &channel.logo_url {
                                                     ui.add(
-                                                        egui::Image::new(url)
-                                                            .fit_to_exact_size(logo_size)
-                                                            .maintain_aspect_ratio(true),
+                                                        egui::Image::new(url.as_str())
+                                                            .max_size(logo_size)
+                                                            .maintain_aspect_ratio(true)
+                                                            // Don't let Image consume pointer events
+                                                            .sense(egui::Sense::hover()),
                                                     );
-                                                }
-                                                None => {
-                                                    // Gray placeholder box
+                                                } else {
                                                     let (rect, _) = ui.allocate_exact_size(
                                                         logo_size,
                                                         egui::Sense::hover(),
@@ -155,41 +174,47 @@ impl ChannelListScreen {
                                                     ui.painter().rect_filled(
                                                         rect,
                                                         4.0,
-                                                        Color32::from_rgb(40, 42, 50),
+                                                        placeholder_color,
                                                     );
                                                 }
-                                            }
 
-                                            ui.add_space(4.0);
+                                                ui.add_space(4.0);
 
-                                            // Channel number + name (+ lock icon if locked)
-                                            let num_str = channel.number
-                                                .map(|n| format!("{}  ", n))
-                                                .unwrap_or_default();
-                                            let lock_str = if channel.locked { " 🔒" } else { "" };
-                                            ui.label(
-                                                RichText::new(format!("{}{}{}", num_str, channel.name, lock_str))
-                                                    .font(FontId::proportional(13.0))
-                                                    .color(if channel.locked {
-                                                        Color32::from_rgb(120, 120, 130)
-                                                    } else {
-                                                        Color32::WHITE
-                                                    }),
-                                            );
-                                        });
-                                    });
+                                                // ── Name + number ────────────
+                                                let num_prefix = channel.number
+                                                    .map(|n| format!("{} · ", n))
+                                                    .unwrap_or_default();
+                                                let lock_suffix = if is_locked { " 🔒" } else { "" };
+                                                ui.label(
+                                                    RichText::new(format!(
+                                                        "{}{}{}",
+                                                        num_prefix, channel.name, lock_suffix
+                                                    ))
+                                                    .font(FontId::proportional(12.0))
+                                                    .color(text_color),
+                                                );
+                                            });
+                                        })
+                                });
 
-                                if !channel.locked {
-                                    if resp.response.interact(egui::Sense::click()).clicked() {
-                                        action = ChannelListAction::SelectChannel((*channel).clone());
-                                    }
+                                // Detect click on the frame via the response returned from push_id.
+                                // Calling .interact() on a Response registers a click zone without
+                                // adding a new Grid cell.
+                                let clicked = tile_resp
+                                    .inner
+                                    .response
+                                    .interact(egui::Sense::click())
+                                    .clicked();
+
+                                if !is_locked && clicked {
+                                    action = ChannelListAction::SelectChannel((*channel).clone());
                                 }
 
-                                if (i + 1) % cols == 0 {
+                                if (i + 1) % COLS == 0 {
                                     ui.end_row();
                                 }
                             }
-                            if !visible.is_empty() && visible.len() % cols != 0 {
+                            if !visible.is_empty() && visible.len() % COLS != 0 {
                                 ui.end_row();
                             }
                         });
