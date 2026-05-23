@@ -145,8 +145,13 @@ unsafe extern "C" fn cb_promise_err(
 ) {
     let state = &*(ctx as *const Mutex<CallbackState>);
     if let Ok(mut s) = state.lock() {
-        let msg_bytes = unsafe { std::slice::from_raw_parts(msg as *const u8, msg_len as usize) };
-        s.promise_err = String::from_utf8_lossy(msg_bytes).into_owned().into();
+        let msg_str = if !msg.is_null() && msg_len > 0 {
+            let msg_bytes = std::slice::from_raw_parts(msg as *const u8, msg_len as usize);
+            String::from_utf8_lossy(msg_bytes).into_owned()
+        } else {
+            String::from("(no message)")
+        };
+        s.promise_err = Some(msg_str);
     }
 }
 
