@@ -497,10 +497,19 @@ void cdm_create_session(CdmState* state, uint32_t promise_id,
 void cdm_update_session(CdmState* state, uint32_t promise_id,
                          const char* session_id, uint32_t session_id_len,
                          const uint8_t* response, uint32_t response_len) {
-    if (state && state->cdm)
-        state->cdm->UpdateSession(promise_id,
-                                   session_id, session_id_len,
-                                   response, response_len);
+    if (!state || !state->cdm) return;
+    state->cdm->UpdateSession(promise_id,
+                               session_id, session_id_len,
+                               response, response_len);
+    // CDM may call QueryOutputProtectionStatus() again after processing the license
+    // (to evaluate output protection levels required by the content policy).
+    // Respond *after* UpdateSession() returns to avoid re-entrancy.
+    fprintf(stderr, "[CDM] cdm_update_session: seeding OnQueryOutputProtectionStatus(link=1, protection=HDCP, ok)\n");
+    fflush(stderr);
+    state->cdm->OnQueryOutputProtectionStatus(
+        /*link_mask=*/1,
+        /*output_protection_mask=*/8,
+        /*result=*/0);
 }
 
 /// Decrypt one MP4 sample.
