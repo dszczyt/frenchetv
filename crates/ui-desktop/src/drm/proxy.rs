@@ -55,12 +55,17 @@ pub async fn start(
     let addr = listener.local_addr()?;
     let port = addr.port();
 
-    let rewritten_mpd = rewrite_mpd(&mpd_text, &mpd_base_url, port);
-    tracing::info!("DRM proxy rewritten MPD:\n{}", &rewritten_mpd[..rewritten_mpd.len().min(4000)]);
+    // Build initial MPD as a fallback (used if the first CDN refresh fails).
+    let mpd_fallback = rewrite_mpd(&mpd_text, &mpd_base_url, port);
+    tracing::info!("DRM proxy initial MPD:\n{}", &mpd_fallback[..mpd_fallback.len().min(4000)]);
 
     let state = Arc::new(ProxyState {
         cdm,
-        mpd: rewritten_mpd,
+        mpd_fallback,
+        // The CDN MPD URL is re-fetched on every manifest request so that
+        // the SegmentTimeline always points to live (non-expired) segments.
+        mpd_cdn_url: mpd_base_url.clone(),
+        proxy_port: port,
         cdn_headers,
         init_info: Mutex::new(None),
         client: cdn_client,
@@ -94,7 +99,11 @@ pub async fn start(
 
 struct ProxyState {
     cdm: Arc<Mutex<CdmHandle>>,
-    mpd: String,
+    /// Cached rewritten MPD from initial fetch — used as fallback if CDN refresh fails.
+    mpd_fallback: String,
+    /// CDN URL to re-fetch on every `/manifest.mpd` request (live stream needs fresh timeline).
+    mpd_cdn_url: String,
+    proxy_port: u16,
     cdn_headers: Vec<(String, String)>,
     init_info: Mutex<Option<InitInfo>>,
     client: reqwest::Client,
@@ -139,7 +148,11 @@ async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<
 
 async fn dispatch(path: &str, state: &Arc<ProxyState>) -> (&'static str, &'static str, Vec<u8>) {
     if path == "/manifest.mpd" || path.starts_with("/manifest.mpd?") {
-        return ("200 OK", "application/dash+xml", state.mpd.as_bytes().to_vec());
+        // Re-fetch from CDN every time so the SegmentTimeline stays current.
+        // A live DASH stream has minimumUpdatePeriod="PT2S" and timeShiftBufferDepth="PT30S";
+        // serving a stale MPD causes mpv to request already-expired segment timestamps → CDN 400.
+        let mpd = fetch_live_mpd(state).await;
+        return ("200 OK", "application/dash+xml", mpd.into_bytes());
     }
 
     if let Some(cdn_path) = path.strip_prefix("/cdn/") {
@@ -153,6 +166,37 @@ async fn dispatch(path: &str, state: &Arc<ProxyState>) -> (&'static str, &'stati
     }
 
     ("404 Not Found", "text/plain", b"not found".to_vec())
+}
+
+/// Fetch the live MPD from the CDN and rewrite it through the proxy.
+/// Falls back to the initial cached MPD if the CDN request fails.
+async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
+    let mut req = state.client.get(&state.mpd_cdn_url);
+    for (name, value) in &state.cdn_headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    match req.send().await {
+        Ok(resp) if resp.status().is_success() => {
+            match resp.text().await {
+                Ok(text) => {
+                    tracing::debug!("DRM proxy: refreshed live MPD ({} bytes)", text.len());
+                    rewrite_mpd(&text, &state.mpd_cdn_url, state.proxy_port)
+                }
+                Err(e) => {
+                    tracing::warn!("DRM proxy: MPD body read failed ({}), using fallback", e);
+                    state.mpd_fallback.clone()
+                }
+            }
+        }
+        Ok(resp) => {
+            tracing::warn!("DRM proxy: MPD refresh returned {} — using fallback", resp.status());
+            state.mpd_fallback.clone()
+        }
+        Err(e) => {
+            tracing::warn!("DRM proxy: MPD refresh failed ({}), using fallback", e);
+            state.mpd_fallback.clone()
+        }
+    }
 }
 
 async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Vec<u8>> {
