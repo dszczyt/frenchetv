@@ -399,8 +399,22 @@ impl App {
                 protection.pssh.as_ref().map(|p| format!("{} bytes", p.len())),
                 mpd_text.len()
             );
-            // Log the MPD at debug level so we can inspect its ContentProtection structure.
             tracing::debug!("widevine: MPD text =\n{}", &mpd_text[..mpd_text.len().min(4000)]);
+
+            // ── Diagnostic: probe init segment directly from app (same client/headers) ──
+            // This tells us whether CDN access to init segment is EVER possible from
+            // our code, before any proxy involvement.
+            if let Some(probe_url) = probe_init_segment_url(&mpd_text, &mpd_url) {
+                tracing::info!("DRM probe: testing init segment directly: {}", &probe_url[..probe_url.len().min(150)]);
+                let mut probe_req = cdn_client.get(&probe_url);
+                for (k, v) in &stream.headers {
+                    probe_req = probe_req.header(k.as_str(), v.as_str());
+                }
+                match probe_req.send().await {
+                    Ok(r) => tracing::info!("DRM probe: init segment → HTTP {}", r.status()),
+                    Err(e) => tracing::warn!("DRM probe: init segment → error: {}", e),
+                }
+            }
 
             let pssh = if let Some(p) = protection.pssh.as_ref() {
                 p.clone()
@@ -578,4 +592,46 @@ impl eframe::App for App {
             }
         }
     }
+}
+
+/// Extract the first init-segment URL from a raw DASH MPD.
+///
+/// Looks for `<BaseURL>` + first `initialization="…"` template, substitutes
+/// the first `<Representation id="…">` it finds, and resolves against
+/// `mpd_base_url`.  Returns `None` if parsing fails.
+fn probe_init_segment_url(mpd: &str, mpd_base_url: &str) -> Option<String> {
+    // Extract BaseURL value.
+    let base_url = if let Some(s) = mpd.find("<BaseURL>") {
+        let after = &mpd[s + "<BaseURL>".len()..];
+        let end = after.find("</BaseURL>")?;
+        after[..end].trim().to_string()
+    } else {
+        // No BaseURL — use the MPD directory.
+        let dir_end = mpd_base_url.rfind('/')?;
+        mpd_base_url[..dir_end + 1].to_string()
+    };
+
+    // Extract first initialization template attribute value.
+    let init_pos = mpd.find("initialization=\"")?;
+    let after_init = &mpd[init_pos + "initialization=\"".len()..];
+    let end_quote = after_init.find('"')?;
+    let init_template = after_init[..end_quote]
+        .replace("&amp;", "&");
+
+    // Extract first Representation id.
+    let rep_pos = mpd.find("<Representation id=\"")?;
+    let after_rep = &mpd[rep_pos + "<Representation id=\"".len()..];
+    let end_quote2 = after_rep.find('"')?;
+    let rep_id = &after_rep[..end_quote2];
+
+    let init_relative = init_template.replace("$RepresentationID$", rep_id);
+
+    // Resolve relative URL.
+    let full = if init_relative.starts_with("http://") || init_relative.starts_with("https://") {
+        init_relative
+    } else {
+        let base = if base_url.ends_with('/') { base_url } else { format!("{}/", base_url) };
+        format!("{}{}", base, init_relative)
+    };
+    Some(full)
 }
