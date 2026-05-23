@@ -160,26 +160,15 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     let real_url = cdn_path_to_url(cdn_path)?;
     tracing::debug!("DRM proxy → {}", real_url);
 
-    // Forward the same headers used to fetch the MPD — the Broadpeak signed-URL token
-    // embedded in the path was generated with these headers as binding parameters
-    // (Origin in particular).  We forward Origin, Referer, User-Agent, and Cookie
-    // but suppress any Orange-specific auth headers (tv_token, X-*) that are only
-    // for the mediation API, not the CDN.
-    const FORWARD: &[&str] = &["origin", "referer", "user-agent", "cookie"];
-    let mut req = state.client.get(&real_url);
-    for (k, v) in &state.cdn_headers {
-        if FORWARD.iter().any(|h| k.eq_ignore_ascii_case(h)) {
-            req = req.header(k.as_str(), v.as_str());
-        }
-    }
-    tracing::debug!(
-        "DRM proxy CDN request headers: {}",
-        state.cdn_headers.iter()
-            .filter(|(k, _)| FORWARD.iter().any(|h| k.eq_ignore_ascii_case(h)))
-            .map(|(k, v)| format!("{}: {}", k, if k.eq_ignore_ascii_case("cookie") { "[redacted]" } else { v }))
-            .collect::<Vec<_>>().join(", ")
-    );
-    let resp = req.send().await.context("CDN fetch")?;
+    // The Broadpeak signed-URL token embedded in the path is self-sufficient
+    // authentication; the Kodi reference plugin (plugin.video.orange.fr) sets no
+    // custom headers for CDN segment requests and uses inputstream.adaptive bare.
+    // Adding Origin/Referer/Cookie headers routes the request through a CORS
+    // validation path on the CDN that rejects us with 400.  Send NO custom headers;
+    // let reqwest supply only its defaults (User-Agent, Accept, Accept-Encoding).
+    // The shared client's cookie jar (populated during MPD fetch) still applies.
+    tracing::debug!("DRM proxy CDN request: bare (no custom headers)");
+    let resp = state.client.get(&real_url).send().await.context("CDN fetch")?;
     if !resp.status().is_success() {
         let status = resp.status();
         for (k, v) in resp.headers() {
