@@ -158,20 +158,25 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     let real_url = cdn_path_to_url(cdn_path)?;
     tracing::debug!("DRM proxy → {}", real_url);
 
-    // Orange's CDN uses Broadpeak signed URLs (token embedded in path).
-    // Sending Origin/Referer headers from the browser triggers CDN CORS validation
-    // against the signature and returns 400.  We send only User-Agent (for browser
-    // recognition) plus any session Cookie captured from the MPD response — Broadpeak
-    // may use cookies for session continuity in addition to the signed URL token.
-    let user_agent = state.cdn_headers.iter()
-        .find(|(k, _)| k.eq_ignore_ascii_case("user-agent"))
-        .map(|(_, v)| v.as_str())
-        .unwrap_or("Mozilla/5.0");
-    let mut req = state.client.get(&real_url).header("User-Agent", user_agent);
-    if let Some((_, cookie)) = state.cdn_headers.iter().find(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
-        tracing::debug!("DRM proxy CDN request: forwarding Cookie header");
-        req = req.header("Cookie", cookie.as_str());
+    // Forward the same headers used to fetch the MPD — the Broadpeak signed-URL token
+    // embedded in the path was generated with these headers as binding parameters
+    // (Origin in particular).  We forward Origin, Referer, User-Agent, and Cookie
+    // but suppress any Orange-specific auth headers (tv_token, X-*) that are only
+    // for the mediation API, not the CDN.
+    const FORWARD: &[&str] = &["origin", "referer", "user-agent", "cookie"];
+    let mut req = state.client.get(&real_url);
+    for (k, v) in &state.cdn_headers {
+        if FORWARD.iter().any(|h| k.eq_ignore_ascii_case(h)) {
+            req = req.header(k.as_str(), v.as_str());
+        }
     }
+    tracing::debug!(
+        "DRM proxy CDN request headers: {}",
+        state.cdn_headers.iter()
+            .filter(|(k, _)| FORWARD.iter().any(|h| k.eq_ignore_ascii_case(h)))
+            .map(|(k, v)| format!("{}: {}", k, if k.eq_ignore_ascii_case("cookie") { "[redacted]" } else { v }))
+            .collect::<Vec<_>>().join(", ")
+    );
     let resp = req.send().await.context("CDN fetch")?;
     if !resp.status().is_success() {
         let status = resp.status();
