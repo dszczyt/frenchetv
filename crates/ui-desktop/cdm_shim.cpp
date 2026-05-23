@@ -350,7 +350,10 @@ class CdmHostImpl : public cdm::Host_10 {
     void OnSessionClosed(const char*, uint32_t) override {}
     void SendPlatformChallenge(const char*, uint32_t, const char*, uint32_t) override {}
     void EnableOutputProtection(uint32_t) override {}
-    void QueryOutputProtectionStatus() override;  // defined after CdmState
+    void QueryOutputProtectionStatus() override {
+        fprintf(stderr, "[CDM] QueryOutputProtectionStatus called (no-op)\n");
+        fflush(stderr);
+    }
     void OnDeferredInitializationDone(uint32_t, cdm::Status /*s*/) override {}
     cdm::FileIO* CreateFileIO(cdm::FileIOClient*) override { return nullptr; }
     void RequestStorageId(uint32_t) override {}
@@ -372,21 +375,6 @@ struct CdmState {
     std::vector<std::vector<uint8_t>>  loaded_key_ids;
     std::vector<uint32_t>              loaded_key_statuses; // parallel to loaded_key_ids
 };
-
-// Out-of-line definition of QueryOutputProtectionStatus (needs complete CdmState type).
-// Responds immediately with "no external outputs, query succeeded" so the CDM does not
-// block decryption waiting for a platform challenge response.
-void CdmHostImpl::QueryOutputProtectionStatus() {
-    fprintf(stderr, "[CDM] QueryOutputProtectionStatus — replying kQuerySucceeded link=1 protection=0\n");
-    fflush(stderr);
-    if (state_ && state_->cdm)
-        // link_mask=1 (kLinkTypeInternal), output_protection_mask=0 (no HDCP required on internal display),
-        // result=0 (kQuerySucceeded).
-        state_->cdm->OnQueryOutputProtectionStatus(
-            /*link_mask=*/1,
-            /*output_protection_mask=*/0,
-            /*result=*/0);
-}
 
 // Out-of-line definition of OnSessionKeysChange (needs complete CdmState type).
 void CdmHostImpl::OnSessionKeysChange(const char* session_id, uint32_t session_id_size,
@@ -476,7 +464,7 @@ CdmState* cdm_create(const char* lib_path, const CdmCallbacks* callbacks) {
 void cdm_initialize(CdmState* state) {
     if (state && state->cdm)
         state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
-                               /*allow_persistent_state=*/true,
+                               /*allow_persistent_state=*/false,
                                /*use_hw_secure_codecs=*/false);
 }
 
