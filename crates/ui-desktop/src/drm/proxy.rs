@@ -166,20 +166,17 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
         }
     }
 
-    // Send Origin + Referer so Broadpeak CORS / session validation passes.
-    // The shared client's cookie jar (populated during MPD manifest fetch) is also
-    // applied automatically by reqwest — this provides any bpk-session cookie the
-    // CDN set in response to the manifest request.
-    // NOTE: do NOT forward the wassup cookie manually here; that is an Orange API
-    // credential and would conflict with the CDN session cookie in the jar.
+    // Forward the same headers used for the manifest fetch so Orange's CDN layer
+    // (cdnfr.orange.fr) can validate the request before routing to Broadpeak.
+    // The CDN validates Origin/Referer for CORS, User-Agent for client detection,
+    // and the wassup session cookie for authentication — all are required.
+    // The shared cookie jar (populated during MPD fetch) also applies automatically.
     tracing::info!("DRM proxy → CDN: {}", &real_url[..real_url.len().min(120)]);
-    let resp = state.client
-        .get(&real_url)
-        .header("Origin",  "https://tv.orange.fr")
-        .header("Referer", "https://tv.orange.fr/")
-        .send()
-        .await
-        .context("CDN fetch")?;
+    let mut req = state.client.get(&real_url);
+    for (name, value) in &state.cdn_headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    let resp = req.send().await.context("CDN fetch")?;
     if !resp.status().is_success() {
         let status = resp.status();
         for (k, v) in resp.headers() {
