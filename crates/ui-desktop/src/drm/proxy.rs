@@ -159,6 +159,12 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     // cdn_path is "https/HOST/PATH?QUERY" or "http/HOST/PATH?QUERY"
     let real_url = cdn_path_to_url(cdn_path)?;
     tracing::debug!("DRM proxy → {}", real_url);
+    // Log URL after url-crate normalization so we can detect encoding changes.
+    if let Ok(parsed) = url::Url::parse(&real_url) {
+        if parsed.as_str() != real_url {
+            tracing::warn!("DRM proxy URL normalised: {} → {}", real_url, parsed.as_str());
+        }
+    }
 
     // The Broadpeak signed-URL token embedded in the path is self-sufficient
     // authentication; the Kodi reference plugin (plugin.video.orange.fr) sets no

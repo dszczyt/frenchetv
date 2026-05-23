@@ -350,7 +350,7 @@ impl App {
             // by the CDN during the manifest fetch are automatically included in the
             // proxy's subsequent segment requests (same client instance).
             let mpd_url = stream.url.to_string();
-            tracing::debug!("DRM: fetching MPD from {}", mpd_url);
+            tracing::info!("DRM: stream URL = {}", mpd_url);
             let cdn_client = match reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(30))
                 .cookie_store(true)
