@@ -177,10 +177,12 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
     }
     match req.send().await {
         Ok(resp) if resp.status().is_success() => {
+            // Use the final URL after redirects (CDN may 307 to a different token/path).
+            let final_url = resp.url().to_string();
             match resp.text().await {
                 Ok(text) => {
-                    tracing::debug!("DRM proxy: refreshed live MPD ({} bytes)", text.len());
-                    rewrite_mpd(&text, &state.mpd_cdn_url, state.proxy_port)
+                    tracing::debug!("DRM proxy: refreshed live MPD ({} bytes, url={})", text.len(), &final_url[..final_url.len().min(120)]);
+                    rewrite_mpd(&text, &final_url, state.proxy_port)
                 }
                 Err(e) => {
                     tracing::warn!("DRM proxy: MPD body read failed ({}), using fallback", e);

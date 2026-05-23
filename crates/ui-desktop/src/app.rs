@@ -384,6 +384,15 @@ impl App {
                 }
             }
 
+            // Capture the final URL *before* consuming the response body — reqwest
+            // follows 307 redirects automatically, so the CDN may have redirected
+            // e.g. from `.../1-64/...` to `.../CDN_1/3/...`.  Segment URLs in the
+            // MPD are relative to the final URL, not the original request URL.
+            let final_mpd_url = mpd_resp.url().to_string();
+            if final_mpd_url != mpd_url {
+                tracing::info!("DRM: MPD redirected: {} → {}", mpd_url, final_mpd_url);
+            }
+
             let mpd_text = match mpd_resp.text().await {
                 Ok(t) => t,
                 Err(e) => {
@@ -404,7 +413,7 @@ impl App {
             // ── Diagnostic: probe init segment directly from app (same client/headers) ──
             // This tells us whether CDN access to init segment is EVER possible from
             // our code, before any proxy involvement.
-            if let Some(probe_url) = probe_init_segment_url(&mpd_text, &mpd_url) {
+            if let Some(probe_url) = probe_init_segment_url(&mpd_text, &final_mpd_url) {
                 tracing::info!("DRM probe: testing init segment directly: {}", &probe_url[..probe_url.len().min(150)]);
                 let mut probe_req = cdn_client.get(&probe_url);
                 for (k, v) in &stream.headers {
@@ -438,7 +447,7 @@ impl App {
 
             // --- 4. Start proxy (pass the same cdn_client so its cookie jar is reused) ---
             let cdn_headers = stream.headers.clone();
-            let drm_proxy = match proxy::start(cdm, mpd_text, mpd_url, cdn_headers, cdn_client).await {
+            let drm_proxy = match proxy::start(cdm, mpd_text, final_mpd_url, cdn_headers, cdn_client).await {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(AsyncMsg::DrmProxyErr(format!("Proxy start failed: {}", e)));
