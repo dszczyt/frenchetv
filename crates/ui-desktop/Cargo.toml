@@ -12,7 +12,7 @@ egui_extras = { version = "0.30", features = ["image"] }
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "webp", "gif"] }
 # libmpv2 = "3"  # requires libmpv system library; re-enable when libmpv-dev is installed
 tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json", "cookies"] }
 zip = { version = "2", default-features = false, features = ["deflate"] }
 dirs = "5"
 sha1 = { version = "0.10", default-features = false }

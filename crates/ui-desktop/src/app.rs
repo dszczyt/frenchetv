@@ -346,13 +346,25 @@ impl App {
             let cdm = std::sync::Arc::new(std::sync::Mutex::new(cdm_handle));
 
             // --- 2. Fetch MPD and extract PSSH ---
+            // Use a cookie-store-enabled client so any Broadpeak session cookies set
+            // by the CDN during the manifest fetch are automatically included in the
+            // proxy's subsequent segment requests (same client instance).
             let mpd_url = stream.url.to_string();
-            let client = reqwest::Client::builder()
-                .timeout(std::time::Duration::from_secs(15))
+            tracing::debug!("DRM: fetching MPD from {}", mpd_url);
+            let cdn_client = match reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .cookie_store(true)
                 .build()
-                .unwrap_or_default();
+            {
+                Ok(c) => c,
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!("CDN client build failed: {}", e)));
+                    ctx.request_repaint();
+                    return;
+                }
+            };
 
-            let mut req = client.get(&mpd_url);
+            let mut req = cdn_client.get(&mpd_url);
             for (k, v) in &stream.headers {
                 req = req.header(k.as_str(), v.as_str());
             }
@@ -364,18 +376,11 @@ impl App {
                     return;
                 }
             };
-
-            // Capture Set-Cookie headers from the MPD response — Broadpeak CDN may set a
-            // session cookie during the MPD fetch that must accompany segment requests.
-            let mut cdn_cookies: Vec<String> = Vec::new();
+            // Log any session cookies the CDN set (they are now in cdn_client's jar).
             for value in mpd_resp.headers().get_all(reqwest::header::SET_COOKIE) {
-                if let Ok(cookie_str) = value.to_str() {
-                    // Parse "name=value; Path=/; ..." → take only "name=value"
-                    let pair = cookie_str.split(';').next().unwrap_or("").trim();
-                    if !pair.is_empty() {
-                        tracing::debug!("DRM: captured Set-Cookie from MPD response: {}", pair);
-                        cdn_cookies.push(pair.to_string());
-                    }
+                if let Ok(s) = value.to_str() {
+                    let pair = s.split(';').next().unwrap_or("").trim();
+                    tracing::debug!("DRM: CDN Set-Cookie during MPD fetch: {}", pair);
                 }
             }
 
@@ -417,20 +422,9 @@ impl App {
                 return;
             }
 
-            // --- 4. Start proxy ---
-            // Merge stream headers with any session cookies captured from the MPD response.
-            let mut cdn_headers = stream.headers.clone();
-            if !cdn_cookies.is_empty() {
-                // Append captured cookies to any existing Cookie header (or add a new one).
-                let new_cookies = cdn_cookies.join("; ");
-                if let Some(pos) = cdn_headers.iter().position(|(k, _)| k.eq_ignore_ascii_case("cookie")) {
-                    cdn_headers[pos].1 = format!("{}; {}", cdn_headers[pos].1, new_cookies);
-                } else {
-                    cdn_headers.push(("Cookie".to_string(), new_cookies));
-                }
-                tracing::debug!("DRM: forwarding {} cookie(s) to proxy CDN requests", cdn_cookies.len());
-            }
-            let drm_proxy = match proxy::start(cdm, mpd_text, mpd_url, cdn_headers).await {
+            // --- 4. Start proxy (pass the same cdn_client so its cookie jar is reused) ---
+            let cdn_headers = stream.headers.clone();
+            let drm_proxy = match proxy::start(cdm, mpd_text, mpd_url, cdn_headers, cdn_client).await {
                 Ok(p) => p,
                 Err(e) => {
                     let _ = tx.send(AsyncMsg::DrmProxyErr(format!("Proxy start failed: {}", e)));

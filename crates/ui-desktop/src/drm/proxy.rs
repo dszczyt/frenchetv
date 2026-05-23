@@ -43,6 +43,11 @@ pub async fn start(
     mpd_text: String,
     mpd_base_url: String,
     cdn_headers: Vec<(String, String)>,
+    // The reqwest client that was used to fetch the MPD.  Must be the *same*
+    // instance so that any Broadpeak session cookies set by the CDN during the
+    // manifest request are present in its cookie jar and automatically included
+    // in subsequent segment requests.
+    cdn_client: reqwest::Client,
 ) -> Result<DrmProxy> {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -58,10 +63,7 @@ pub async fn start(
         mpd: rewritten_mpd,
         cdn_headers,
         init_info: Mutex::new(None),
-        client: reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .unwrap_or_default(),
+        client: cdn_client,
     });
 
     let task = tokio::spawn(async move {
