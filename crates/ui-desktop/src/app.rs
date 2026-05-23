@@ -594,29 +594,42 @@ impl eframe::App for App {
     }
 }
 
-/// Extract the first init-segment URL from a raw DASH MPD.
-///
-/// Looks for `<BaseURL>` + first `initialization="…"` template, substitutes
-/// the first `<Representation id="…">` it finds, and resolves against
-/// `mpd_base_url`.  Returns `None` if parsing fails.
+/// Extract the first init-segment URL from a raw DASH MPD and resolve it
+/// against the MPD's own URL so the result is always absolute.
 fn probe_init_segment_url(mpd: &str, mpd_base_url: &str) -> Option<String> {
-    // Extract BaseURL value.
-    let base_url = if let Some(s) = mpd.find("<BaseURL>") {
+    // Directory of the MPD URL (everything up to and including the last '/').
+    // Strip query string first.
+    let mpd_path = mpd_base_url.split('?').next().unwrap_or(mpd_base_url);
+    let mpd_dir = if let Some(pos) = mpd_path.rfind('/') {
+        &mpd_base_url[..pos + 1]   // keep the trailing slash; excludes query
+    } else {
+        mpd_base_url
+    };
+
+    // Extract <BaseURL> value (may be relative like "dash/").
+    let raw_base = if let Some(s) = mpd.find("<BaseURL>") {
         let after = &mpd[s + "<BaseURL>".len()..];
         let end = after.find("</BaseURL>")?;
         after[..end].trim().to_string()
     } else {
-        // No BaseURL — use the MPD directory.
-        let dir_end = mpd_base_url.rfind('/')?;
-        mpd_base_url[..dir_end + 1].to_string()
+        String::new()
     };
+
+    // Resolve base to absolute.
+    let base_url = if raw_base.starts_with("http://") || raw_base.starts_with("https://") {
+        raw_base
+    } else if raw_base.is_empty() {
+        mpd_dir.to_string()
+    } else {
+        format!("{}{}", mpd_dir, raw_base)
+    };
+    let base_url = if base_url.ends_with('/') { base_url } else { format!("{}/", base_url) };
 
     // Extract first initialization template attribute value.
     let init_pos = mpd.find("initialization=\"")?;
     let after_init = &mpd[init_pos + "initialization=\"".len()..];
     let end_quote = after_init.find('"')?;
-    let init_template = after_init[..end_quote]
-        .replace("&amp;", "&");
+    let init_template = after_init[..end_quote].replace("&amp;", "&");
 
     // Extract first Representation id.
     let rep_pos = mpd.find("<Representation id=\"")?;
@@ -626,12 +639,10 @@ fn probe_init_segment_url(mpd: &str, mpd_base_url: &str) -> Option<String> {
 
     let init_relative = init_template.replace("$RepresentationID$", rep_id);
 
-    // Resolve relative URL.
     let full = if init_relative.starts_with("http://") || init_relative.starts_with("https://") {
         init_relative
     } else {
-        let base = if base_url.ends_with('/') { base_url } else { format!("{}/", base_url) };
-        format!("{}{}", base, init_relative)
+        format!("{}{}", base_url, init_relative)
     };
     Some(full)
 }
