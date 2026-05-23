@@ -462,10 +462,22 @@ CdmState* cdm_create(const char* lib_path, const CdmCallbacks* callbacks) {
 
 /// Call Initialize on the CDM instance.
 void cdm_initialize(CdmState* state) {
-    if (state && state->cdm)
-        state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
-                               /*allow_persistent_state=*/false,
-                               /*use_hw_secure_codecs=*/false);
+    if (!state || !state->cdm) return;
+    state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
+                           /*allow_persistent_state=*/false,
+                           /*use_hw_secure_codecs=*/false);
+    // CDM calls QueryOutputProtectionStatus() during Initialize() and waits for a reply.
+    // Respond *after* Initialize() returns so we are not re-entrant.
+    // Report: internal display present (link_mask=1 = kLinkTypeInternal),
+    //         HDCP active (output_protection_mask=8 = kProtectionHDCP),
+    //         result=0 (kQuerySucceeded).
+    // Without this reply, Decrypt() returns kNeedMoreData on every call.
+    fprintf(stderr, "[CDM] cdm_initialize: seeding OnQueryOutputProtectionStatus(link=1, protection=HDCP, ok)\n");
+    fflush(stderr);
+    state->cdm->OnQueryOutputProtectionStatus(
+        /*link_mask=*/1,
+        /*output_protection_mask=*/8,
+        /*result=*/0);
 }
 
 /// Start a temporary session with the given PSSH data.
