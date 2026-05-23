@@ -380,7 +380,7 @@ impl App {
             for value in mpd_resp.headers().get_all(reqwest::header::SET_COOKIE) {
                 if let Ok(s) = value.to_str() {
                     let pair = s.split(';').next().unwrap_or("").trim();
-                    tracing::debug!("DRM: CDN Set-Cookie during MPD fetch: {}", pair);
+                    tracing::info!("DRM: CDN Set-Cookie during MPD fetch: {}", pair);
                 }
             }
 

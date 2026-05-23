@@ -56,7 +56,7 @@ pub async fn start(
     let port = addr.port();
 
     let rewritten_mpd = rewrite_mpd(&mpd_text, &mpd_base_url, port);
-    tracing::debug!("DRM proxy rewritten MPD (first 2000 chars):\n{}", &rewritten_mpd[..rewritten_mpd.len().min(2000)]);
+    tracing::info!("DRM proxy rewritten MPD:\n{}", &rewritten_mpd[..rewritten_mpd.len().min(4000)]);
 
     let state = Arc::new(ProxyState {
         cdm,
@@ -166,22 +166,27 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
         }
     }
 
-    // The Broadpeak signed-URL token embedded in the path is self-sufficient
-    // authentication; the Kodi reference plugin (plugin.video.orange.fr) sets no
-    // custom headers for CDN segment requests and uses inputstream.adaptive bare.
-    // Adding Origin/Referer/Cookie headers routes the request through a CORS
-    // validation path on the CDN that rejects us with 400.  Send NO custom headers;
-    // let reqwest supply only its defaults (User-Agent, Accept, Accept-Encoding).
-    // The shared client's cookie jar (populated during MPD fetch) still applies.
-    tracing::debug!("DRM proxy CDN request: bare (no custom headers)");
-    let resp = state.client.get(&real_url).send().await.context("CDN fetch")?;
+    // Send Origin + Referer so Broadpeak CORS / session validation passes.
+    // The shared client's cookie jar (populated during MPD manifest fetch) is also
+    // applied automatically by reqwest — this provides any bpk-session cookie the
+    // CDN set in response to the manifest request.
+    // NOTE: do NOT forward the wassup cookie manually here; that is an Orange API
+    // credential and would conflict with the CDN session cookie in the jar.
+    tracing::info!("DRM proxy → CDN: {}", &real_url[..real_url.len().min(120)]);
+    let resp = state.client
+        .get(&real_url)
+        .header("Origin",  "https://tv.orange.fr")
+        .header("Referer", "https://tv.orange.fr/")
+        .send()
+        .await
+        .context("CDN fetch")?;
     if !resp.status().is_success() {
         let status = resp.status();
         for (k, v) in resp.headers() {
-            tracing::debug!("DRM proxy CDN error header: {}: {}", k, v.to_str().unwrap_or("?"));
+            tracing::info!("DRM proxy CDN error header: {}: {}", k, v.to_str().unwrap_or("?"));
         }
         let body = resp.text().await.unwrap_or_default();
-        tracing::debug!("DRM proxy CDN error body: {}", &body[..body.len().min(500)]);
+        tracing::info!("DRM proxy CDN error body: {}", &body[..body.len().min(500)]);
         bail!("CDN returned {}", status);
     }
     let data = resp.bytes().await.context("CDN body")?;
