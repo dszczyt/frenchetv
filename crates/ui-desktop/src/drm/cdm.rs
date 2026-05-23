@@ -282,14 +282,24 @@ impl CdmHandle {
             .map(|&(c, e)| SubsampleEntry { clear_bytes: c, cipher_bytes: e })
             .collect();
 
+        // Widevine CDM 10 expects a 16-byte AES-CTR counter block.
+        // CENC spec §9.4: 8-byte IVs occupy the upper 8 bytes; lower 8 bytes are zero.
+        let iv_padded: Vec<u8> = if iv.len() == 8 {
+            let mut p = vec![0u8; 16];
+            p[..8].copy_from_slice(iv);
+            p
+        } else {
+            iv.to_vec()
+        };
+
         let inp = RawDecryptInput {
             data: data.as_ptr(),
             data_size: data.len() as u32,
             encryption_scheme: 1, // CENC = AES-128-CTR
             key_id: key_id.as_ptr(),
             key_id_size: key_id.len() as u32,
-            iv: iv.as_ptr(),
-            iv_size: iv.len() as u32,
+            iv: iv_padded.as_ptr(),
+            iv_size: iv_padded.len() as u32,
             subsamples: if raw_subsamples.is_empty() { std::ptr::null() } else { raw_subsamples.as_ptr() },
             num_subsamples: raw_subsamples.len() as u32,
             timestamp,

@@ -13,6 +13,7 @@
 #include <time.h>
 #include <dlfcn.h>
 #include <stdio.h>
+#include <vector>
 
 // ─── CDM types (matching chromium CDM interface 10 ABI) ───────────────────────
 
@@ -283,9 +284,12 @@ struct CdmDecryptOutput {
 
 // ─── Host implementation ─────────────────────────────────────────────────────
 
+// Forward declaration so CdmHostImpl can store loaded key IDs in CdmState.
+struct CdmState;
+
 class CdmHostImpl : public cdm::Host_10 {
  public:
-    explicit CdmHostImpl(CdmCallbacks* cbs) : cbs_(cbs) {}
+    explicit CdmHostImpl(CdmCallbacks* cbs, CdmState* state) : cbs_(cbs), state_(state) {}
     ~CdmHostImpl() override {}
 
     cdm::Buffer* Allocate(uint32_t capacity) override {
@@ -340,25 +344,20 @@ class CdmHostImpl : public cdm::Host_10 {
     void OnSessionKeysChange(const char* session_id, uint32_t session_id_size,
                              bool has_additional_usable_key,
                              const cdm::KeyInformation* keys_info,
-                             uint32_t keys_info_count) override {
-        bool any_usable = has_additional_usable_key;
-        for (uint32_t i = 0; i < keys_info_count && !any_usable; ++i)
-            if (keys_info[i].status == cdm::KeyStatus::kUsable) any_usable = true;
-        if (cbs_->on_keys_change)
-            cbs_->on_keys_change(cbs_->ctx, session_id, session_id_size, any_usable);
-    }
+                             uint32_t keys_info_count) override;  // defined after CdmState
 
     void OnExpirationChange(const char*, uint32_t, double) override {}
     void OnSessionClosed(const char*, uint32_t) override {}
     void SendPlatformChallenge(const char*, uint32_t, const char*, uint32_t) override {}
     void EnableOutputProtection(uint32_t) override {}
-    void QueryOutputProtectionStatus() override {}
+    void QueryOutputProtectionStatus() override;  // defined after CdmState
     void OnDeferredInitializationDone(uint32_t, cdm::Status /*s*/) override {}
     cdm::FileIO* CreateFileIO(cdm::FileIOClient*) override { return nullptr; }
     void RequestStorageId(uint32_t) override {}
 
  private:
     CdmCallbacks* cbs_;
+    CdmState*     state_;
 };
 
 // ─── CDM state ───────────────────────────────────────────────────────────────
@@ -369,7 +368,53 @@ struct CdmState {
     cdm::ContentDecryptionModule_10*   cdm;
     CdmHostImpl*                       host;
     CdmCallbacks                       callbacks; // owned copy
+    // Loaded key IDs + statuses (populated in OnSessionKeysChange).
+    std::vector<std::vector<uint8_t>>  loaded_key_ids;
+    std::vector<uint32_t>              loaded_key_statuses; // parallel to loaded_key_ids
 };
+
+// Out-of-line definition of QueryOutputProtectionStatus (needs complete CdmState type).
+// Responds immediately with "no external outputs, query succeeded" so the CDM does not
+// block decryption waiting for a platform challenge response.
+void CdmHostImpl::QueryOutputProtectionStatus() {
+    fprintf(stderr, "[CDM] QueryOutputProtectionStatus — replying kQuerySucceeded link=1 protection=0\n");
+    fflush(stderr);
+    if (state_ && state_->cdm)
+        // link_mask=1 (kLinkTypeInternal), output_protection_mask=0 (no HDCP required on internal display),
+        // result=0 (kQuerySucceeded).
+        state_->cdm->OnQueryOutputProtectionStatus(
+            /*link_mask=*/1,
+            /*output_protection_mask=*/0,
+            /*result=*/0);
+}
+
+// Out-of-line definition of OnSessionKeysChange (needs complete CdmState type).
+void CdmHostImpl::OnSessionKeysChange(const char* session_id, uint32_t session_id_size,
+                                       bool has_additional_usable_key,
+                                       const cdm::KeyInformation* keys_info,
+                                       uint32_t keys_info_count) {
+    bool any_usable = has_additional_usable_key;
+    // Store all key IDs + statuses so cdm_decrypt can log them on failure.
+    if (state_) { state_->loaded_key_ids.clear(); state_->loaded_key_statuses.clear(); }
+    for (uint32_t i = 0; i < keys_info_count; ++i) {
+        if (keys_info[i].status == cdm::KeyStatus::kUsable) any_usable = true;
+        if (state_) {
+            state_->loaded_key_ids.push_back(std::vector<uint8_t>(
+                keys_info[i].key_id,
+                keys_info[i].key_id + keys_info[i].key_id_size));
+            state_->loaded_key_statuses.push_back(
+                static_cast<uint32_t>(keys_info[i].status));
+        }
+        fprintf(stderr, "[CDM] OnSessionKeysChange key[%u] status=%u id=", i,
+                static_cast<unsigned>(keys_info[i].status));
+        for (uint32_t j = 0; j < keys_info[i].key_id_size; ++j)
+            fprintf(stderr, "%02x", keys_info[i].key_id[j]);
+        fprintf(stderr, "\n");
+    }
+    fflush(stderr);
+    if (cbs_->on_keys_change)
+        cbs_->on_keys_change(cbs_->ctx, session_id, session_id_size, any_usable);
+}
 
 // ─── C API ───────────────────────────────────────────────────────────────────
 
@@ -406,7 +451,7 @@ CdmState* cdm_create(const char* lib_path, const CdmCallbacks* callbacks) {
     state->lib_handle = handle;
     state->deinit     = deinit_fn;
     state->callbacks  = *callbacks;
-    state->host       = new CdmHostImpl(&state->callbacks);
+    state->host       = new CdmHostImpl(&state->callbacks, state);
 
     static const char key_system[] = "com.widevine.alpha";
     state->cdm = create_fn(cdm::ContentDecryptionModule_10::kVersion,
@@ -431,7 +476,7 @@ CdmState* cdm_create(const char* lib_path, const CdmCallbacks* callbacks) {
 void cdm_initialize(CdmState* state) {
     if (state && state->cdm)
         state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
-                               /*allow_persistent_state=*/false,
+                               /*allow_persistent_state=*/true,
                                /*use_hw_secure_codecs=*/false);
 }
 
@@ -479,6 +524,43 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
     cdm::Status status = state->cdm->Decrypt(buf, &block);
 
     out.status = static_cast<int>(status);
+    if (status != cdm::Status::kSuccess) {
+        // Log everything needed to diagnose why decrypt failed.
+        fprintf(stderr, "[CDM] Decrypt FAILED status=%u scheme=%u data_size=%u\n",
+                static_cast<unsigned>(status),
+                static_cast<unsigned>(inp->encryption_scheme),
+                inp->data_size);
+        fprintf(stderr, "[CDM]   requested_kid=");
+        for (uint32_t i = 0; i < inp->key_id_size; ++i)
+            fprintf(stderr, "%02x", inp->key_id[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[CDM]   iv(%u)=", inp->iv_size);
+        for (uint32_t i = 0; i < inp->iv_size; ++i)
+            fprintf(stderr, "%02x", inp->iv[i]);
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[CDM]   subsamples(%u):", inp->num_subsamples);
+        uint64_t total_sub = 0;
+        for (uint32_t i = 0; i < inp->num_subsamples && i < 8; ++i) {
+            fprintf(stderr, " [clr=%u enc=%u]",
+                    inp->subsamples[i].clear_bytes,
+                    inp->subsamples[i].cipher_bytes);
+            total_sub += inp->subsamples[i].clear_bytes + inp->subsamples[i].cipher_bytes;
+        }
+        if (inp->num_subsamples > 0)
+            fprintf(stderr, " total_sub=%llu data=%u %s",
+                    (unsigned long long)total_sub, inp->data_size,
+                    (total_sub == inp->data_size) ? "MATCH" : "MISMATCH");
+        fprintf(stderr, "\n");
+        fprintf(stderr, "[CDM]   loaded_keys(%zu):", state->loaded_key_ids.size());
+        for (size_t i = 0; i < state->loaded_key_ids.size(); ++i) {
+            fprintf(stderr, " [status=%u id=", (i < state->loaded_key_statuses.size())
+                    ? state->loaded_key_statuses[i] : 99u);
+            for (uint8_t b : state->loaded_key_ids[i]) fprintf(stderr, "%02x", b);
+            fprintf(stderr, "]");
+        }
+        fprintf(stderr, "\n");
+        fflush(stderr);
+    }
     if (status == cdm::Status::kSuccess && block.DecryptedBuffer()) {
         cdm::Buffer* b = block.DecryptedBuffer();
         out.data_size  = b->Size();
