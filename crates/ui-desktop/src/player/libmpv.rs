@@ -676,6 +676,8 @@ pub struct LibMpvPlayer {
     renderer: ActiveRenderer,       // MUST be declared before mpv (drop order)
     mpv: libmpv2::Mpv,
     has_cdm_support: bool,
+    /// Last observed time-pos, used to detect backward jumps in the audio stream.
+    last_time_pos: f64,
 }
 
 impl LibMpvPlayer {
@@ -707,7 +709,7 @@ impl LibMpvPlayer {
 
         let renderer = ActiveRenderer::probe(&mpv, egui_ctx, force_software);
 
-        Self { renderer, mpv, has_cdm_support }
+        Self { renderer, mpv, has_cdm_support, last_time_pos: f64::NAN }
     }
 
     /// Start playing a stream URL.
@@ -832,6 +834,18 @@ impl LibMpvPlayer {
                 None | Some(Ok(libmpv2::events::Event::QueueOverflow)) => break,
                 Some(_) => {}
             }
+        }
+        // Detect backward jumps in the DASH presentation timeline.
+        // These are NOT reported as mpv Seek events — they come from the demuxer
+        // receiving a segment whose PTS is earlier than the previous segment's end.
+        if let Ok(pos) = self.mpv.get_property::<f64>("time-pos") {
+            if self.last_time_pos.is_finite() && pos < self.last_time_pos - 0.5 {
+                tracing::warn!(
+                    "mpv: time-pos jumped backward {:.3} → {:.3} (Δ={:.3} s)",
+                    self.last_time_pos, pos, pos - self.last_time_pos
+                );
+            }
+            self.last_time_pos = pos;
         }
         self.renderer.poll_frame(ctx, width, height)
     }
