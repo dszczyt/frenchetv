@@ -451,6 +451,16 @@ impl GlRenderer {
             return None;
         }
 
+        // Cap render resolution to avoid glReadPixels stalling at screen size.
+        // IPTV streams are ≤1080p; rendering at 4K/HiDPI fullscreen size wastes
+        // bandwidth (glReadPixels at 3840×2160 = 33 MB/frame).
+        // The returned SizedTexture carries the *display* size so egui scales
+        // the smaller texture up on the GPU — zero quality loss for IPTV content.
+        const MAX_W: u32 = 1920;
+        const MAX_H: u32 = 1080;
+        let rw = width.min(MAX_W);
+        let rh = height.min(MAX_H);
+
         if !self.needs_update.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return self.texture.as_ref().map(|t| {
                 egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
@@ -472,25 +482,25 @@ impl GlRenderer {
         }
 
         // Resize the renderbuffer when dimensions change.
-        if self.rbo_size != (width, height) {
+        if self.rbo_size != (rw, rh) {
             unsafe {
                 gl::BindRenderbuffer(gl::RENDERBUFFER, self.rbo);
                 gl::RenderbufferStorage(
                     gl::RENDERBUFFER,
                     gl::RGBA8,
-                    width as gl::types::GLsizei,
-                    height as gl::types::GLsizei,
+                    rw as gl::types::GLsizei,
+                    rh as gl::types::GLsizei,
                 );
                 gl::BindRenderbuffer(gl::RENDERBUFFER, 0);
             }
-            self.rbo_size = (width, height);
+            self.rbo_size = (rw, rh);
         }
 
         // Ask mpv to render into the FBO.
         let mut fbo_params = libmpv2_sys::mpv_opengl_fbo {
             fbo: self.fbo as std::os::raw::c_int,
-            w:   width  as std::os::raw::c_int,
-            h:   height as std::os::raw::c_int,
+            w:   rw as std::os::raw::c_int,
+            h:   rh as std::os::raw::c_int,
             internal_format: 0, // 0 means use default (GL_RGBA)
         };
         // flip_y=0: mpv renders with video row 0 at the top of the FBO (OpenGL y=h).
@@ -522,18 +532,16 @@ impl GlRenderer {
             return None;
         }
 
-        // Read back the pixels from the FBO.
-        // flip_y=0 means mpv places video row 0 at FBO y=0 (OpenGL bottom),
-        // so glReadPixels (which reads from y=0 upward) gives correct top-down
-        // order directly — no row swap needed.
-        let pixel_count = (width * height * 4) as usize;
+        // Read back the pixels from the capped-resolution FBO.
+        // flip_y=0: glReadPixels from y=0 upward gives correct top-down order.
+        let pixel_count = (rw * rh * 4) as usize;
         let mut pixels = vec![0u8; pixel_count];
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.fbo);
             gl::ReadPixels(
                 0, 0,
-                width  as gl::types::GLsizei,
-                height as gl::types::GLsizei,
+                rw as gl::types::GLsizei,
+                rh as gl::types::GLsizei,
                 gl::RGBA,
                 gl::UNSIGNED_BYTE,
                 pixels.as_mut_ptr() as *mut std::ffi::c_void,
@@ -542,7 +550,7 @@ impl GlRenderer {
         }
 
         let image = egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
+            [rw as usize, rh as usize],
             &pixels,
         );
 
@@ -553,6 +561,7 @@ impl GlRenderer {
                 Some(ctx.load_texture("mpv_frame_gl", image, egui::TextureOptions::LINEAR));
         }
 
+        // Return display size so egui GPU-scales the texture to fill the panel.
         self.texture.as_ref().map(|t| {
             egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
         })
