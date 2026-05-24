@@ -747,6 +747,7 @@ impl LibMpvPlayer {
     }
 
     /// Returns true if mpv is playing (not idle/stopped).
+    #[allow(dead_code)]
     pub fn is_playing(&self) -> bool {
         self.mpv.get_property::<bool>("core-idle")
             .map(|idle| !idle)
