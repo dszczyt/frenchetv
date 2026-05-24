@@ -350,10 +350,7 @@ class CdmHostImpl : public cdm::Host_10 {
     void OnSessionClosed(const char*, uint32_t) override {}
     void SendPlatformChallenge(const char*, uint32_t, const char*, uint32_t) override {}
     void EnableOutputProtection(uint32_t) override {}
-    void QueryOutputProtectionStatus() override {
-        fprintf(stderr, "[CDM] QueryOutputProtectionStatus called (no-op)\n");
-        fflush(stderr);
-    }
+    void QueryOutputProtectionStatus() override;  // defined after CdmState (needs complete type)
     void OnDeferredInitializationDone(uint32_t, cdm::Status /*s*/) override {}
     cdm::FileIO* CreateFileIO(cdm::FileIOClient*) override { return nullptr; }
     void RequestStorageId(uint32_t) override {}
@@ -374,7 +371,32 @@ struct CdmState {
     // Loaded key IDs + statuses (populated in OnSessionKeysChange).
     std::vector<std::vector<uint8_t>>  loaded_key_ids;
     std::vector<uint32_t>              loaded_key_statuses; // parallel to loaded_key_ids
+    // Set by QueryOutputProtectionStatus() host callback; cleared by answer_ops_query().
+    bool                               output_protection_query_pending = false;
 };
+
+// Respond to a pending QueryOutputProtectionStatus request.
+// MUST be called from outside any CDM call stack to avoid re-entrancy.
+// Reports: internal display present, HDCP active, query succeeded.
+static void answer_ops_query(CdmState* state) {
+    if (!state || !state->output_protection_query_pending || !state->cdm) return;
+    state->output_protection_query_pending = false;
+    fprintf(stderr, "[CDM] answer_ops_query: OnQueryOutputProtectionStatus(link=1, HDCP, ok)\n");
+    fflush(stderr);
+    state->cdm->OnQueryOutputProtectionStatus(
+        /*link_mask=*/1,
+        /*output_protection_mask=*/8,   // kProtectionHDCP
+        /*result=*/0);                  // kQuerySucceeded
+}
+
+// Out-of-line definition of QueryOutputProtectionStatus (needs complete CdmState type).
+void CdmHostImpl::QueryOutputProtectionStatus() {
+    // Mark the query as pending; answer_ops_query() will respond after the
+    // current CDM call returns (avoiding re-entrancy).
+    if (state_) state_->output_protection_query_pending = true;
+    fprintf(stderr, "[CDM] QueryOutputProtectionStatus — pending flag set\n");
+    fflush(stderr);
+}
 
 // Out-of-line definition of OnSessionKeysChange (needs complete CdmState type).
 void CdmHostImpl::OnSessionKeysChange(const char* session_id, uint32_t session_id_size,
@@ -466,18 +488,8 @@ void cdm_initialize(CdmState* state) {
     state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
                            /*allow_persistent_state=*/false,
                            /*use_hw_secure_codecs=*/false);
-    // CDM calls QueryOutputProtectionStatus() during Initialize() and waits for a reply.
-    // Respond *after* Initialize() returns so we are not re-entrant.
-    // Report: internal display present (link_mask=1 = kLinkTypeInternal),
-    //         HDCP active (output_protection_mask=8 = kProtectionHDCP),
-    //         result=0 (kQuerySucceeded).
-    // Without this reply, Decrypt() returns kNeedMoreData on every call.
-    fprintf(stderr, "[CDM] cdm_initialize: seeding OnQueryOutputProtectionStatus(link=1, protection=HDCP, ok)\n");
-    fflush(stderr);
-    state->cdm->OnQueryOutputProtectionStatus(
-        /*link_mask=*/1,
-        /*output_protection_mask=*/8,
-        /*result=*/0);
+    // Answer any QueryOutputProtectionStatus() call the CDM made during Initialize().
+    answer_ops_query(state);
 }
 
 /// Start a temporary session with the given PSSH data.
@@ -501,18 +513,16 @@ void cdm_update_session(CdmState* state, uint32_t promise_id,
     state->cdm->UpdateSession(promise_id,
                                session_id, session_id_len,
                                response, response_len);
-    // CDM may call QueryOutputProtectionStatus() again after processing the license
-    // (to evaluate output protection levels required by the content policy).
-    // Respond *after* UpdateSession() returns to avoid re-entrancy.
-    fprintf(stderr, "[CDM] cdm_update_session: seeding OnQueryOutputProtectionStatus(link=1, protection=HDCP, ok)\n");
-    fflush(stderr);
-    state->cdm->OnQueryOutputProtectionStatus(
-        /*link_mask=*/1,
-        /*output_protection_mask=*/8,
-        /*result=*/0);
+    // Answer any QueryOutputProtectionStatus() call made during UpdateSession().
+    answer_ops_query(state);
 }
 
 /// Decrypt one MP4 sample.
+///
+/// Handles periodic CDM QueryOutputProtectionStatus() re-queries:
+/// - Answer any pending OPS query before each attempt (flag set from host callback).
+/// - If Decrypt returns kNeedMoreData, the CDM queried OPS *during* the call;
+///   answer the new pending query (safely, after Decrypt returned) and retry once.
 CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
     CdmDecryptOutput out{nullptr, 0, static_cast<int>(cdm::Status::kDecryptError)};
     if (!state || !state->cdm || !inp) return out;
@@ -529,54 +539,73 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
     buf.num_subsamples    = inp->num_subsamples;
     buf.timestamp         = inp->timestamp;
 
-    cdm::SimpleDecryptedBlock block;
-    cdm::Status status = state->cdm->Decrypt(buf, &block);
+    cdm::Status status = cdm::Status::kDecryptError;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        // Answer any pending OPS query before calling Decrypt.
+        answer_ops_query(state);
 
-    out.status = static_cast<int>(status);
-    if (status != cdm::Status::kSuccess) {
-        // Log everything needed to diagnose why decrypt failed.
-        fprintf(stderr, "[CDM] Decrypt FAILED status=%u scheme=%u data_size=%u\n",
-                static_cast<unsigned>(status),
-                static_cast<unsigned>(inp->encryption_scheme),
-                inp->data_size);
-        fprintf(stderr, "[CDM]   requested_kid=");
-        for (uint32_t i = 0; i < inp->key_id_size; ++i)
-            fprintf(stderr, "%02x", inp->key_id[i]);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "[CDM]   iv(%u)=", inp->iv_size);
-        for (uint32_t i = 0; i < inp->iv_size; ++i)
-            fprintf(stderr, "%02x", inp->iv[i]);
-        fprintf(stderr, "\n");
-        fprintf(stderr, "[CDM]   subsamples(%u):", inp->num_subsamples);
-        uint64_t total_sub = 0;
-        for (uint32_t i = 0; i < inp->num_subsamples && i < 8; ++i) {
-            fprintf(stderr, " [clr=%u enc=%u]",
-                    inp->subsamples[i].clear_bytes,
-                    inp->subsamples[i].cipher_bytes);
-            total_sub += inp->subsamples[i].clear_bytes + inp->subsamples[i].cipher_bytes;
+        cdm::SimpleDecryptedBlock block;
+        status = state->cdm->Decrypt(buf, &block);
+
+        if (status == cdm::Status::kSuccess && block.DecryptedBuffer()) {
+            cdm::Buffer* b = block.DecryptedBuffer();
+            out.data_size  = b->Size();
+            out.data       = static_cast<uint8_t*>(malloc(out.data_size));
+            if (out.data) {
+                memcpy(out.data, b->Data(), out.data_size);
+                out.status = 0;
+            } else {
+                out.status = static_cast<int>(cdm::Status::kDecryptError);
+            }
+            return out;
         }
-        if (inp->num_subsamples > 0)
-            fprintf(stderr, " total_sub=%llu data=%u %s",
-                    (unsigned long long)total_sub, inp->data_size,
-                    (total_sub == inp->data_size) ? "MATCH" : "MISMATCH");
-        fprintf(stderr, "\n");
-        fprintf(stderr, "[CDM]   loaded_keys(%zu):", state->loaded_key_ids.size());
-        for (size_t i = 0; i < state->loaded_key_ids.size(); ++i) {
-            fprintf(stderr, " [status=%u id=", (i < state->loaded_key_statuses.size())
-                    ? state->loaded_key_statuses[i] : 99u);
-            for (uint8_t b : state->loaded_key_ids[i]) fprintf(stderr, "%02x", b);
-            fprintf(stderr, "]");
-        }
-        fprintf(stderr, "\n");
+
+        if (status != cdm::Status::kNeedMoreData) break; // fatal error, no retry
+
+        // kNeedMoreData: CDM may have issued a new QueryOutputProtectionStatus
+        // call during Decrypt(). answer_ops_query() at the top of the next
+        // iteration will respond (safely, outside the CDM call stack).
+        fprintf(stderr, "[CDM] Decrypt kNeedMoreData (attempt %d, OPS pending=%s)\n",
+                attempt + 1, state->output_protection_query_pending ? "yes" : "no");
         fflush(stderr);
     }
-    if (status == cdm::Status::kSuccess && block.DecryptedBuffer()) {
-        cdm::Buffer* b = block.DecryptedBuffer();
-        out.data_size  = b->Size();
-        out.data       = static_cast<uint8_t*>(malloc(out.data_size));
-        if (out.data) memcpy(out.data, b->Data(), out.data_size);
-        else          out.status = static_cast<int>(cdm::Status::kDecryptError);
+
+    // Both attempts failed — log diagnostics.
+    out.status = static_cast<int>(status);
+    fprintf(stderr, "[CDM] Decrypt FAILED status=%u scheme=%u data_size=%u\n",
+            static_cast<unsigned>(status),
+            static_cast<unsigned>(inp->encryption_scheme),
+            inp->data_size);
+    fprintf(stderr, "[CDM]   requested_kid=");
+    for (uint32_t i = 0; i < inp->key_id_size; ++i)
+        fprintf(stderr, "%02x", inp->key_id[i]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "[CDM]   iv(%u)=", inp->iv_size);
+    for (uint32_t i = 0; i < inp->iv_size; ++i)
+        fprintf(stderr, "%02x", inp->iv[i]);
+    fprintf(stderr, "\n");
+    fprintf(stderr, "[CDM]   subsamples(%u):", inp->num_subsamples);
+    uint64_t total_sub = 0;
+    for (uint32_t i = 0; i < inp->num_subsamples && i < 8; ++i) {
+        fprintf(stderr, " [clr=%u enc=%u]",
+                inp->subsamples[i].clear_bytes,
+                inp->subsamples[i].cipher_bytes);
+        total_sub += inp->subsamples[i].clear_bytes + inp->subsamples[i].cipher_bytes;
     }
+    if (inp->num_subsamples > 0)
+        fprintf(stderr, " total_sub=%llu data=%u %s",
+                (unsigned long long)total_sub, inp->data_size,
+                (total_sub == inp->data_size) ? "MATCH" : "MISMATCH");
+    fprintf(stderr, "\n");
+    fprintf(stderr, "[CDM]   loaded_keys(%zu):", state->loaded_key_ids.size());
+    for (size_t i = 0; i < state->loaded_key_ids.size(); ++i) {
+        fprintf(stderr, " [status=%u id=", (i < state->loaded_key_statuses.size())
+                ? state->loaded_key_statuses[i] : 99u);
+        for (uint8_t b : state->loaded_key_ids[i]) fprintf(stderr, "%02x", b);
+        fprintf(stderr, "]");
+    }
+    fprintf(stderr, "\n");
+    fflush(stderr);
     return out;
 }
 
