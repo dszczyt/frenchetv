@@ -295,7 +295,7 @@ class CdmHostImpl : public cdm::Host_10 {
     cdm::Buffer* Allocate(uint32_t capacity) override {
         return new cdm::SimpleBuffer(capacity);
     }
-    void SetTimer(int64_t, void*) override {}
+    void SetTimer(int64_t delay_ms, void* context) override;  // defined after CdmState
 
     double GetCurrentWallTime() override {
         struct timespec ts;
@@ -373,6 +373,8 @@ struct CdmState {
     std::vector<uint32_t>              loaded_key_statuses; // parallel to loaded_key_ids
     // Set by QueryOutputProtectionStatus() host callback; cleared by answer_ops_query().
     bool                               output_protection_query_pending = false;
+    // Contexts registered via SetTimer(); fired by fire_pending_timers() outside CDM call stack.
+    std::vector<void*>                 pending_timer_contexts;
 };
 
 // Respond to a pending QueryOutputProtectionStatus request.
@@ -387,6 +389,30 @@ static void answer_ops_query(CdmState* state) {
         /*link_mask=*/1,
         /*output_protection_mask=*/8,   // kProtectionHDCP
         /*result=*/0);                  // kQuerySucceeded
+}
+
+// Fire all pending SetTimer() callbacks (safely, outside any CDM call stack),
+// then answer any OPS query that the timers may have triggered.
+// The CDM uses SetTimer to schedule deferred policy re-checks; if we never fire
+// them it can return kNeedMoreData from Decrypt.
+static void fire_pending_timers(CdmState* state) {
+    if (!state || !state->cdm || state->pending_timer_contexts.empty()) return;
+    std::vector<void*> contexts;
+    std::swap(contexts, state->pending_timer_contexts); // consume to avoid infinite loop
+    fprintf(stderr, "[CDM] fire_pending_timers: %zu timer(s)\n", contexts.size());
+    fflush(stderr);
+    for (void* ctx : contexts) {
+        state->cdm->TimerExpired(ctx);
+    }
+    // Timers may have triggered an OPS query — answer it now (outside CDM call stack).
+    answer_ops_query(state);
+}
+
+// Out-of-line definition of SetTimer (needs complete CdmState type).
+void CdmHostImpl::SetTimer(int64_t delay_ms, void* context) {
+    fprintf(stderr, "[CDM] SetTimer(delay=%lld ms, ctx=%p)\n", (long long)delay_ms, context);
+    fflush(stderr);
+    if (state_ && context) state_->pending_timer_contexts.push_back(context);
 }
 
 // Out-of-line definition of QueryOutputProtectionStatus (needs complete CdmState type).
@@ -488,7 +514,8 @@ void cdm_initialize(CdmState* state) {
     state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
                            /*allow_persistent_state=*/false,
                            /*use_hw_secure_codecs=*/false);
-    // Answer any QueryOutputProtectionStatus() call the CDM made during Initialize().
+    // Fire any timers and answer OPS queries deferred during Initialize().
+    fire_pending_timers(state);
     answer_ops_query(state);
 }
 
@@ -513,7 +540,8 @@ void cdm_update_session(CdmState* state, uint32_t promise_id,
     state->cdm->UpdateSession(promise_id,
                                session_id, session_id_len,
                                response, response_len);
-    // Answer any QueryOutputProtectionStatus() call made during UpdateSession().
+    // Fire any timers and answer OPS queries deferred during UpdateSession().
+    fire_pending_timers(state);
     answer_ops_query(state);
 }
 
@@ -541,7 +569,8 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
 
     cdm::Status status = cdm::Status::kDecryptError;
     for (int attempt = 0; attempt < 2; ++attempt) {
-        // Answer any pending OPS query before calling Decrypt.
+        // Fire any deferred timers and answer pending OPS queries before calling Decrypt.
+        fire_pending_timers(state);
         answer_ops_query(state);
 
         cdm::SimpleDecryptedBlock block;
