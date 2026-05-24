@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Base theme: Leanback (Android TV) -->
+    <style name="Theme.FrenchTV" parent="@style/Theme.Leanback">
+        <item name="android:windowBackground">@android:color/black</item>
+    </style>
+
+    <!-- Full-screen: no status bar, no nav bar -->
+    <style name="Theme.FrenchTV.Fullscreen" parent="Theme.FrenchTV">
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+    </style>
+</resources>

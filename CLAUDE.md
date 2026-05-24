@@ -4,10 +4,11 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
  
 ## Project
  
-FrenchTV — lightweight IPTV client for French operators (Orange, Bouygues, SFR, Free), targeting Linux/Windows/macOS desktop and Android TV / FireTV. Rust workspace, no Electron, no JVM (except Android).
+**frenchetv** — lightweight open-source IPTV client for French operators (Orange, Bouygues, SFR, Free), targeting Linux/Windows/macOS desktop and Android TV / FireTV. Rust workspace, no Electron, no JVM (except Android).
  
-**MSRV: 1.75** — do not use language or standard library features introduced after Rust 1.75.
- 
+- GitHub: https://github.com/dszczyt/frenchetv (public from day one)
+- License: MIT
+- **MSRV: 1.75** — do not use language or standard library features introduced after Rust 1.75.
 ---
  
 ## Build Commands
@@ -83,7 +84,7 @@ pub trait Operator: Send + Sync {
 }
 ```
  
-`OperatorKind` enum + `OperatorRegistry::all()` in `crates/core/src/operator/mod.rs` register all implementations. To add an operator: implement trait in `operator/<name>.rs`, add variant to enum, register in `all()`.
+`OperatorKind` enum + `OperatorRegistry::all()` in `crates/core/src/operator/mod.rs` register all implementations. To add an operator: implement trait in `operator/<name>.rs`, add variant to enum, register in `all()`. See `CONTRIBUTING.md` for the full checklist.
  
 ### Screen flow
  
@@ -101,7 +102,7 @@ Screen structs live in `crates/ui-desktop/src/screens/` (and mirrored in `crates
 - **Android**: `crates/ui-android/src/player/exoplayer.rs` — JNI call into `PlayerActivity.kt`, which hosts ExoPlayer with auth header injected via `DefaultHttpDataSource.Factory`. Hardware decoder handles 4K HDR.
 ### Config & credentials
  
-Config: `~/.config/frenchetv/config.toml` (Linux), `%APPDATA%\frenchetv\config.toml` (Windows), app internal storage (Android).  
+Config: `~/.config/frenchetv/config.toml` (Linux), `%APPDATA%\frenchetv\config.toml` (Windows), app internal storage (Android).
 Credentials: OS keyring via `keyring` crate on desktop (`keyring::Entry::new("frenchetv", username)`), Android Keystore on Android. **Passwords must never be written to `config.toml`.**
  
 ---
@@ -131,3 +132,13 @@ Credentials: OS keyring via `keyring` crate on desktop (`keyring::Entry::new("fr
 - Fixture M3U files live in `tests/fixtures/`.
 - Integration tests (real network/VPN) are `#[ignore]`-gated; run with `-- --ignored`.
 - CI matrix: ubuntu-latest, windows-latest, macos-latest for desktop; build-only check for Android via `cargo ndk`.
+---
+ 
+## Contributing
+ 
+This is an open-source project. Before opening a PR:
+ 
+- Run `cargo fmt --all` and `cargo clippy --workspace -- -D warnings` — CI will reject anything that doesn't pass.
+- Operator API changes (broken endpoints, new auth flow) are the most frequent contribution — document them in `docs/operators.md` alongside the code change.
+- Do not commit real credentials or personal tokens anywhere, including test fixtures.
+- See `CONTRIBUTING.md` for the full operator integration checklist and PR template.

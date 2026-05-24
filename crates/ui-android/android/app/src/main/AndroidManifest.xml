@@ -1,0 +1,62 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+
+    <!-- Android TV declaration -->
+    <uses-feature
+        android:name="android.software.leanback"
+        android:required="true" />
+    <!-- TV remotes have no touchscreen -->
+    <uses-feature
+        android:name="android.hardware.touchscreen"
+        android:required="false" />
+
+    <application
+        android:allowBackup="false"
+        android:banner="@drawable/banner"
+        android:icon="@drawable/banner"
+        android:label="@string/app_name"
+        android:theme="@style/Theme.FrenchTV"
+        android:hardwareAccelerated="true">
+
+        <!-- ── Main egui/wgpu activity (GameActivity) ──────────────────────── -->
+        <activity
+            android:name=".MainActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden|keyboard|navigation"
+            android:exported="true"
+            android:label="@string/app_name"
+            android:launchMode="singleTask"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.FrenchTV.Fullscreen">
+
+            <!-- Android TV leanback launcher -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LEANBACK_LAUNCHER" />
+            </intent-filter>
+
+            <!-- Amazon FireTV launcher (also picks up LEANBACK_LAUNCHER above) -->
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="amazon.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!-- Points to our Rust .so -->
+            <meta-data
+                android:name="android.app.lib_name"
+                android:value="ui_android" />
+        </activity>
+
+        <!-- ── ExoPlayer full-screen playback activity ─────────────────────── -->
+        <activity
+            android:name=".PlayerActivity"
+            android:configChanges="orientation|screenSize|keyboardHidden"
+            android:exported="false"
+            android:launchMode="singleTop"
+            android:screenOrientation="landscape"
+            android:theme="@style/Theme.FrenchTV.Fullscreen" />
+
+    </application>
+</manifest>
