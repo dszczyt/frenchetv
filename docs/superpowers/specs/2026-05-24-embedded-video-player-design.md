@@ -114,4 +114,4 @@ CDM support detection: probe `mpv --list-options | grep cdm-store` at startup, s
 
 - Unit: `LibMpvPlayer::new()` constructs without panic (requires `libmpv-dev` installed).
 - Manual: Play France 2 via Orange DRM proxy — video appears in egui window, info overlay works, channel switch (←→) works, back (Esc) works.
-- Fallback: Force GL renderer to fail by temporarily passing invalid GL params in `GlRenderer::try_new()` during a dev build — software renderer activates, video still plays.
+- Fallback: `LibMpvPlayer` accepts a `force_software: bool` flag (set via `--force-software-renderer` CLI arg). When true, skips `GlRenderer::try_new()` entirely. Verify software renderer activates and video still plays.
