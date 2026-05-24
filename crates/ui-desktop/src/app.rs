@@ -48,6 +48,7 @@ enum Screen {
 }
 
 pub struct App {
+    force_software_renderer: bool,
     screen: Screen,
     channels: Vec<Channel>,
     current_operator: Option<SharedOperator>,
@@ -70,6 +71,10 @@ impl App {
         let logos: LogoCache = Arc::new(Mutex::new(HashMap::new()));
         let config = Config::load().unwrap_or_default();
 
+        let force_software_renderer = std::env::args().any(|a| a == "--force-software-renderer");
+        if force_software_renderer {
+            tracing::info!("renderer: forced software mode via --force-software-renderer");
+        }
         let app = Self {
             screen: Screen::Setup(SetupScreen::new()),
             channels: Vec::new(),
@@ -80,6 +85,7 @@ impl App {
             rx,
             rt,
             egui_ctx: cc.egui_ctx.clone(),
+            force_software_renderer,
             _drm_proxy: None,
         };
 
@@ -594,7 +600,11 @@ impl eframe::App for App {
             Screen::ChannelList(list) => {
                 if let ChannelListAction::SelectChannel(channel) = list.show(ctx) {
                     self.start_resolve_stream(channel.clone());
-                    self.screen = Screen::Player(PlayerScreen::new(channel));
+                    self.screen = Screen::Player(PlayerScreen::new(
+                        channel,
+                        self.egui_ctx.clone(),
+                        self.force_software_renderer,
+                    ));
                 }
             }
             Screen::Player(player) => {
