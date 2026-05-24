@@ -617,6 +617,75 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
     buf.num_subsamples    = inp->num_subsamples;
     buf.timestamp         = inp->timestamp;
 
+    // ── Fast path: CDM rejects num_subsamples > 0 with kNeedMoreData ────────────
+    // Strategy: extract cipher portions only → decrypt → reconstruct clear+decrypted.
+    if (inp->num_subsamples > 0) {
+        uint32_t total_cipher = 0;
+        for (uint32_t i = 0; i < inp->num_subsamples; ++i)
+            total_cipher += inp->subsamples[i].cipher_bytes;
+
+        std::vector<uint8_t> cipher_only;
+        cipher_only.reserve(total_cipher);
+        const uint8_t* p = inp->data;
+        for (uint32_t i = 0; i < inp->num_subsamples; ++i) {
+            p += inp->subsamples[i].clear_bytes;
+            cipher_only.insert(cipher_only.end(), p, p + inp->subsamples[i].cipher_bytes);
+            p += inp->subsamples[i].cipher_bytes;
+        }
+
+        answer_storage_id(state);
+        fire_pending_timers(state);
+        answer_ops_query(state);
+
+        cdm::InputBuffer_2 buf_c = buf;
+        buf_c.data           = cipher_only.data();
+        buf_c.data_size      = static_cast<uint32_t>(cipher_only.size());
+        buf_c.subsamples     = nullptr;
+        buf_c.num_subsamples = 0;
+
+        fprintf(stderr, "[CDM] Decrypt cipher-only (%u of %u bytes, %u subsamples)\n",
+                total_cipher, inp->data_size, inp->num_subsamples);
+        fflush(stderr);
+
+        cdm::SimpleDecryptedBlock block;
+        cdm::Status s = state->cdm->Decrypt(buf_c, &block);
+
+        if (s == cdm::Status::kSuccess && block.DecryptedBuffer()) {
+            cdm::Buffer* b = block.DecryptedBuffer();
+            if (b->Size() != total_cipher) {
+                fprintf(stderr, "[CDM] cipher-only size mismatch: got %u want %u\n",
+                        b->Size(), total_cipher);
+                fflush(stderr);
+                out.status = static_cast<int>(cdm::Status::kDecryptError);
+                return out;
+            }
+            out.data = static_cast<uint8_t*>(malloc(inp->data_size));
+            if (!out.data) { out.status = static_cast<int>(cdm::Status::kDecryptError); return out; }
+            out.data_size = inp->data_size;
+
+            const uint8_t* src     = inp->data;
+            const uint8_t* dec_ptr = static_cast<const uint8_t*>(b->Data());
+            uint8_t*       dst     = out.data;
+            for (uint32_t i = 0; i < inp->num_subsamples; ++i) {
+                memcpy(dst, src, inp->subsamples[i].clear_bytes);
+                dst += inp->subsamples[i].clear_bytes;
+                src += inp->subsamples[i].clear_bytes;
+                memcpy(dst, dec_ptr, inp->subsamples[i].cipher_bytes);
+                dst    += inp->subsamples[i].cipher_bytes;
+                dec_ptr += inp->subsamples[i].cipher_bytes;
+                src    += inp->subsamples[i].cipher_bytes;
+            }
+            out.status = 0;
+            fprintf(stderr, "[CDM] Decrypt SUCCESS cipher-only (out=%u bytes)\n", inp->data_size);
+            fflush(stderr);
+        } else {
+            out.status = static_cast<int>(s);
+            fprintf(stderr, "[CDM] Decrypt cipher-only FAILED status=%u\n", (unsigned)s);
+            fflush(stderr);
+        }
+        return out;
+    }
+
     cdm::Status status = cdm::Status::kDecryptError;
     for (int attempt = 0; attempt < 2; ++attempt) {
         // Respond to any deferred callbacks, then call Decrypt.
