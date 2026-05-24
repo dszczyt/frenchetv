@@ -699,6 +699,11 @@ impl LibMpvPlayer {
         let mpv = libmpv2::Mpv::new().expect("failed to create mpv instance");
         // Must set vo=libmpv before any loadfile so mpv uses the render context.
         mpv.set_property("vo", "libmpv").expect("mpv: set vo=libmpv failed");
+        // Override any user config that might enable looping (loop=yes in
+        // ~/.config/mpv/mpv.conf is a common culprit for the "audio repeats"
+        // symptom because libmpv loads user config by default).
+        let _ = mpv.set_property("loop-file", "no");
+        let _ = mpv.set_property("loop-playlist", "no");
 
         let renderer = ActiveRenderer::probe(&mpv, egui_ctx, force_software);
 
@@ -747,16 +752,24 @@ impl LibMpvPlayer {
         let _ = self.mpv.set_property("hwdec", "no");
         let _ = self.mpv.set_property("demuxer-lavf-analyzeduration", 1i64);
 
-        // Audio: default buffer (0.2 s) underruns on DASH streams served through
-        // the local DRM proxy, causing audible looping.  3 s gives enough headroom.
+        // Audio: extend the output ring buffer so a brief demuxer stall doesn't
+        // wrap the buffer and cause the "repeating loop" symptom.  Default is
+        // 0.2 s; 3 s spans several DASH segments worth of decoded audio.
         let _ = self.mpv.set_property("audio-buffer", 3.0f64);
 
-        // Cache: buffer up to 50 MB of demuxed data so segment latency spikes
-        // don't starve the decoders.  Keep only 1 MB behind the playhead —
-        // we don't need seekability on a live stream.
+        // Cache: enable the demuxer read-ahead cache and let mpv use its default
+        // size (150 MiB forward).  Do NOT set demuxer-max-bytes here — any value
+        // lower than the default would reduce the buffer and make stalls more likely.
         let _ = self.mpv.set_property("cache", "yes");
-        let _ = self.mpv.set_property("demuxer-max-bytes", "50MiB");
-        let _ = self.mpv.set_property("demuxer-max-back-bytes", "1MiB");
+
+        // Pause playback (rather than underrun) when the demuxer cache runs low.
+        // For live streams at the CDN edge the next segment may not exist yet;
+        // cache-pause lets mpv wait for it instead of wrapping the audio buffer.
+        let _ = self.mpv.set_property("cache-pause", "yes");
+
+        // Prevent any looping that might have been inherited from user config.
+        let _ = self.mpv.set_property("loop-file", "no");
+        let _ = self.mpv.set_property("loop-playlist", "no");
 
         if self.has_cdm_support {
             let cdm_path = crate::widevine::dir().to_string_lossy().into_owned();
