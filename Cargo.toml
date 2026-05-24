@@ -2,6 +2,7 @@
 members = [
     "crates/core",
     "crates/ui-desktop",
+    "crates/ui-android",
 ]
 resolver = "2"
 
