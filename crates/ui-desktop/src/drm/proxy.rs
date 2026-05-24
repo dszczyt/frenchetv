@@ -213,6 +213,7 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
 }
 
 async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Vec<u8>> {
+    let t0 = std::time::Instant::now();
     // cdn_path is "https/HOST/PATH?QUERY" or "http/HOST/PATH?QUERY"
     let real_url = cdn_path_to_url(cdn_path)?;
     tracing::debug!("DRM proxy → {}", real_url);
@@ -319,7 +320,16 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
         }
     }
 
-    Ok(fmp4::rebuild_segment(&data, &decrypted_samples, &parsed))
+    let result = fmp4::rebuild_segment(&data, &decrypted_samples, &parsed);
+    let elapsed = t0.elapsed();
+    // Log every segment fetch; WARN if it took > 1 s (likely stall cause).
+    let seg_name = cdn_path.rsplit('/').next().unwrap_or(cdn_path);
+    if elapsed.as_millis() > 1000 {
+        tracing::warn!("DRM proxy: slow segment {}ms {}", elapsed.as_millis(), seg_name);
+    } else {
+        tracing::debug!("DRM proxy: segment {}ms {}", elapsed.as_millis(), seg_name);
+    }
+    Ok(result)
 }
 
 fn cdn_path_to_url(cdn_path: &str) -> Result<String> {

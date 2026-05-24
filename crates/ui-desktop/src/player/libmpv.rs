@@ -777,6 +777,12 @@ impl LibMpvPlayer {
         // correct A/V drift caused by DRM proxy processing jitter.
         let _ = self.mpv.set_property("video-sync", "audio");
 
+        // Output silence when the audio output buffer runs dry instead of letting
+        // PulseAudio/ALSA replay whatever is in the hardware ring buffer.
+        // Without this, a brief demuxer stall causes the hardware to wrap around
+        // in its ~1-second ring buffer and replay old audio — the "looping" symptom.
+        let _ = self.mpv.set_property("audio-stream-silence", "yes");
+
         // Prevent any looping that might have been inherited from user config.
         let _ = self.mpv.set_property("loop-file", "no");
         let _ = self.mpv.set_property("loop-playlist", "no");
