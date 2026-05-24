@@ -473,10 +473,11 @@ impl GlRenderer {
             });
         }
 
-        // Cap render resolution to avoid glReadPixels stalling at screen size.
-        // 1280×720 = 3.7 MB/frame vs 33 MB at 4K; GPU scales up for free.
-        const MAX_W: u32 = 1280;
-        const MAX_H: u32 = 720;
+        // Cap render resolution at 1080p to avoid glReadPixels stalling at native
+        // 4K/HiDPI sizes. 1920×1080 = 8 MB/frame; acceptable on integrated Intel.
+        // Software renderer keeps its 720p cap for CPU performance.
+        const MAX_W: u32 = 1920;
+        const MAX_H: u32 = 1080;
         let rw = width.min(MAX_W);
         let rh = height.min(MAX_H);
 
