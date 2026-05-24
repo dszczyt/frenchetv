@@ -71,6 +71,8 @@ impl App {
         let logos: LogoCache = Arc::new(Mutex::new(HashMap::new()));
         let config = Config::load().unwrap_or_default();
 
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
         let force_software_renderer = std::env::args().any(|a| a == "--force-software-renderer");
         if force_software_renderer {
             tracing::info!("renderer: forced software mode via --force-software-renderer");

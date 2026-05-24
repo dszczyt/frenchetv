@@ -120,6 +120,8 @@ impl App {
             .clone()
             .expect("android_app must be set in NativeOptions");
 
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
         let (tx, rx) = mpsc::sync_channel(16);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let logos: LogoCache = Arc::new(Mutex::new(HashMap::new()));

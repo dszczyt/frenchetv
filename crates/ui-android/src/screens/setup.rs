@@ -1,4 +1,6 @@
 use egui::{Color32, FontId, Key, RichText, Vec2};
+
+const LOGO_BYTES: &[u8] = include_bytes!("../../../../assets/logo.png");
 use frenchetv_core::{OperatorKind, OperatorRegistry};
 
 #[derive(Debug, Clone, PartialEq)]
@@ -124,11 +126,11 @@ impl SetupScreen {
                 ui.vertical_centered(|ui| {
                     ui.add_space(60.0);
 
-                    // Title
-                    ui.label(
-                        RichText::new("FrenchTV")
-                            .font(FontId::proportional(48.0))
-                            .color(Color32::WHITE),
+                    // Logo
+                    ui.add(
+                        egui::Image::from_bytes("bytes://frenchetv-logo.png", LOGO_BYTES)
+                            .max_size(egui::vec2(360.0, 90.0))
+                            .maintain_aspect_ratio(true),
                     );
                     ui.add_space(12.0);
                     ui.label(

@@ -13,10 +13,11 @@ frenchetv-core = { path = "../core" }
 [target.'cfg(target_os = "android")'.dependencies]
 eframe = { version = "0.30", default-features = false, features = ["default_fonts", "android-game-activity"] }
 egui = "0.30"
+egui_extras = { version = "0.30", features = ["image"] }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 winit = { version = "0.30", default-features = false, features = ["android-game-activity"] }
 tokio = { version = "1", features = ["rt", "rt-multi-thread", "macros", "sync"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
-image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 android_logger = "0.14"
 log = "0.4"
 url = "2"

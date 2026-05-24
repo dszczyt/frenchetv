@@ -1,4 +1,6 @@
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, Vec2};
+
+const LOGO_BYTES: &[u8] = include_bytes!("../../../../assets/logo.png");
 use frenchetv_core::{Channel, ChannelCategory};
 use crate::app::LogoCache;
 
@@ -43,10 +45,10 @@ impl ChannelListScreen {
                 // ── Top bar ──────────────────────────────────────────────────
                 ui.horizontal(|ui| {
                     ui.add_space(16.0);
-                    ui.label(
-                        RichText::new("FrenchTV")
-                            .font(FontId::proportional(22.0))
-                            .color(Color32::WHITE),
+                    ui.add(
+                        egui::Image::from_bytes("bytes://frenchetv-logo.png", LOGO_BYTES)
+                            .max_size(egui::vec2(144.0, 36.0))
+                            .maintain_aspect_ratio(true),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.add_space(16.0);
