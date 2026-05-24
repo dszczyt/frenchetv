@@ -117,6 +117,7 @@ impl PlayerScreen {
                             Some(sized_texture) => {
                                 ui.add(
                                     egui::Image::new(sized_texture)
+                                        .maintain_aspect_ratio(true)
                                         .fit_to_exact_size(available),
                                 );
                             }
