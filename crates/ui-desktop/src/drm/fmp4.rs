@@ -602,11 +602,13 @@ fn remove_senc_from_traf(moof_payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(moof_payload.len());
     for b in boxes(moof_payload) {
         if &b.fourcc == b"traf" {
-            let inner = remove_senc_box(b.payload);
+            let (inner, removed_bytes) = remove_enc_boxes_from_traf(b.payload);
             let new_size = (8 + inner.len()) as u32;
             out.extend_from_slice(&new_size.to_be_bytes());
             out.extend_from_slice(b"traf");
-            out.extend_from_slice(&inner);
+            // Fix trun.data_offset: we removed `removed_bytes` from moof payload,
+            // so the byte offset from moof start to mdat data decreases by that amount.
+            out.extend_from_slice(&fix_traf_trun_offset(&inner, -(removed_bytes as i32)));
         } else {
             out.extend_from_slice(&moof_payload[b.offset..b.offset + b.total_size]);
         }
@@ -617,16 +619,58 @@ fn remove_senc_from_traf(moof_payload: &[u8]) -> Vec<u8> {
     out
 }
 
-fn remove_senc_box(traf_payload: &[u8]) -> Vec<u8> {
+/// Remove encryption-related boxes from a `traf` payload.
+/// Returns `(new_traf_payload, total_bytes_removed)`.
+///
+/// Strips `senc`, `saiz`, and `saio` — all three carry per-sample encryption
+/// metadata that is no longer valid after the proxy has pre-decrypted the samples.
+fn remove_enc_boxes_from_traf(traf_payload: &[u8]) -> (Vec<u8>, usize) {
+    const DROP: &[[u8; 4]] = &[*b"senc", *b"saiz", *b"saio"];
     let mut out = Vec::with_capacity(traf_payload.len());
+    let mut removed = 0usize;
     for b in boxes(traf_payload) {
-        if &b.fourcc == b"senc" {
-            continue; // drop
+        if DROP.contains(&b.fourcc) {
+            removed += b.total_size;
+        } else {
+            out.extend_from_slice(&traf_payload[b.offset..b.offset + b.total_size]);
         }
-        out.extend_from_slice(&traf_payload[b.offset..b.offset + b.total_size]);
     }
     if out.is_empty() {
         out.extend_from_slice(traf_payload);
+        removed = 0;
     }
+    (out, removed)
+}
+
+/// Walk a rebuilt `traf` payload and adjust each `trun.data_offset` by `delta`.
+///
+/// `trun.data_offset` is relative to the start of the enclosing `moof` box.
+/// When we shorten `moof` by removing enc boxes from `traf`, `data_offset`
+/// must decrease by the same amount so ffmpeg finds the sample data correctly.
+fn fix_traf_trun_offset(traf_payload: &[u8], delta: i32) -> Vec<u8> {
+    if delta == 0 { return traf_payload.to_vec(); }
+    let mut out = Vec::with_capacity(traf_payload.len());
+    for b in boxes(traf_payload) {
+        if &b.fourcc == b"trun" {
+            let fixed = adjust_trun_data_offset(b.payload, delta);
+            let sz = (8 + fixed.len()) as u32;
+            out.extend_from_slice(&sz.to_be_bytes());
+            out.extend_from_slice(b"trun");
+            out.extend_from_slice(&fixed);
+        } else {
+            out.extend_from_slice(&traf_payload[b.offset..b.offset + b.total_size]);
+        }
+    }
+    out
+}
+
+/// Add `delta` to `trun.data_offset` if the data-offset flag is set.
+fn adjust_trun_data_offset(payload: &[u8], delta: i32) -> Vec<u8> {
+    if payload.len() < 12 { return payload.to_vec(); }
+    let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
+    if flags & 0x000001 == 0 { return payload.to_vec(); } // no data-offset field
+    let old = i32::from_be_bytes(payload[8..12].try_into().unwrap());
+    let mut out = payload.to_vec();
+    out[8..12].copy_from_slice(&(old + delta).to_be_bytes());
     out
 }

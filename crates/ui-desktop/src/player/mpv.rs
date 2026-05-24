@@ -73,8 +73,12 @@ impl MpvPlayer {
             cmd.arg(format!("--cdm-store={}", crate::widevine::dir().display()));
         }
 
-        // Give lavf 500 ms to probe codec parameters (pixel format from SPS).
-        // Default is 0 for live streams which leaves pixel format "unspecified".
+        // Live DASH: lavf's DASH demuxer doesn't invoke the codec decoder during
+        // probing, so pixel format stays "none" until the first IDR frame.
+        // Hardware decoders (vaapi/vdpau) refuse to init with pixel_format=none;
+        // force software decode so mpv can open the stream and resolve pix_fmt
+        // from the first decoded IDR.
+        cmd.arg("--hwdec=no");
         cmd.arg("--demuxer-lavf-analyzeduration=1");
 
         cmd.arg(url);
