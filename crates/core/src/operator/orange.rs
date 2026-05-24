@@ -12,6 +12,82 @@ use super::traits::{AuthPhase, Operator, Result};
 /// Fallback M3U shipped with the binary.
 const FALLBACK_M3U: &str = include_str!("../../../../assets/channels/orange.m3u");
 
+/// Infer a channel category from the channel name.
+///
+/// Orange's channel list API does not include a category field, so we derive
+/// the category from known French channel names / keyword patterns.
+fn category_from_name(name: &str) -> ChannelCategory {
+    let n = name.to_lowercase();
+
+    // ── Info / News ──────────────────────────────────────────────────────────
+    if n == "bfm tv" || n.starts_with("bfm ") || n == "cnews" || n == "lci"
+        || n == "france info" || n.starts_with("france 24") || n == "euronews"
+        || n.contains("météo") || n.contains("meteo") || n == "i24news"
+        || n == "bfm business"
+    {
+        return ChannelCategory::News;
+    }
+
+    // ── Sport ────────────────────────────────────────────────────────────────
+    if n.starts_with("bein sports") || n.starts_with("beinsports")
+        || n.starts_with("canal+ sport") || n.starts_with("eurosport")
+        || n == "l'équipe" || n == "l'equipe" || n.starts_with("rmc sport")
+        || n == "infosport+" || n == "l'équipe 21"
+    {
+        return ChannelCategory::Sports;
+    }
+
+    // ── Kids ─────────────────────────────────────────────────────────────────
+    if n == "gulli" || n.starts_with("disney") || n == "boomerang"
+        || n == "cartoon network" || n.starts_with("nickelodeon") || n == "tiji"
+        || n == "piwi+" || n == "canal j" || n == "j-one" || n == "mangas"
+        || n == "game one" || n == "boing"
+    {
+        return ChannelCategory::Kids;
+    }
+
+    // ── Documentary ──────────────────────────────────────────────────────────
+    if n.starts_with("planète") || n.starts_with("planete")
+        || n.starts_with("national geo") || n.starts_with("discovery")
+        || n == "rmc découverte" || n == "rmc decouverte"
+        || n.contains("histoire") || n.contains("science") || n == "animaux"
+        || n == "ushuaïa tv" || n == "ushuaia tv" || n == "toute l'histoire"
+        || n == "crime district" || n == "trek"
+    {
+        return ChannelCategory::Documentary;
+    }
+
+    // ── Music ────────────────────────────────────────────────────────────────
+    if n == "mtv" || n == "mcm" || n == "mcm top" || n == "m6 music"
+        || n.starts_with("trace ") || n == "melody" || n == "rfm tv"
+        || n.starts_with("nrj hits") || n == "stingray"
+    {
+        return ChannelCategory::Music;
+    }
+
+    // ── Entertainment ────────────────────────────────────────────────────────
+    if n == "nrj 12" || n == "chérie 25" || n == "cherie 25"
+        || n.contains("paris première") || n.contains("paris premiere")
+        || n.starts_with("comédie") || n.starts_with("comedie")
+        || n == "ab1" || n.contains("virgin tonic") || n == "tv breizh"
+        || n == "polar+" || n == "action" || n == "serie club" || n == "club rtl"
+    {
+        return ChannelCategory::Entertainment;
+    }
+
+    // ── Generalist ───────────────────────────────────────────────────────────
+    if matches!(
+        n.as_str(),
+        "tf1" | "france 2" | "france 3" | "france 4" | "france 5" | "m6"
+            | "w9" | "tmc" | "tfx" | "tf1 séries films" | "tf1 series films"
+            | "6ter" | "c8" | "cstar" | "arte" | "france ô" | "france o"
+    ) {
+        return ChannelCategory::Generalist;
+    }
+
+    ChannelCategory::Other(String::new())
+}
+
 /// Placeholder URL used for channels fetched from the live API (stream resolved separately).
 const PLACEHOLDER_URL: &str = "https://placeholder.invalid/";
 
@@ -700,10 +776,10 @@ impl Operator for OrangeOperator {
                             .unwrap_or_else(|| c.id_epg.to_string());
                         Channel {
                             id: stream_id,
+                            category: category_from_name(&c.name),
                             name: c.name,
                             logo_url,
                             number: c.display_order,
-                            category: ChannelCategory::Other("".to_string()),
                             stream_template: StreamTemplate::Direct(placeholder.clone()),
                             locked,
                         }
@@ -1170,7 +1246,7 @@ mod tests {
             name: "TF1".into(),
             logo_url: None,
             number: Some(1),
-            category: ChannelCategory::Other("".to_string()),
+            category: ChannelCategory::Generalist,
             stream_template: StreamTemplate::Direct(
                 url::Url::parse(PLACEHOLDER_URL).unwrap(),
             ),
