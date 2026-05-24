@@ -68,14 +68,13 @@ pub async fn start(
     let state = Arc::new(ProxyState {
         cdm,
         mpd_fallback,
-        // The CDN MPD URL is re-fetched on every manifest request so that
-        // the SegmentTimeline always points to live (non-expired) segments.
         mpd_cdn_url: mpd_base_url.clone(),
         proxy_port: port,
         cdn_headers,
         init_info: Mutex::new(None),
         client: cdn_client,
         mpd_scheme,
+        mpd_cache: Mutex::new(None),
     });
 
     let task = tokio::spawn(async move {
@@ -108,7 +107,7 @@ struct ProxyState {
     cdm: Arc<Mutex<CdmHandle>>,
     /// Cached rewritten MPD from initial fetch — used as fallback if CDN refresh fails.
     mpd_fallback: String,
-    /// CDN URL to re-fetch on every `/manifest.mpd` request (live stream needs fresh timeline).
+    /// CDN URL to re-fetch when the cache expires.
     mpd_cdn_url: String,
     proxy_port: u16,
     cdn_headers: Vec<(String, String)>,
@@ -118,6 +117,14 @@ struct ProxyState {
     /// before stripping.  Used as `scheme_hint` when parsing CMAF-style init segments that have
     /// no `sinf/schm` box.  1 = CENC (AES-128-CTR), 2 = CBCS (AES-128-CBC).
     mpd_scheme: u32,
+    /// Short-lived MPD cache: (fetch_time, rewritten_mpd).
+    ///
+    /// mpv polls `/manifest.mpd` far more often than `minimumUpdatePeriod` (2 s).
+    /// Without caching, each poll re-fetches from CDN and returns a slightly
+    /// different SegmentTimeline.  mpv recalculates its live-edge position on every
+    /// change, producing the audio jitter / backward-replay symptom.
+    /// Serving the same rewritten MPD for 2 s stabilises the timeline.
+    mpd_cache: Mutex<Option<(std::time::Instant, String)>>,
 }
 
 async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<()> {
@@ -179,16 +186,32 @@ async fn dispatch(path: &str, state: &Arc<ProxyState>) -> (&'static str, &'stati
     ("404 Not Found", "text/plain", b"not found".to_vec())
 }
 
-/// Fetch the live MPD from the CDN and rewrite it through the proxy.
-/// Falls back to the initial cached MPD if the CDN request fails.
+/// Serve the live MPD, re-fetching from CDN at most once per `MPD_TTL`.
+///
+/// mpv polls this endpoint much more often than `minimumUpdatePeriod`.
+/// Serving the same rewritten MPD for `MPD_TTL` prevents mpv from
+/// recalculating its live-edge position on every poll, which was the
+/// source of the audio backward-replay / jitter symptom.
+const MPD_TTL: std::time::Duration = std::time::Duration::from_secs(2);
+
 async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
+    // Return cached MPD if still fresh.
+    {
+        let cache = state.mpd_cache.lock().unwrap();
+        if let Some((fetched_at, ref cached)) = *cache {
+            if fetched_at.elapsed() < MPD_TTL {
+                return cached.clone();
+            }
+        }
+    }
+
+    // Cache expired — fetch a fresh one from CDN.
     let mut req = state.client.get(&state.mpd_cdn_url);
     for (name, value) in &state.cdn_headers {
         req = req.header(name.as_str(), value.as_str());
     }
-    match req.send().await {
+    let fresh = match req.send().await {
         Ok(resp) if resp.status().is_success() => {
-            // Use the final URL after redirects (CDN may 307 to a different token/path).
             let final_url = resp.url().to_string();
             match resp.text().await {
                 Ok(text) => {
@@ -209,7 +232,10 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
             tracing::warn!("DRM proxy: MPD refresh failed ({}), using fallback", e);
             state.mpd_fallback.clone()
         }
-    }
+    };
+
+    *state.mpd_cache.lock().unwrap() = Some((std::time::Instant::now(), fresh.clone()));
+    fresh
 }
 
 async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Vec<u8>> {
