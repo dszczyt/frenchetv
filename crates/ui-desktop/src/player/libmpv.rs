@@ -755,17 +755,27 @@ impl LibMpvPlayer {
         // Audio: extend the output ring buffer so a brief demuxer stall doesn't
         // wrap the buffer and cause the "repeating loop" symptom.  Default is
         // 0.2 s; 3 s spans several DASH segments worth of decoded audio.
-        let _ = self.mpv.set_property("audio-buffer", 3.0f64);
+        let _ = self.mpv.set_property("audio-buffer", "3.0");
 
         // Cache: enable the demuxer read-ahead cache and let mpv use its default
         // size (150 MiB forward).  Do NOT set demuxer-max-bytes here — any value
         // lower than the default would reduce the buffer and make stalls more likely.
         let _ = self.mpv.set_property("cache", "yes");
 
-        // Pause playback (rather than underrun) when the demuxer cache runs low.
-        // For live streams at the CDN edge the next segment may not exist yet;
-        // cache-pause lets mpv wait for it instead of wrapping the audio buffer.
-        let _ = self.mpv.set_property("cache-pause", "yes");
+        // Read ahead 10 seconds of segments — enough that CDN fetch latency spikes
+        // don't drain the playback pipeline before the next segment arrives.
+        let _ = self.mpv.set_property("demuxer-readahead-secs", 10.0f64);
+
+        // Do NOT use cache-pause for live streams: when mpv pauses at the CDN live
+        // edge and then unpauses, it seeks forward to the new live edge.  On DASH
+        // that seek often overshoots backward by ~1 s and the player then rapidly
+        // replays buffered audio to catch up — exactly the "looping" symptom.
+        let _ = self.mpv.set_property("cache-pause", "no");
+
+        // Sync video to the audio clock rather than the other way around.
+        // Prevents mpv from adjusting (or briefly seeking) the audio track to
+        // correct A/V drift caused by DRM proxy processing jitter.
+        let _ = self.mpv.set_property("video-sync", "audio");
 
         // Prevent any looping that might have been inherited from user config.
         let _ = self.mpv.set_property("loop-file", "no");
@@ -796,6 +806,27 @@ impl LibMpvPlayer {
         width: u32,
         height: u32,
     ) -> Option<egui::load::SizedTexture> {
+        // Drain the mpv event queue non-blocking to catch seek / end-of-file events.
+        // These log at WARN so they're visible without --verbose and help diagnose
+        // the "audio jumps back 1 second" symptom.
+        loop {
+            match self.mpv.event_context_mut().wait_event(0.0) {
+                Some(Ok(libmpv2::events::Event::Seek)) => {
+                    let pos = self.mpv
+                        .get_property::<f64>("time-pos")
+                        .unwrap_or(f64::NAN);
+                    tracing::warn!("mpv: seek event (time-pos={:.3})", pos);
+                }
+                Some(Ok(libmpv2::events::Event::PlaybackRestart)) => {
+                    tracing::debug!("mpv: playback-restart after seek");
+                }
+                Some(Ok(libmpv2::events::Event::EndFile(reason))) => {
+                    tracing::warn!("mpv: end-file reason={}", reason);
+                }
+                None | Some(Ok(libmpv2::events::Event::QueueOverflow)) => break,
+                Some(_) => {}
+            }
+        }
         self.renderer.poll_frame(ctx, width, height)
     }
 
