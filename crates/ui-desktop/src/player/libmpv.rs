@@ -99,9 +99,7 @@ impl SoftwareRenderer {
         })
     }
 
-    /// Renders a new frame if mpv signalled one is ready.
-    ///
-    /// Returns the current texture (new or cached).
+    /// Renders a new frame if mpv has one ready; returns cached texture otherwise.
     pub fn poll_frame(
         &mut self,
         ctx: &egui::Context,
@@ -112,18 +110,32 @@ impl SoftwareRenderer {
             return None;
         }
 
-        // Only re-render if mpv flagged a new frame.
+        // Fast pre-check: callback has not fired since last poll.
         if !self.needs_update.swap(false, Ordering::AcqRel) {
             return self.texture.as_ref().map(|t| {
                 egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
             });
         }
 
-        let mut pixels = vec![0u8; (width * height * 4) as usize];
-        let stride = (width * 4) as usize;
+        // The callback fires for *every* mpv internal event, not only new frames.
+        // Check the authoritative flag before doing any pixel work.
+        let update_flags = unsafe { libmpv2_sys::mpv_render_context_update(self.ctx) };
+        if update_flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
+            return self.texture.as_ref().map(|t| {
+                egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
+            });
+        }
 
-        // SW render params: size, format ("bgr0"), stride, pointer, terminator
-        let mut sw_size = [width as i32, height as i32];
+        // Cap render resolution — software scaling at 1920×1080 is expensive on
+        // a laptop CPU. IPTV sources are ≤1080p so quality is not lost.
+        const MAX_W: u32 = 1920;
+        const MAX_H: u32 = 1080;
+        let rw = width.min(MAX_W);
+        let rh = height.min(MAX_H);
+
+        let stride = (rw * 4) as usize;
+        let mut pixels = vec![0u8; stride * rh as usize];
+        let mut sw_size = [rw as i32, rh as i32];
         let format_str = b"bgr0\0";
         let mut sw_stride = stride;
 
@@ -153,23 +165,18 @@ impl SoftwareRenderer {
                 render_params.as_ptr() as *mut libmpv2_sys::mpv_render_param,
             )
         };
-
         if err != 0 {
             tracing::warn!("software render failed: error code {}", err);
             return None;
         }
 
-        // bgr0 -> rgba: swap R/B, set alpha=255
+        // bgr0 → rgba: swap R↔B, set alpha=255
         for px in pixels.chunks_exact_mut(4) {
             px.swap(0, 2);
             px[3] = 255;
         }
 
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [width as usize, height as usize],
-            &pixels,
-        );
-
+        let image = egui::ColorImage::from_rgba_unmultiplied([rw as usize, rh as usize], &pixels);
         if let Some(ref mut tex) = self.texture {
             tex.set(image, egui::TextureOptions::LINEAR);
         } else {
@@ -177,6 +184,7 @@ impl SoftwareRenderer {
                 Some(ctx.load_texture("mpv_frame_sw", image, egui::TextureOptions::LINEAR));
         }
 
+        // Return display size so egui GPU-scales the texture to fill the panel.
         self.texture.as_ref().map(|t| {
             egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
         })
@@ -451,21 +459,29 @@ impl GlRenderer {
             return None;
         }
 
-        // Cap render resolution to avoid glReadPixels stalling at screen size.
-        // IPTV streams are ≤1080p; rendering at 4K/HiDPI fullscreen size wastes
-        // bandwidth (glReadPixels at 3840×2160 = 33 MB/frame).
-        // The returned SizedTexture carries the *display* size so egui scales
-        // the smaller texture up on the GPU — zero quality loss for IPTV content.
-        const MAX_W: u32 = 1920;
-        const MAX_H: u32 = 1080;
-        let rw = width.min(MAX_W);
-        let rh = height.min(MAX_H);
-
+        // Fast pre-check: callback has not fired since last poll.
         if !self.needs_update.swap(false, std::sync::atomic::Ordering::AcqRel) {
             return self.texture.as_ref().map(|t| {
                 egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
             });
         }
+
+        // Gate on mpv's authoritative frame-ready flag — the callback fires for
+        // every internal mpv event, not only new decoded frames.
+        let update_flags = unsafe { libmpv2_sys::mpv_render_context_update(self.ctx) };
+        if update_flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
+            return self.texture.as_ref().map(|t| {
+                egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
+            });
+        }
+
+        // Cap render resolution to avoid glReadPixels stalling at screen size.
+        // IPTV streams are ≤1080p; rendering at 4K/HiDPI fullscreen size wastes
+        // bandwidth (glReadPixels at 3840×2160 = 33 MB/frame).
+        const MAX_W: u32 = 1920;
+        const MAX_H: u32 = 1080;
+        let rw = width.min(MAX_W);
+        let rh = height.min(MAX_H);
 
         // Make our offscreen EGL context current.
         if self
