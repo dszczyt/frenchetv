@@ -4,3 +4,8 @@ ruvector.db
 *.db-shm
 *.db-wal
 Cargo.lock
+.playwright-mcp/
+*.rvf
+*.rvf.lock
+*.png
+*.txt

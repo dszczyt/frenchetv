@@ -1,6 +1,0 @@
-[     183ms] [ERROR] 5/23/2026, 8:09:03 PM [swaptv.request.service.2] ERROR - Fetch error on url https://ottdatacollector.orange.fr/PC/technicaldata : Failed to fetch @ https://tv.orange.fr/assets/index-CqiMyiq2.js:7
-[     186ms] [ERROR] Failed to load resource: the server responded with a status of 410 (Gone) @ https://tv.orange.fr/chaines/france-2:0
-[     337ms] [WARNING] Manifest: property 'name' ignored, type string expected. @ https://tv.orange.fr/assets/manifest.webmanifest:0
-[     337ms] [WARNING] Manifest: property 'short_name' ignored, type string expected. @ https://tv.orange.fr/assets/manifest.webmanifest:0
-[     337ms] [WARNING] Manifest: property 'description' ignored, type string expected. @ https://tv.orange.fr/assets/manifest.webmanifest:0
-[    3776ms] [WARNING] The resource https://tv.orange.fr/assets/img-bienvenue-DJwVlz_3.jpg was preloaded using link preload but not used within a few seconds from the window's load event. Please make sure it has an appropriate `as` value and it is preloaded intentionally. @ https://tv.orange.fr/404-not-found:0

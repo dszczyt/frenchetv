@@ -1,5 +1,0 @@
-[    1573ms] [WARNING] Manifest: property 'name' ignored, type string expected. @ https://tv.orange.fr/assets/manifest.webmanifest:0
-[    1573ms] [WARNING] Manifest: property 'short_name' ignored, type string expected. @ https://tv.orange.fr/assets/manifest.webmanifest:0
-[    1573ms] [WARNING] Manifest: property 'description' ignored, type string expected. @ https://tv.orange.fr/assets/manifest.webmanifest:0
-[    2881ms] [LOG] {c: Object} @ https://tags.tiqcdn.com/utag/orange/dnu/prod/utag.440.js?utv=ut4.39.202502191254:22
-[   10309ms] [WARNING] The resource https://tv.orange.fr/assets/img-bienvenue-DJwVlz_3.jpg was preloaded using link preload but not used within a few seconds from the window's load event. Please make sure it has an appropriate `as` value and it is preloaded intentionally. @ https://tv.orange.fr/:0
