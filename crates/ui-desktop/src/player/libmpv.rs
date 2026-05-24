@@ -493,7 +493,11 @@ impl GlRenderer {
             h:   height as std::os::raw::c_int,
             internal_format: 0, // 0 means use default (GL_RGBA)
         };
-        let mut flip_y: std::os::raw::c_int = 1;
+        // flip_y=0: mpv renders with video row 0 at the top of the FBO (OpenGL y=h).
+        // glReadPixels reads from y=0 (bottom) upward, so row 0 of the pixel
+        // buffer = bottom row of FBO = bottom of video → need to flip rows.
+        // flip_y=1 would double-flip (mpv flips + glReadPixels flips = 180° rotation).
+        let mut flip_y: std::os::raw::c_int = 0;
 
         let render_params: [libmpv2_sys::mpv_render_param; 3] = [
             libmpv2_sys::mpv_render_param {
@@ -519,7 +523,11 @@ impl GlRenderer {
         }
 
         // Read back the pixels from the FBO.
-        let pixel_count = (width * height * 4) as usize;
+        // glReadPixels with y=0 reads from the OpenGL bottom row upward, so
+        // the buffer is vertically flipped relative to video/egui convention.
+        // Flip rows in-place after readback.
+        let row_bytes = (width * 4) as usize;
+        let pixel_count = row_bytes * height as usize;
         let mut pixels = vec![0u8; pixel_count];
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.fbo);
@@ -532,6 +540,15 @@ impl GlRenderer {
                 pixels.as_mut_ptr() as *mut std::ffi::c_void,
             );
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
+        }
+        // Flip rows: swap row 0 ↔ row (h-1), row 1 ↔ row (h-2), …
+        let h = height as usize;
+        for row in 0..h / 2 {
+            let top = row * row_bytes;
+            let bot = (h - 1 - row) * row_bytes;
+            // Safety: top and bot are non-overlapping slices within `pixels`.
+            let (a, b) = pixels.split_at_mut(bot);
+            a[top..top + row_bytes].swap_with_slice(&mut b[..row_bytes]);
         }
 
         let image = egui::ColorImage::from_rgba_unmultiplied(
