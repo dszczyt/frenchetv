@@ -747,6 +747,17 @@ impl LibMpvPlayer {
         let _ = self.mpv.set_property("hwdec", "no");
         let _ = self.mpv.set_property("demuxer-lavf-analyzeduration", 1i64);
 
+        // Audio: default buffer (0.2 s) underruns on DASH streams served through
+        // the local DRM proxy, causing audible looping.  3 s gives enough headroom.
+        let _ = self.mpv.set_property("audio-buffer", 3.0f64);
+
+        // Cache: buffer up to 50 MB of demuxed data so segment latency spikes
+        // don't starve the decoders.  Keep only 1 MB behind the playhead —
+        // we don't need seekability on a live stream.
+        let _ = self.mpv.set_property("cache", "yes");
+        let _ = self.mpv.set_property("demuxer-max-bytes", "50MiB");
+        let _ = self.mpv.set_property("demuxer-max-back-bytes", "1MiB");
+
         if self.has_cdm_support {
             let cdm_path = crate::widevine::dir().to_string_lossy().into_owned();
             let _ = self.mpv.set_property("cdm-store", cdm_path.as_str());
