@@ -426,8 +426,6 @@ static void fire_pending_timers(CdmState* state) {
     if (!state || !state->cdm || state->pending_timer_contexts.empty()) return;
     std::vector<void*> contexts;
     std::swap(contexts, state->pending_timer_contexts); // consume to avoid infinite loop
-    fprintf(stderr, "[CDM] fire_pending_timers: %zu timer(s)\n", contexts.size());
-    fflush(stderr);
     for (void* ctx : contexts) {
         state->cdm->TimerExpired(ctx);
     }
@@ -458,8 +456,6 @@ void CdmHostImpl::RequestStorageId(uint32_t version) {
 
 // Out-of-line definition of SetTimer (needs complete CdmState type).
 void CdmHostImpl::SetTimer(int64_t delay_ms, void* context) {
-    fprintf(stderr, "[CDM] SetTimer(delay=%lld ms, ctx=%p)\n", (long long)delay_ms, context);
-    fflush(stderr);
     if (state_ && context) state_->pending_timer_contexts.push_back(context);
 }
 
@@ -643,10 +639,6 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
         buf_c.subsamples     = nullptr;
         buf_c.num_subsamples = 0;
 
-        fprintf(stderr, "[CDM] Decrypt cipher-only (%u of %u bytes, %u subsamples)\n",
-                total_cipher, inp->data_size, inp->num_subsamples);
-        fflush(stderr);
-
         cdm::SimpleDecryptedBlock block;
         cdm::Status s = state->cdm->Decrypt(buf_c, &block);
 
@@ -676,8 +668,6 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
                 src    += inp->subsamples[i].cipher_bytes;
             }
             out.status = 0;
-            fprintf(stderr, "[CDM] Decrypt SUCCESS cipher-only (out=%u bytes)\n", inp->data_size);
-            fflush(stderr);
         } else {
             out.status = static_cast<int>(s);
             fprintf(stderr, "[CDM] Decrypt cipher-only FAILED status=%u\n", (unsigned)s);
@@ -693,10 +683,6 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
         fire_pending_timers(state);
         answer_ops_query(state);
 
-        fprintf(stderr, "[CDM] Decrypt(attempt=%d, data=%u, subsamples=%u)\n",
-                attempt + 1, inp->data_size, inp->num_subsamples);
-        fflush(stderr);
-
         cdm::SimpleDecryptedBlock block;
         status = state->cdm->Decrypt(buf, &block);
 
@@ -707,9 +693,6 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
             if (out.data) {
                 memcpy(out.data, b->Data(), out.data_size);
                 out.status = 0;
-                fprintf(stderr, "[CDM] Decrypt SUCCESS (attempt=%d, out=%u bytes)\n",
-                        attempt + 1, out.data_size);
-                fflush(stderr);
             } else {
                 out.status = static_cast<int>(cdm::Status::kDecryptError);
             }

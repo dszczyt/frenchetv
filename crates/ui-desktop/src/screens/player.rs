@@ -14,6 +14,7 @@ pub struct PlayerScreen {
     state: PlayerState,
     info_visible: bool,
     info_hide_timer: f32,
+    fullscreen: bool,
 }
 
 #[derive(Debug)]
@@ -37,6 +38,7 @@ impl PlayerScreen {
             state: PlayerState::Loading,
             info_visible: false,
             info_hide_timer: 0.0,
+            fullscreen: false,
         }
     }
 
@@ -53,7 +55,7 @@ impl PlayerScreen {
     }
 
     pub fn show(&mut self, ctx: &egui::Context) -> PlayerAction {
-        let (dt, action, toggle_info) = ctx.input(|i| {
+        let (dt, action, toggle_info, toggle_fs) = ctx.input(|i| {
             let dt = i.unstable_dt;
             let action = if i.key_pressed(Key::Escape) || i.key_pressed(Key::Backspace) {
                 PlayerAction::Back
@@ -65,8 +67,14 @@ impl PlayerScreen {
                 PlayerAction::None
             };
             let toggle_info = i.key_pressed(Key::Enter);
-            (dt, action, toggle_info)
+            let toggle_fs   = i.key_pressed(Key::F);
+            (dt, action, toggle_info, toggle_fs)
         });
+
+        if toggle_fs {
+            self.fullscreen = !self.fullscreen;
+            ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
+        }
 
         if toggle_info {
             self.info_visible = !self.info_visible;
@@ -146,7 +154,7 @@ impl PlayerScreen {
                                         .color(Color32::WHITE),
                                 );
                                 ui.label(
-                                    RichText::new("← → Changer  ↵ Info  Esc Retour")
+                                    RichText::new("← → Changer  ↵ Info  F Plein écran  Esc Retour")
                                         .font(FontId::proportional(12.0))
                                         .color(Color32::from_rgb(160, 160, 160)),
                                 );
