@@ -115,11 +115,13 @@ impl PlayerScreen {
                     PlayerState::Playing => {
                         match self.player.render_frame(ctx, w, h) {
                             Some(sized_texture) => {
-                                ui.add(
-                                    egui::Image::new(sized_texture)
-                                        .maintain_aspect_ratio(true)
-                                        .fit_to_exact_size(available),
-                                );
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(
+                                        egui::Image::new(sized_texture)
+                                            .maintain_aspect_ratio(true)
+                                            .fit_to_exact_size(available),
+                                    );
+                                });
                             }
                             None => {
                                 ui.centered_and_justified(|ui| {

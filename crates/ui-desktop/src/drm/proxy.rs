@@ -137,7 +137,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<
         if line == "\r\n" || line == "\n" || line.is_empty() { break; }
     }
 
-    tracing::info!("DRM proxy request: {}", &path[..path.len().min(200)]);
+    tracing::debug!("DRM proxy request: {}", &path[..path.len().min(200)]);
     let (status, content_type, body) = dispatch(path, &state).await;
     if status != "200 OK" {
         tracing::warn!("DRM proxy {} → {}", path, status);
@@ -228,7 +228,7 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     // The CDN validates Origin/Referer for CORS, User-Agent for client detection,
     // and the wassup session cookie for authentication — all are required.
     // The shared cookie jar (populated during MPD fetch) also applies automatically.
-    tracing::info!("DRM proxy → CDN: {}", &real_url[..real_url.len().min(120)]);
+    tracing::debug!("DRM proxy → CDN: {}", &real_url[..real_url.len().min(120)]);
     let mut req = state.client.get(&real_url);
     for (name, value) in &state.cdn_headers {
         req = req.header(name.as_str(), value.as_str());
@@ -294,7 +294,7 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     if init_info.is_none() {
         tracing::warn!("DRM proxy: init still None after auto-fetch — decrypt will fail (NoKey)");
     } else {
-        tracing::info!("DRM proxy: decrypt scheme={} kid={}",
+        tracing::debug!("DRM proxy: decrypt scheme={} kid={}",
             if encryption_scheme == 2 { "CBCS" } else { "CENC" },
             default_kid.iter().map(|b| format!("{:02x}", b)).collect::<String>());
     }
