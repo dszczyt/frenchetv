@@ -473,11 +473,10 @@ impl GlRenderer {
             });
         }
 
-        // Cap render resolution at 1080p to avoid glReadPixels stalling at native
-        // 4K/HiDPI sizes. 1920×1080 = 8 MB/frame; acceptable on integrated Intel.
-        // Software renderer keeps its 720p cap for CPU performance.
-        const MAX_W: u32 = 1920;
-        const MAX_H: u32 = 1080;
+        // Cap render resolution at 720p — glReadPixels at 1080p stalls integrated
+        // Intel GPUs (Skylake) badly. Software renderer uses the same cap.
+        const MAX_W: u32 = 1280;
+        const MAX_H: u32 = 720;
         let rw = width.min(MAX_W);
         let rh = height.min(MAX_H);
 
@@ -707,6 +706,12 @@ impl LibMpvPlayer {
         // symptom because libmpv loads user config by default).
         let _ = mpv.set_property("loop-file", "no");
         let _ = mpv.set_property("loop-playlist", "no");
+        // Force ALSA audio output. PipeWire's PulseAudio compatibility layer
+        // wraps its internal ring buffer silently when underrun occurs — mpv has
+        // no visibility into this and cannot apply audio-stream-silence there.
+        // ALSA handles underruns differently (xrun → silence) and honours
+        // mpv's audio-buffer request directly.
+        let _ = mpv.set_property("ao", "alsa,pulse,pipewire");
 
         let renderer = ActiveRenderer::probe(&mpv, egui_ctx, force_software);
 
