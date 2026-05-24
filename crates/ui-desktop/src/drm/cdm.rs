@@ -267,13 +267,14 @@ impl CdmHandle {
         Ok(())
     }
 
-    /// Decrypt one CENC sample.
+    /// Decrypt one encrypted sample.
     ///
     /// * `data` — encrypted sample bytes
     /// * `key_id` — 16-byte key ID
     /// * `iv` — 8 or 16 byte IV
     /// * `subsamples` — `(clear_bytes, cipher_bytes)` pairs; empty = whole sample encrypted
     /// * `timestamp` — decode timestamp for the sample
+    /// * `encryption_scheme` — 1 = CENC (AES-128-CTR), 2 = CBCS (AES-128-CBC)
     pub fn decrypt(
         &self,
         data: &[u8],
@@ -281,15 +282,17 @@ impl CdmHandle {
         iv: &[u8],
         subsamples: &[(u32, u32)],
         timestamp: i64,
+        encryption_scheme: u32,
     ) -> Result<Vec<u8>> {
         let raw_subsamples: Vec<SubsampleEntry> = subsamples
             .iter()
             .map(|&(c, e)| SubsampleEntry { clear_bytes: c, cipher_bytes: e })
             .collect();
 
-        // Widevine CDM 10 expects a 16-byte AES-CTR counter block.
-        // CENC spec §9.4: 8-byte IVs occupy the upper 8 bytes; lower 8 bytes are zero.
-        let iv_padded: Vec<u8> = if iv.len() == 8 {
+        // CENC (AES-CTR): 8-byte IVs go in the upper 8 bytes of the 16-byte counter block;
+        //   lower 8 bytes are zero (CENC spec §9.4).
+        // CBCS (AES-CBC pattern): IV is always 16 bytes, used as-is.
+        let iv_padded: Vec<u8> = if encryption_scheme != 2 && iv.len() == 8 {
             let mut p = vec![0u8; 16];
             p[..8].copy_from_slice(iv);
             p
@@ -300,7 +303,7 @@ impl CdmHandle {
         let inp = RawDecryptInput {
             data: data.as_ptr(),
             data_size: data.len() as u32,
-            encryption_scheme: 1, // CENC = AES-128-CTR
+            encryption_scheme,
             key_id: key_id.as_ptr(),
             key_id_size: key_id.len() as u32,
             iv: iv_padded.as_ptr(),

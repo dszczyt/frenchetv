@@ -78,24 +78,121 @@ pub fn find_box_path<'a>(data: &'a [u8], path: &[&[u8; 4]]) -> Option<BoxRef<'a>
 pub struct InitInfo {
     pub default_kid: [u8; 16],
     pub default_iv_size: u8,
+    /// 1 = CENC (AES-128-CTR), 2 = CBCS (AES-128-CBC).  Sourced from `sinf/schm`
+    /// (Strategy 1) or the MPD `ContentProtection value` attribute (Strategy 2).
+    pub encryption_scheme: u32,
 }
 
-/// Parse a DASH init segment and return CENC parameters from `tenc`.
+/// Parse a DASH init segment and return CENC parameters.
 ///
-/// Returns `Ok(None)` if the segment has no `tenc` box (unprotected track).
-pub fn parse_init_segment(data: &[u8]) -> Result<Option<InitInfo>> {
+/// Strategy (tried in order):
+/// 1. `moov/trak/.../stsd/encv|enca/sinf/schi/tenc` — classic CENC init.
+///    Encryption scheme is read from `sinf/schm` (`cenc`→1, `cbcs`→2).
+/// 2. `moov/pssh` (Widevine) — CMAF-style init where `tenc` is absent and the
+///    KID lives in a `pssh` box at the `moov` level.  IV size defaults to 8.
+///    `scheme_hint` is used as the encryption scheme (caller should supply it
+///    from the MPD `ContentProtection value` attribute before it is stripped).
+///
+/// Returns `Ok(None)` if the segment has no encryption info at all (clear track).
+pub fn parse_init_segment(data: &[u8], scheme_hint: u32) -> Result<Option<InitInfo>> {
     // Path: moov → trak → mdia → minf → stbl → stsd → (encv|enca) → sinf → schi → tenc
     let moov = match find_box(data, b"moov") {
         Some(b) => b,
         None => return Ok(None),
     };
-    // There may be multiple trak boxes; check each.
+    // Strategy 1: classic tenc path.
     for trak in boxes(moov.payload).filter(|b| &b.fourcc == b"trak") {
         if let Some(info) = parse_trak_tenc(trak.payload)? {
             return Ok(Some(info));
         }
     }
+    // Strategy 2: KID from Widevine PSSH at moov level (CMAF-style, no encv/enca).
+    for pssh in boxes(moov.payload).filter(|b| &b.fourcc == b"pssh") {
+        if let Some(kid) = extract_kid_from_widevine_pssh(pssh.payload) {
+            return Ok(Some(InitInfo {
+                default_kid: kid,
+                default_iv_size: 8,
+                encryption_scheme: scheme_hint,
+            }));
+        }
+    }
     Ok(None)
+}
+
+/// Extract the complete Widevine PSSH box bytes from a DASH init segment.
+///
+/// Returns the full box (size + "pssh" + payload) suitable for passing directly
+/// to `CdmHandle::create_session`.  The box is extracted verbatim from the CDN
+/// response so it retains any provider/content_id fields the license server needs.
+pub fn extract_widevine_pssh(data: &[u8]) -> Option<Vec<u8>> {
+    let moov = find_box(data, b"moov")?;
+    for pssh in boxes(moov.payload).filter(|b| &b.fourcc == b"pssh") {
+        // pssh.payload = version(1)+flags(3)+SystemID(16)+...
+        if pssh.payload.len() >= 20 && &pssh.payload[4..20] == WV_SYSTEM_ID {
+            let start = pssh.offset;
+            let end = pssh.offset + pssh.total_size;
+            if end <= moov.payload.len() {
+                return Some(moov.payload[start..end].to_vec());
+            }
+        }
+    }
+    None
+}
+
+/// Widevine system ID bytes.
+const WV_SYSTEM_ID: [u8; 16] = [
+    0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
+    0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed,
+];
+
+/// Extract the first KID from a Widevine PSSH box payload (the bytes after the
+/// box size+fourcc header).
+///
+/// Supports both PSSH v0 (KID in WidevineCencHeader proto, field 2) and
+/// PSSH v1 (KID list in the box header).
+fn extract_kid_from_widevine_pssh(payload: &[u8]) -> Option<[u8; 16]> {
+    // Full-box header: version(1) + flags(3) = 4 bytes, then SystemID(16).
+    if payload.len() < 20 { return None; }
+    let version = payload[0];
+    if &payload[4..20] != WV_SYSTEM_ID { return None; }
+
+    if version == 1 {
+        // v1: KID count (4 bytes) then KIDs.
+        if payload.len() < 24 { return None; }
+        let kid_count = u32::from_be_bytes(payload[20..24].try_into().ok()?) as usize;
+        if kid_count > 0 && payload.len() >= 40 {
+            return Some(payload[24..40].try_into().ok()?);
+        }
+    } else {
+        // v0: data_size(4) + WidevineCencHeader protobuf.
+        if payload.len() < 24 { return None; }
+        let data_size = u32::from_be_bytes(payload[20..24].try_into().ok()?) as usize;
+        if payload.len() < 24 + data_size { return None; }
+        let proto = &payload[24..24 + data_size];
+        // Minimal protobuf scan for field 2 (key_id), wire type 2 (LEN).
+        let mut pos = 0;
+        while pos < proto.len() {
+            let tag = proto[pos]; pos += 1;
+            let wire = tag & 0x07;
+            let field = tag >> 3;
+            match wire {
+                0 => { // varint — skip
+                    while pos < proto.len() && proto[pos] & 0x80 != 0 { pos += 1; }
+                    if pos < proto.len() { pos += 1; }
+                }
+                2 => { // LEN
+                    if pos >= proto.len() { break; }
+                    let len = proto[pos] as usize; pos += 1;
+                    if field == 2 && len == 16 && pos + 16 <= proto.len() {
+                        return Some(proto[pos..pos + 16].try_into().ok()?);
+                    }
+                    pos += len;
+                }
+                _ => break,
+            }
+        }
+    }
+    None
 }
 
 fn parse_trak_tenc(trak: &[u8]) -> Result<Option<InitInfo>> {
@@ -113,9 +210,15 @@ fn parse_trak_tenc(trak: &[u8]) -> Result<Option<InitInfo>> {
             // = 8 bytes before nested boxes.  VisualSampleEntry adds 70 bytes of video params.
             // We just scan children of enc.payload for sinf.
             if let Some(sinf) = find_box(enc.payload, b"sinf") {
+                // Detect encryption scheme from sinf/schm.
+                // SchemeTypeBox layout: FullBox header (version 1B + flags 3B) + scheme_type 4CC.
+                let encryption_scheme = find_box(sinf.payload, b"schm")
+                    .filter(|b| b.payload.len() >= 8)
+                    .map(|b| if &b.payload[4..8] == b"cbcs" { 2u32 } else { 1u32 })
+                    .unwrap_or(1u32);
                 if let Some(schi) = find_box(sinf.payload, b"schi") {
                     if let Some(tenc) = find_box(schi.payload, b"tenc") {
-                        return parse_tenc(tenc.payload).map(Some);
+                        return parse_tenc(tenc.payload, encryption_scheme).map(Some);
                     }
                 }
             }
@@ -124,7 +227,7 @@ fn parse_trak_tenc(trak: &[u8]) -> Result<Option<InitInfo>> {
     Ok(None)
 }
 
-fn parse_tenc(payload: &[u8]) -> Result<InitInfo> {
+fn parse_tenc(payload: &[u8], encryption_scheme: u32) -> Result<InitInfo> {
     // version(1) + flags(3) + reserved(1) + crypt/skip(1) + default_isEncrypted(1) +
     // default_IV_size(1) + default_KID(16)
     if payload.len() < 20 {
@@ -133,7 +236,7 @@ fn parse_tenc(payload: &[u8]) -> Result<InitInfo> {
     let default_iv_size = payload[7];
     let mut default_kid = [0u8; 16];
     default_kid.copy_from_slice(&payload[8..24]);
-    Ok(InitInfo { default_kid, default_iv_size })
+    Ok(InitInfo { default_kid, default_iv_size, encryption_scheme })
 }
 
 /// Rewrite an init segment: replace `encv`/`enca` sample entries with their

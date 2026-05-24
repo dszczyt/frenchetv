@@ -55,6 +55,12 @@ pub async fn start(
     let addr = listener.local_addr()?;
     let port = addr.port();
 
+    // Extract encryption scheme from MPD BEFORE stripping ContentProtection elements.
+    // Orange DASH MPD uses value="cenc" or value="cbcs" on ContentProtection.
+    let mpd_scheme = extract_mpd_scheme(&mpd_text);
+    tracing::info!("DRM proxy: MPD encryption scheme={} ({})", mpd_scheme,
+        if mpd_scheme == 2 { "CBCS/AES-CBC" } else { "CENC/AES-CTR" });
+
     // Build initial MPD as a fallback (used if the first CDN refresh fails).
     let mpd_fallback = rewrite_mpd(&mpd_text, &mpd_base_url, port);
     tracing::info!("DRM proxy initial MPD:\n{}", &mpd_fallback[..mpd_fallback.len().min(4000)]);
@@ -69,6 +75,7 @@ pub async fn start(
         cdn_headers,
         init_info: Mutex::new(None),
         client: cdn_client,
+        mpd_scheme,
     });
 
     let task = tokio::spawn(async move {
@@ -78,7 +85,7 @@ pub async fn start(
                     let s = Arc::clone(&state);
                     tokio::spawn(async move {
                         if let Err(e) = handle_connection(stream, s).await {
-                            tracing::debug!("DRM proxy connection error: {}", e);
+                            tracing::warn!("DRM proxy connection error: {:#}", e);
                         }
                     });
                 }
@@ -107,6 +114,10 @@ struct ProxyState {
     cdn_headers: Vec<(String, String)>,
     init_info: Mutex<Option<InitInfo>>,
     client: reqwest::Client,
+    /// Encryption scheme extracted from the original MPD's `ContentProtection value` attribute
+    /// before stripping.  Used as `scheme_hint` when parsing CMAF-style init segments that have
+    /// no `sinf/schm` box.  1 = CENC (AES-128-CTR), 2 = CBCS (AES-128-CBC).
+    mpd_scheme: u32,
 }
 
 async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<()> {
@@ -126,7 +137,7 @@ async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<
         if line == "\r\n" || line == "\n" || line.is_empty() { break; }
     }
 
-    tracing::debug!("DRM proxy request: {}", path);
+    tracing::info!("DRM proxy request: {}", &path[..path.len().min(200)]);
     let (status, content_type, body) = dispatch(path, &state).await;
     if status != "200 OK" {
         tracing::warn!("DRM proxy {} → {}", path, status);
@@ -159,7 +170,7 @@ async fn dispatch(path: &str, state: &Arc<ProxyState>) -> (&'static str, &'stati
         match fetch_and_decrypt(cdn_path, state).await {
             Ok(data) => return ("200 OK", "video/mp4", data),
             Err(e) => {
-                tracing::error!("DRM proxy segment error: {}", e);
+                tracing::error!("DRM proxy segment error: {:#}", e);
                 return ("502 Bad Gateway", "text/plain", e.to_string().into_bytes());
             }
         }
@@ -239,20 +250,46 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
 
     if !is_media {
         // Init segment — extract CENC info, rewrite encv→avc1, return.
-        if let Ok(Some(info)) = fmp4::parse_init_segment(&data) {
-            *state.init_info.lock().unwrap() = Some(info);
-            tracing::debug!("DRM proxy: init segment parsed (iv_size={})", {
-                state.init_info.lock().unwrap().as_ref().map(|i| i.default_iv_size).unwrap_or(0)
-            });
+        match fmp4::parse_init_segment(&data, state.mpd_scheme) {
+            Ok(Some(info)) => {
+                tracing::info!(
+                    "DRM proxy: init segment parsed ok (scheme={}, iv_size={}, kid={})",
+                    if info.encryption_scheme == 2 { "CBCS" } else { "CENC" },
+                    info.default_iv_size,
+                    info.default_kid.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                );
+                *state.init_info.lock().unwrap() = Some(info);
+            }
+            Ok(None) => tracing::warn!("DRM proxy: init segment has no tenc box — init_info stays None"),
+            Err(e) => tracing::warn!("DRM proxy: init segment parse failed: {:#}", e),
         }
         let plain_init = fmp4::strip_encryption_from_init(&data);
         return Ok(plain_init);
     }
 
-    // Media segment — decrypt CENC samples.
+    // Media segment — ensure init_info is populated before decrypting.
+    if state.init_info.lock().unwrap().is_none() {
+        tracing::warn!("DRM proxy: media segment arrived before init segment — auto-fetching init");
+        if let Some(init_url) = derive_init_url(&real_url) {
+            if let Err(e) = fetch_and_store_init(&init_url, state).await {
+                tracing::warn!("DRM proxy: init auto-fetch failed: {:#}", e);
+            }
+        } else {
+            tracing::warn!("DRM proxy: cannot derive init URL from: {}", &real_url[..real_url.len().min(120)]);
+        }
+    }
+
     let init_info = state.init_info.lock().unwrap().clone();
     let iv_size = init_info.as_ref().map(|i| i.default_iv_size).unwrap_or(8);
     let default_kid = init_info.as_ref().map(|i| i.default_kid).unwrap_or([0u8; 16]);
+    let encryption_scheme = init_info.as_ref().map(|i| i.encryption_scheme).unwrap_or(state.mpd_scheme);
+    if init_info.is_none() {
+        tracing::warn!("DRM proxy: init still None after auto-fetch — decrypt will fail (NoKey)");
+    } else {
+        tracing::info!("DRM proxy: decrypt scheme={} kid={}",
+            if encryption_scheme == 2 { "CBCS" } else { "CENC" },
+            default_kid.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+    }
 
     let parsed = fmp4::parse_media_segment(&data, iv_size)
         .context("parse media segment")?;
@@ -266,7 +303,7 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
                 .cdm
                 .lock()
                 .unwrap()
-                .decrypt(raw, &default_kid, &enc.iv, &subs, sample.decode_time as i64)
+                .decrypt(raw, &default_kid, &enc.iv, &subs, sample.decode_time as i64, encryption_scheme)
                 .context("CDM decrypt")?;
             decrypted_samples.push(decrypted);
         } else {
@@ -378,6 +415,19 @@ fn resolve_relative_base_urls(mpd: &str, mpd_base_url: &str) -> String {
     out
 }
 
+/// Extract the encryption scheme from an MPD's `ContentProtection` elements.
+///
+/// Looks for `value="cbcs"` (case-insensitive) to detect CBCS (AES-128-CBC pattern).
+/// Falls back to 1 (CENC/AES-128-CTR) if no explicit scheme is indicated.
+fn extract_mpd_scheme(mpd: &str) -> u32 {
+    let lower = mpd.to_lowercase();
+    // Common patterns: value="cbcs" or value='cbcs'
+    if lower.contains("value=\"cbcs\"") || lower.contains("value='cbcs'") {
+        return 2;
+    }
+    1
+}
+
 fn remove_content_protection(mpd: &str) -> String {
     let mut out = String::with_capacity(mpd.len());
     let mut remaining = mpd;
@@ -426,4 +476,71 @@ fn rewrite_cdn_urls(mpd: &str, proxy_base: &str, _mpd_base_url: &str) -> String 
     let broken = format!("{}http/{}", proxy_base, local_addr);
     let fixed = format!("http://{}", local_addr);
     mpd_replace_http.replace(&broken, &fixed)
+}
+
+/// Derive the DASH init segment URL from a media segment URL.
+///
+/// Pattern: `…/stream-repid-TIMESTAMP.dash?q` → `…/stream-repid.dash?q`
+///
+/// Returns `None` if the URL doesn't end in `-<all-digits>.dash`.
+fn derive_init_url(media_url: &str) -> Option<String> {
+    let (base, query) = if let Some(pos) = media_url.find('?') {
+        (&media_url[..pos], &media_url[pos + 1..])
+    } else {
+        (media_url, "")
+    };
+    if !base.ends_with(".dash") { return None; }
+    let stem = &base[..base.len() - 5]; // strip ".dash"
+    let last_dash = stem.rfind('-')?;
+    let after = &stem[last_dash + 1..];
+    if after.is_empty() || !after.chars().all(|c| c.is_ascii_digit()) { return None; }
+    let init_stem = &stem[..last_dash];
+    Some(if query.is_empty() {
+        format!("{}.dash", init_stem)
+    } else {
+        format!("{}.dash?{}", init_stem, query)
+    })
+}
+
+/// Fetch the DASH init segment directly from the CDN and populate `state.init_info`.
+async fn fetch_and_store_init(init_url: &str, state: &Arc<ProxyState>) -> Result<()> {
+    tracing::info!("DRM proxy: fetching init segment: {}", &init_url[..init_url.len().min(120)]);
+    let mut req = state.client.get(init_url);
+    for (name, value) in &state.cdn_headers {
+        req = req.header(name.as_str(), value.as_str());
+    }
+    let resp = req.send().await.context("init segment CDN fetch")?;
+    if !resp.status().is_success() {
+        let status = resp.status();
+        let body = resp.text().await.unwrap_or_default();
+        bail!("init segment CDN returned {} (body: {})", status, &body[..body.len().min(200)]);
+    }
+    let data = resp.bytes().await.context("init segment CDN body")?;
+    match fmp4::parse_init_segment(&data, state.mpd_scheme) {
+        Ok(Some(info)) => {
+            tracing::info!(
+                "DRM proxy: init segment ok (scheme={}, iv_size={}, kid={})",
+                if info.encryption_scheme == 2 { "CBCS" } else { "CENC" },
+                info.default_iv_size,
+                info.default_kid.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+            );
+            *state.init_info.lock().unwrap() = Some(info);
+            Ok(())
+        }
+        Ok(None) => {
+            // Dump top-level box types so we can diagnose alternate encryption layouts.
+            let top_boxes: Vec<String> = fmp4::boxes(&data)
+                .map(|b| String::from_utf8_lossy(&b.fourcc).into_owned())
+                .collect();
+            tracing::warn!("DRM proxy: init segment no tenc — top boxes: {:?} (data len={})", top_boxes, data.len());
+            if let Some(moov) = fmp4::find_box(&data, b"moov") {
+                let moov_children: Vec<String> = fmp4::boxes(moov.payload)
+                    .map(|b| String::from_utf8_lossy(&b.fourcc).into_owned())
+                    .collect();
+                tracing::warn!("DRM proxy: moov children: {:?}", moov_children);
+            }
+            bail!("init segment has no tenc box")
+        }
+        Err(e) => Err(e).context("init segment parse"),
+    }
 }
