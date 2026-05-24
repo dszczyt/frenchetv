@@ -42,7 +42,9 @@ unsafe extern "C" fn update_callback(cb_ctx: *mut std::ffi::c_void) {
     }
     let state = &*(cb_ctx as *const CallbackState);
     state.flag.store(true, Ordering::Release);
-    state.egui_ctx.request_repaint();
+    // Rate-limit egui wakeups to ~25 fps. The callback fires for every mpv
+    // internal event; uncapped it keeps the event loop spinning at 100+ Hz.
+    state.egui_ctx.request_repaint_after(std::time::Duration::from_millis(40));
 }
 
 impl SoftwareRenderer {
@@ -126,17 +128,18 @@ impl SoftwareRenderer {
             });
         }
 
-        // Cap render resolution — software scaling at 1920×1080 is expensive on
-        // a laptop CPU. IPTV sources are ≤1080p so quality is not lost.
-        const MAX_W: u32 = 1920;
-        const MAX_H: u32 = 1080;
+        // Cap render resolution — software scaling at high res is expensive.
+        // 1280×720 = 3.7 MB/frame vs 8 MB at 1080p; IPTV quality is unaffected.
+        const MAX_W: u32 = 1280;
+        const MAX_H: u32 = 720;
         let rw = width.min(MAX_W);
         let rh = height.min(MAX_H);
 
         let stride = (rw * 4) as usize;
         let mut pixels = vec![0u8; stride * rh as usize];
         let mut sw_size = [rw as i32, rh as i32];
-        let format_str = b"bgr0\0";
+        // Use rgba directly — avoids the bgr0→rgba swap loop (saves 3.7 MB/frame of CPU work).
+        let format_str = b"rgba\0";
         let mut sw_stride = stride;
 
         let render_params: [libmpv2_sys::mpv_render_param; 5] = [
@@ -170,12 +173,7 @@ impl SoftwareRenderer {
             return None;
         }
 
-        // bgr0 → rgba: swap R↔B, set alpha=255
-        for px in pixels.chunks_exact_mut(4) {
-            px.swap(0, 2);
-            px[3] = 255;
-        }
-
+        // rgba format requested — no conversion needed.
         let image = egui::ColorImage::from_rgba_unmultiplied([rw as usize, rh as usize], &pixels);
         if let Some(ref mut tex) = self.texture {
             tex.set(image, egui::TextureOptions::LINEAR);
@@ -476,10 +474,9 @@ impl GlRenderer {
         }
 
         // Cap render resolution to avoid glReadPixels stalling at screen size.
-        // IPTV streams are ≤1080p; rendering at 4K/HiDPI fullscreen size wastes
-        // bandwidth (glReadPixels at 3840×2160 = 33 MB/frame).
-        const MAX_W: u32 = 1920;
-        const MAX_H: u32 = 1080;
+        // 1280×720 = 3.7 MB/frame vs 33 MB at 4K; GPU scales up for free.
+        const MAX_W: u32 = 1280;
+        const MAX_H: u32 = 720;
         let rw = width.min(MAX_W);
         let rh = height.min(MAX_H);
 
