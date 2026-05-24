@@ -182,9 +182,9 @@ impl SoftwareRenderer {
                 Some(ctx.load_texture("mpv_frame_sw", image, egui::TextureOptions::LINEAR));
         }
 
-        // Return display size so egui GPU-scales the texture to fill the panel.
+        // Return render dimensions — egui uses this for maintain_aspect_ratio.
         self.texture.as_ref().map(|t| {
-            egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
+            egui::load::SizedTexture::new(t.id(), egui::vec2(rw as f32, rh as f32))
         })
     }
 }
@@ -574,9 +574,9 @@ impl GlRenderer {
                 Some(ctx.load_texture("mpv_frame_gl", image, egui::TextureOptions::LINEAR));
         }
 
-        // Return display size so egui GPU-scales the texture to fill the panel.
+        // Return render dimensions — egui uses this for maintain_aspect_ratio.
         self.texture.as_ref().map(|t| {
-            egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
+            egui::load::SizedTexture::new(t.id(), egui::vec2(rw as f32, rh as f32))
         })
     }
 }
