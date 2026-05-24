@@ -309,7 +309,11 @@ class CdmHostImpl : public cdm::Host_10 {
             cbs_->on_initialized(cbs_->ctx, success);
     }
 
-    void OnResolveKeyStatusPromise(uint32_t, cdm::KeyStatus) override {}
+    void OnResolveKeyStatusPromise(uint32_t promise_id, cdm::KeyStatus status) override {
+        fprintf(stderr, "[CDM] OnResolveKeyStatusPromise(promise=%u, status=%u)\n",
+                promise_id, static_cast<unsigned>(status));
+        fflush(stderr);
+    }
 
     void OnResolveNewSessionPromise(uint32_t promise_id,
                                     const char* session_id,
@@ -346,14 +350,34 @@ class CdmHostImpl : public cdm::Host_10 {
                              const cdm::KeyInformation* keys_info,
                              uint32_t keys_info_count) override;  // defined after CdmState
 
-    void OnExpirationChange(const char*, uint32_t, double) override {}
-    void OnSessionClosed(const char*, uint32_t) override {}
-    void SendPlatformChallenge(const char*, uint32_t, const char*, uint32_t) override {}
-    void EnableOutputProtection(uint32_t) override {}
+    void OnExpirationChange(const char*, uint32_t, double expiry) override {
+        fprintf(stderr, "[CDM] OnExpirationChange(expiry=%f)\n", expiry);
+        fflush(stderr);
+    }
+    void OnSessionClosed(const char*, uint32_t) override {
+        fprintf(stderr, "[CDM] OnSessionClosed\n");
+        fflush(stderr);
+    }
+    void SendPlatformChallenge(const char*, uint32_t, const char*, uint32_t) override {
+        fprintf(stderr, "[CDM] SendPlatformChallenge (no-op)\n");
+        fflush(stderr);
+    }
+    void EnableOutputProtection(uint32_t protection_mask) override {
+        fprintf(stderr, "[CDM] EnableOutputProtection(mask=0x%x)\n", protection_mask);
+        fflush(stderr);
+    }
     void QueryOutputProtectionStatus() override;  // defined after CdmState (needs complete type)
-    void OnDeferredInitializationDone(uint32_t, cdm::Status /*s*/) override {}
-    cdm::FileIO* CreateFileIO(cdm::FileIOClient*) override { return nullptr; }
-    void RequestStorageId(uint32_t) override {}
+    void OnDeferredInitializationDone(uint32_t stream_type, cdm::Status decode_status) override {
+        fprintf(stderr, "[CDM] OnDeferredInitializationDone(stream=%u, status=%u)\n",
+                stream_type, static_cast<unsigned>(decode_status));
+        fflush(stderr);
+    }
+    cdm::FileIO* CreateFileIO(cdm::FileIOClient*) override {
+        fprintf(stderr, "[CDM] CreateFileIO (returning nullptr)\n");
+        fflush(stderr);
+        return nullptr;
+    }
+    void RequestStorageId(uint32_t version) override;  // defined after CdmState
 
  private:
     CdmCallbacks* cbs_;
@@ -375,6 +399,9 @@ struct CdmState {
     bool                               output_protection_query_pending = false;
     // Contexts registered via SetTimer(); fired by fire_pending_timers() outside CDM call stack.
     std::vector<void*>                 pending_timer_contexts;
+    // Set by RequestStorageId(); cleared by answer_storage_id().
+    bool                               storage_id_requested = false;
+    uint32_t                           storage_id_version = 0;
 };
 
 // Respond to a pending QueryOutputProtectionStatus request.
@@ -406,6 +433,27 @@ static void fire_pending_timers(CdmState* state) {
     }
     // Timers may have triggered an OPS query — answer it now (outside CDM call stack).
     answer_ops_query(state);
+}
+
+// Respond to a pending RequestStorageId() call with an empty storage ID.
+// MUST be called outside any CDM call stack to avoid re-entrancy.
+static void answer_storage_id(CdmState* state) {
+    if (!state || !state->storage_id_requested || !state->cdm) return;
+    uint32_t version = state->storage_id_version;
+    state->storage_id_requested = false;
+    fprintf(stderr, "[CDM] answer_storage_id: OnStorageId(version=%u, empty)\n", version);
+    fflush(stderr);
+    state->cdm->OnStorageId(version, nullptr, 0);
+}
+
+// Out-of-line definition of RequestStorageId (needs complete CdmState type).
+void CdmHostImpl::RequestStorageId(uint32_t version) {
+    fprintf(stderr, "[CDM] RequestStorageId(version=%u) — deferring response\n", version);
+    fflush(stderr);
+    if (state_) {
+        state_->storage_id_requested = true;
+        state_->storage_id_version   = version;
+    }
 }
 
 // Out-of-line definition of SetTimer (needs complete CdmState type).
@@ -514,7 +562,8 @@ void cdm_initialize(CdmState* state) {
     state->cdm->Initialize(/*allow_distinctive_identifier=*/true,
                            /*allow_persistent_state=*/false,
                            /*use_hw_secure_codecs=*/false);
-    // Fire any timers and answer OPS queries deferred during Initialize().
+    // Respond to any deferred callbacks from Initialize().
+    answer_storage_id(state);
     fire_pending_timers(state);
     answer_ops_query(state);
 }
@@ -540,7 +589,8 @@ void cdm_update_session(CdmState* state, uint32_t promise_id,
     state->cdm->UpdateSession(promise_id,
                                session_id, session_id_len,
                                response, response_len);
-    // Fire any timers and answer OPS queries deferred during UpdateSession().
+    // Respond to any deferred callbacks from UpdateSession().
+    answer_storage_id(state);
     fire_pending_timers(state);
     answer_ops_query(state);
 }
@@ -569,9 +619,14 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
 
     cdm::Status status = cdm::Status::kDecryptError;
     for (int attempt = 0; attempt < 2; ++attempt) {
-        // Fire any deferred timers and answer pending OPS queries before calling Decrypt.
+        // Respond to any deferred callbacks, then call Decrypt.
+        answer_storage_id(state);
         fire_pending_timers(state);
         answer_ops_query(state);
+
+        fprintf(stderr, "[CDM] Decrypt(attempt=%d, data=%u, subsamples=%u)\n",
+                attempt + 1, inp->data_size, inp->num_subsamples);
+        fflush(stderr);
 
         cdm::SimpleDecryptedBlock block;
         status = state->cdm->Decrypt(buf, &block);
@@ -583,6 +638,9 @@ CdmDecryptOutput cdm_decrypt(CdmState* state, const CdmDecryptInput* inp) {
             if (out.data) {
                 memcpy(out.data, b->Data(), out.data_size);
                 out.status = 0;
+                fprintf(stderr, "[CDM] Decrypt SUCCESS (attempt=%d, out=%u bytes)\n",
+                        attempt + 1, out.data_size);
+                fflush(stderr);
             } else {
                 out.status = static_cast<int>(cdm::Status::kDecryptError);
             }
