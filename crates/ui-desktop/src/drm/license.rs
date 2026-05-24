@@ -59,9 +59,11 @@ pub fn extract_pssh_from_mpd(mpd_text: &str) -> Option<Vec<u8>> {
                 let kid_str = &after[..end];
                 if let Some(kid) = parse_uuid_to_bytes(kid_str) {
                     let pssh = build_pssh_from_kid(&kid);
-                    tracing::debug!(
-                        "widevine: PSSH v0+WidevineCencHeader built from default_KID {} ({} bytes)",
-                        kid_str, pssh.len()
+                    tracing::info!(
+                        "widevine: PSSH built from default_KID {} → kid_bytes={} ({} bytes)",
+                        kid_str,
+                        kid.iter().map(|b| format!("{:02x}", b)).collect::<String>(),
+                        pssh.len()
                     );
                     return Some(pssh);
                 }
@@ -137,6 +139,67 @@ pub fn build_pssh_from_kid(kid: &[u8; 16]) -> Vec<u8> {
     out.extend_from_slice(&(data.len() as u32).to_be_bytes()); // data_size
     out.extend_from_slice(&data);                           // WidevineCencHeader
     out
+}
+
+/// Decode a full PSSH box and log every KID it carries at INFO level.
+///
+/// Handles both PSSH v0 (KID in WidevineCencHeader proto, field 2) and
+/// v1 (explicit KID list in the box header).  No-ops silently if the box
+/// is too short or malformed.
+fn log_pssh_kids(pssh: &[u8]) {
+    // Minimum: size(4)+fourcc(4)+version(1)+flags(3)+SystemID(16)+data_size(4) = 32 bytes.
+    if pssh.len() < 32 {
+        tracing::info!("widevine: license PSSH {} bytes (too short to decode KID)", pssh.len());
+        return;
+    }
+    let version = pssh[8];
+    if version == 1 {
+        // v1: kid_count(4) at offset 28, then KIDs.
+        let kid_count = u32::from_be_bytes([pssh[28], pssh[29], pssh[30], pssh[31]]) as usize;
+        tracing::info!("widevine: license PSSH v1, {} KID(s)", kid_count);
+        for i in 0..kid_count {
+            let start = 32 + i * 16;
+            if start + 16 <= pssh.len() {
+                tracing::info!(
+                    "widevine: license PSSH v1 KID[{}]: {}",
+                    i,
+                    pssh[start..start + 16].iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                );
+            }
+        }
+    } else {
+        // v0: data_size(4) at offset 28, then WidevineCencHeader protobuf.
+        let data_size = u32::from_be_bytes([pssh[28], pssh[29], pssh[30], pssh[31]]) as usize;
+        tracing::info!("widevine: license PSSH v0, proto {} bytes", data_size);
+        if pssh.len() >= 32 + data_size {
+            let proto = &pssh[32..32 + data_size];
+            // Minimal protobuf scan: field 2 (key_id), wire type 2 (LEN), length 16.
+            let mut pos = 0usize;
+            while pos < proto.len() {
+                let tag = proto[pos]; pos += 1;
+                let wire = tag & 0x07;
+                let field = (tag >> 3) as u32;
+                match wire {
+                    0 => { // varint — skip
+                        while pos < proto.len() && proto[pos] & 0x80 != 0 { pos += 1; }
+                        if pos < proto.len() { pos += 1; }
+                    }
+                    2 => { // LEN
+                        if pos >= proto.len() { break; }
+                        let len = proto[pos] as usize; pos += 1;
+                        if field == 2 && len == 16 && pos + 16 <= proto.len() {
+                            tracing::info!(
+                                "widevine: license PSSH v0 key_id: {}",
+                                proto[pos..pos + 16].iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                            );
+                        }
+                        if pos + len <= proto.len() { pos += len; } else { break; }
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
 }
 
 /// POST the Widevine challenge to the license server and return the raw license response.
@@ -238,6 +301,15 @@ pub async fn acquire_license(
     la_url: &str,
     license_headers: &[(String, String)],
 ) -> Result<String> {
+    // Decode PSSH box to log the KID(s) it carries, for comparison with the
+    // decrypt KID logged by the proxy.
+    //
+    // Full PSSH box layout:
+    //   size(4) + "pssh"(4) + version(1) + flags(3) + SystemID(16) = 32 bytes header
+    //   v1: kid_count(4) + KID[0..N] (16 bytes each)
+    //   v0: data_size(4) + WidevineCencHeader protobuf (field 2 = key_id, 16 bytes)
+    log_pssh_kids(pssh);
+
     // Step 1: generate challenge (synchronous CDM call).
     let (session_id, challenge) = {
         let mut h = cdm.lock().unwrap();

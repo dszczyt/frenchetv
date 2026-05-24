@@ -264,6 +264,14 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
             Err(e) => tracing::warn!("DRM proxy: init segment parse failed: {:#}", e),
         }
         let plain_init = fmp4::strip_encryption_from_init(&data);
+        // Diagnostic: verify encv→avc1 transform and avcC presence.
+        let has_encv = fmp4::find_box_in_init(&plain_init, b"encv").is_some();
+        let has_avc1 = fmp4::find_box_in_init(&plain_init, b"avc1").is_some();
+        let has_avcc = fmp4::find_box_in_init(&plain_init, b"avcC").is_some();
+        tracing::info!(
+            "DRM proxy: init stripped ({} → {} bytes) encv={} avc1={} avcC={}",
+            data.len(), plain_init.len(), has_encv, has_avc1, has_avcc
+        );
         return Ok(plain_init);
     }
 

@@ -312,7 +312,7 @@ impl App {
     /// 5. Send `DrmProxyReady` so the player can start mpv against the proxy URL.
     fn start_drm_proxy(&self, stream: StreamUrl) {
         use crate::drm::cdm::CdmHandle;
-        use crate::drm::{license, proxy};
+        use crate::drm::{license, proxy, fmp4};
 
         let tx  = self.tx.clone();
         let ctx = self.egui_ctx.clone();
@@ -410,28 +410,51 @@ impl App {
             );
             tracing::debug!("widevine: MPD text =\n{}", &mpd_text[..mpd_text.len().min(4000)]);
 
-            // ── Diagnostic: probe init segment directly from app (same client/headers) ──
-            // This tells us whether CDN access to init segment is EVER possible from
-            // our code, before any proxy involvement.
-            if let Some(probe_url) = probe_init_segment_url(&mpd_text, &final_mpd_url) {
-                tracing::info!("DRM probe: testing init segment directly: {}", &probe_url[..probe_url.len().min(150)]);
-                let mut probe_req = cdn_client.get(&probe_url);
+            // ── Fetch init segment: extract Widevine PSSH for license exchange ──
+            // The init segment's moov/pssh (authored by Orange) contains the full
+            // WidevineCencHeader with provider/content_id fields that the license
+            // server requires to return the correct content key.  Our hand-built PSSH
+            // (from cenc:default_KID only) causes the server to return a key under a
+            // different ID, producing CDM NoKey errors.
+            let init_pssh: Option<Vec<u8>> = if let Some(probe_url) = probe_init_segment_url(&mpd_text, &final_mpd_url) {
+                tracing::info!("DRM: fetching init segment for Widevine PSSH: {}", &probe_url[..probe_url.len().min(150)]);
+                let mut req = cdn_client.get(&probe_url);
                 for (k, v) in &stream.headers {
-                    probe_req = probe_req.header(k.as_str(), v.as_str());
+                    req = req.header(k.as_str(), v.as_str());
                 }
-                match probe_req.send().await {
-                    Ok(r) => tracing::info!("DRM probe: init segment → HTTP {}", r.status()),
-                    Err(e) => tracing::warn!("DRM probe: init segment → error: {}", e),
+                match req.send().await {
+                    Ok(r) if r.status().is_success() => {
+                        match r.bytes().await {
+                            Ok(bytes) => {
+                                let pssh = fmp4::extract_widevine_pssh(&bytes);
+                                tracing::info!(
+                                    "DRM: init segment {} bytes, Widevine PSSH: {}",
+                                    bytes.len(),
+                                    pssh.as_ref().map(|p| format!("{} bytes", p.len())).unwrap_or_else(|| "not found".into())
+                                );
+                                pssh
+                            }
+                            Err(e) => { tracing::warn!("DRM: init segment body error: {}", e); None }
+                        }
+                    }
+                    Ok(r) => { tracing::warn!("DRM: init segment → HTTP {} (no PSSH)", r.status()); None }
+                    Err(e) => { tracing::warn!("DRM: init segment fetch error: {}", e); None }
                 }
-            }
+            } else {
+                tracing::warn!("DRM: cannot derive init segment URL from MPD");
+                None
+            };
 
-            let pssh = if let Some(p) = protection.pssh.as_ref() {
+            // PSSH priority: (1) init segment moov/pssh, (2) operator-provided, (3) MPD-derived.
+            let pssh = if let Some(p) = init_pssh {
+                p
+            } else if let Some(p) = protection.pssh.as_ref() {
                 p.clone()
             } else {
                 match license::extract_pssh_from_mpd(&mpd_text) {
                     Some(p) => p,
                     None => {
-                        let _ = tx.send(AsyncMsg::DrmProxyErr("PSSH not found in MPD".into()));
+                        let _ = tx.send(AsyncMsg::DrmProxyErr("PSSH not found in init segment or MPD".into()));
                         ctx.request_repaint();
                         return;
                     }

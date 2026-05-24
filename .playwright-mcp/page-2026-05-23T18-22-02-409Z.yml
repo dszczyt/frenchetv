@@ -1,0 +1,51 @@
+- generic [ref=e3]:
+  - region "Lecteur vidéo Orange" [ref=e211]:
+    - generic [ref=e225]:
+      - generic [ref=e227]:
+        - button "Retour, fermer le lecteur vidéo" [ref=e229] [cursor=pointer]:
+          - generic [ref=e230]: Retour
+          - generic [ref=e231]: 
+        - generic [ref=e232]:
+          - generic [ref=e234]:
+            - button "Couper le son (m)" [ref=e236] [cursor=pointer]:
+              - generic [ref=e238]: 
+            - generic:
+              - slider "Volume": "100"
+          - button "Mode mini (v)" [ref=e299] [cursor=pointer]:
+            - generic [ref=e301]: 
+          - button "Plein écran (f)" [ref=e240] [cursor=pointer]:
+            - generic [ref=e242]: 
+      - generic [ref=e245]:
+        - button "Chaîne suivante" [ref=e246] [cursor=pointer]:
+          - generic [ref=e247]: 
+        - button "Liste des chaînes (l)" [ref=e249] [cursor=pointer]:
+          - generic [ref=e251]: 
+        - button "Chaîne précédente" [ref=e252] [cursor=pointer]:
+          - generic [ref=e253]: 
+      - generic [ref=e254]:
+        - generic [ref=e255]:
+          - generic [ref=e256]:
+            - generic [ref=e259]: 2. FRANCE 2
+            - generic [ref=e260]:
+              - generic [ref=e262]: Cérémonie de palmarès du Festival de Cannes
+              - generic [ref=e265]: Evénement, 55min, France, 2026
+          - heading "Chaine 2, FRANCE 2, Cérémonie de palmarès du Festival de Cannes, Cérémonie de palmarès du Festival de Cannes, Evénement, 55min, France, 2026, version française (VF), sous-titrage pour sourds et malentendants" [level=1] [ref=e269]
+        - generic [ref=e270]:
+          - slider "Barre de lecture" [ref=e271] [cursor=pointer]: "12.2726422728914"
+          - generic [ref=e272]:
+            - paragraph [ref=e273]: 20:15
+            - paragraph [ref=e274]: 21:10
+        - generic [ref=e275]:
+          - generic [ref=e276]:
+            - button "Pause" [ref=e278] [cursor=pointer]:
+              - generic [ref=e280]: 
+            - button "Retour au début (p)" [ref=e282] [cursor=pointer]:
+              - generic [ref=e284]: 
+            - button "Retour au direct (n)" [disabled] [ref=e286]:
+              - generic [ref=e288]: 
+          - generic [ref=e289]:
+            - button "Informations (i)" [ref=e291] [cursor=pointer]:
+              - generic [ref=e293]: 
+            - button "Langues et sous-titres (c)" [ref=e295] [cursor=pointer]:
+              - generic [ref=e297]: 
+  - contentinfo

@@ -49,7 +49,7 @@ impl<'a> Iterator for BoxIter<'a> {
         } else {
             (8, size32)
         };
-        if start + total_size > self.data.len() {
+        if total_size < header_size || start + total_size > self.data.len() {
             return None;
         }
         let payload = &self.data[start + header_size..start + total_size];
@@ -61,6 +61,23 @@ impl<'a> Iterator for BoxIter<'a> {
 /// Find the first child box with `fourcc` inside `container_payload`.
 pub fn find_box<'a>(container: &'a [u8], fourcc: &[u8; 4]) -> Option<BoxRef<'a>> {
     boxes(container).find(|b| &b.fourcc == fourcc)
+}
+
+/// Recursively search for a box fourcc within known container boxes (DFS).
+/// Only descends into container fourcc types to avoid treating leaf payloads
+/// (avcC, tkhd, mvhd, …) as box streams.  Used for diagnostics only.
+pub fn find_box_in_init<'a>(data: &'a [u8], fourcc: &[u8; 4]) -> Option<BoxRef<'a>> {
+    const CONTAINERS: &[[u8; 4]] = &[
+        *b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd",
+        *b"sinf", *b"schi", *b"encv", *b"enca", *b"avc1", *b"mp4a",
+    ];
+    for b in boxes(data) {
+        if &b.fourcc == fourcc { return Some(b); }
+        if CONTAINERS.contains(&b.fourcc) {
+            if let Some(found) = find_box_in_init(b.payload, fourcc) { return Some(found); }
+        }
+    }
+    None
 }
 
 /// Recursively find a box by path (e.g. `["moov","trak","mdia"]`).
