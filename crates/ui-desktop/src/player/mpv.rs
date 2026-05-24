@@ -73,6 +73,10 @@ impl MpvPlayer {
             cmd.arg(format!("--cdm-store={}", crate::widevine::dir().display()));
         }
 
+        // Give lavf 500 ms to probe codec parameters (pixel format from SPS).
+        // Default is 0 for live streams which leaves pixel format "unspecified".
+        cmd.arg("--demuxer-lavf-analyzeduration=1");
+
         cmd.arg(url);
         match cmd.spawn() {
             Ok(child) => self.handle = Some(child),

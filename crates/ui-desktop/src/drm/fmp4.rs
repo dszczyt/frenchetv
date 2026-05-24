@@ -241,124 +241,127 @@ fn parse_tenc(payload: &[u8], encryption_scheme: u32) -> Result<InitInfo> {
 
 /// Rewrite an init segment: replace `encv`/`enca` sample entries with their
 /// plain codec equivalents (e.g., `avc1`/`mp4a`) by stripping the `sinf` box
-/// and relabelling the box type.
+/// and relabelling the box type.  Also removes `pssh` boxes from `moov`.
 ///
-/// Returns a rewritten copy.  If no `encv`/`enca` is found, returns a clone.
+/// This is required so that ffmpeg/mpv can read codec parameters (pixel format,
+/// SPS/PPS) from the unencrypted H.264/AAC bitstream after the proxy has
+/// pre-decrypted all media segments.
+///
+/// Returns a rebuilt copy.  Falls back to a raw clone if `moov` is not found.
 pub fn strip_encryption_from_init(data: &[u8]) -> Vec<u8> {
-    let mut out = data.to_vec();
-    strip_enc_boxes_in_place(&mut out);
+    let mut out = Vec::with_capacity(data.len());
+    for b in boxes(data) {
+        if &b.fourcc == b"moov" {
+            let inner = strip_enc_moov(b.payload);
+            push_iso_box(&mut out, b"moov", &inner);
+        } else {
+            out.extend_from_slice(&data[b.offset..b.offset + b.total_size]);
+        }
+    }
     out
 }
 
-fn strip_enc_boxes_in_place(buf: &mut Vec<u8>) {
-    // Walk boxes, looking for encv/enca inside stsd.
-    // This is a two-pass operation: collect patches, then apply.
-    let patches = collect_enc_patches(buf);
-    // Apply patches in reverse order (so offsets stay valid).
-    let mut patched = buf.clone();
-    let mut removes: Vec<(usize, usize)> = Vec::new(); // (start, end) of sinf boxes to remove
-    let mut renames: Vec<(usize, [u8; 4])> = Vec::new(); // (offset, new_fourcc)
-    for (enc_offset, _enc_payload_start, orig_codec, sinf_offset, sinf_size) in patches {
-        // Rename encv/enca box to original codec (from sinf/frma).
-        renames.push((enc_offset + 4, orig_codec));
-        // Mark sinf box for removal.
-        removes.push((sinf_offset, sinf_offset + sinf_size));
-    }
-    // Apply: remove sinf boxes (in reverse order to preserve offsets).
-    removes.sort_by(|a, b| b.0.cmp(&a.0));
-    for (start, end) in removes {
-        patched.drain(start..end);
-    }
-    // Apply renames (offsets may have shifted; recalculate).
-    // Simpler: just scan for encv/enca again and rename them.
-    rename_enc_boxes(&mut patched);
-    *buf = patched;
-}
-
-fn collect_enc_patches(data: &[u8]) -> Vec<(usize, usize, [u8; 4], usize, usize)> {
-    let mut results = Vec::new();
-    // Find moov→trak→mdia→minf→stbl→stsd→encv/enca
-    let moov_off = find_box_offset(data, b"moov");
-    if moov_off.is_none() { return results; }
-    let (m_start, m_end) = moov_off.unwrap();
-    let moov_payload = &data[m_start + 8..m_end];
-    for trak_b in boxes(moov_payload).filter(|b| &b.fourcc == b"trak") {
-        let trak_abs = m_start + 8 + trak_b.offset;
-        collect_enc_in_trak(data, trak_abs, trak_abs + 8, trak_b.payload, &mut results);
-    }
-    results
-}
-
-fn collect_enc_in_trak(
-    _root: &[u8],
-    _trak_abs: usize,
-    trak_payload_abs: usize,
-    trak_payload: &[u8],
-    results: &mut Vec<(usize, usize, [u8; 4], usize, usize)>,
-) {
-    let stsd_payload_abs;
-    let stsd_payload;
-    // Navigate mdia → minf → stbl → stsd
-    macro_rules! dig {
-        ($container:expr, $container_abs:expr, $name:literal) => {{
-            let b = match find_box($container, $name) { Some(b) => b, None => return };
-            let abs = $container_abs + b.offset;
-            (abs + 8, b.payload)
-        }};
-    }
-    let (mdia_pay_abs, mdia_pay) = dig!(trak_payload, trak_payload_abs, b"mdia");
-    let (minf_pay_abs, minf_pay) = dig!(mdia_pay, mdia_pay_abs, b"minf");
-    let (stbl_pay_abs, stbl_pay) = dig!(minf_pay, minf_pay_abs, b"stbl");
-    let (s_pay_abs, s_pay)       = dig!(stbl_pay, stbl_pay_abs, b"stsd");
-    stsd_payload_abs = s_pay_abs + 8; // skip version+flags+entry_count
-    stsd_payload = if s_pay.len() >= 8 { &s_pay[8..] } else { return };
-
-    for enc_type in [b"encv", b"enca"] {
-        if let Some(enc_b) = find_box(stsd_payload, enc_type) {
-            let enc_abs = stsd_payload_abs + enc_b.offset;
-            let enc_pay_abs = enc_abs + 8;
-            // Find sinf inside enc
-            if let Some(sinf_b) = find_box(enc_b.payload, b"sinf") {
-                let sinf_abs = enc_pay_abs + sinf_b.offset;
-                // Find frma inside sinf to get original codec fourcc
-                let orig_codec = find_box(sinf_b.payload, b"frma")
-                    .filter(|b| b.payload.len() >= 4)
-                    .map(|b| b.payload[0..4].try_into().unwrap_or(*b"avc1"))
-                    .unwrap_or(*b"avc1");
-                results.push((enc_abs, enc_pay_abs, orig_codec, sinf_abs, sinf_b.total_size));
+/// Rebuild `moov` payload: strip `pssh`, recurse into each `trak`.
+fn strip_enc_moov(payload: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(payload.len());
+    for b in boxes(payload) {
+        match &b.fourcc {
+            b"pssh" => {}  // remove all pssh boxes
+            b"trak" => {
+                // Path: trak → mdia → minf → stbl → stsd
+                let inner = strip_enc_path(b.payload,
+                    &[b"mdia", b"minf", b"stbl", b"stsd"]);
+                push_iso_box(&mut out, b"trak", &inner);
             }
+            _ => out.extend_from_slice(&payload[b.offset..b.offset + b.total_size]),
         }
     }
+    out
 }
 
-fn find_box_offset(data: &[u8], fourcc: &[u8; 4]) -> Option<(usize, usize)> {
-    for b in boxes(data) {
-        if &b.fourcc == fourcc {
-            return Some((b.offset, b.offset + b.total_size));
-        }
-    }
-    None
-}
-
-fn rename_enc_boxes(data: &mut Vec<u8>) {
-    let buf = data.clone();
-    for b in boxes(&buf) {
-        if &b.fourcc == b"encv" || &b.fourcc == b"enca" {
-            // Find frma in payload to get original codec
-            let orig: [u8; 4] = if let Some(sinf) = find_box(b.payload, b"sinf") {
-                find_box(sinf.payload, b"frma")
-                    .filter(|b| b.payload.len() >= 4)
-                    .map(|b| b.payload[0..4].try_into().unwrap_or(*b"avc1"))
-                    .unwrap_or(*b"avc1")
+/// Walk a chain of container boxes, passing unrelated boxes through verbatim,
+/// and recursing into the named containers.  The last name in `chain` is `stsd`.
+fn strip_enc_path(payload: &[u8], chain: &[&[u8; 4]]) -> Vec<u8> {
+    if chain.is_empty() { return payload.to_vec(); }
+    let target = chain[0];
+    let rest   = &chain[1..];
+    let mut out = Vec::with_capacity(payload.len());
+    for b in boxes(payload) {
+        if &b.fourcc == target {
+            let inner = if rest.is_empty() {
+                strip_enc_stsd(b.payload)       // reached stsd
             } else {
-                *b"avc1"
+                strip_enc_path(b.payload, rest) // keep descending
             };
-            // Rename: overwrite fourcc in the output buffer
-            if b.offset + 8 <= data.len() {
-                data[b.offset + 4..b.offset + 8].copy_from_slice(&orig);
-            }
+            push_iso_box(&mut out, target, &inner);
+        } else {
+            out.extend_from_slice(&payload[b.offset..b.offset + b.total_size]);
         }
     }
+    out
+}
+
+/// Rebuild `stsd` payload: convert `encv`/`enca` entries to plain codec form.
+fn strip_enc_stsd(payload: &[u8]) -> Vec<u8> {
+    // stsd: version(1)+flags(3)+entry_count(4) = 8-byte prefix before entries.
+    if payload.len() < 8 { return payload.to_vec(); }
+    let mut out = payload[..8].to_vec();
+    let entries = &payload[8..];
+    for entry in boxes(entries) {
+        let raw = &entries[entry.offset..entry.offset + entry.total_size];
+        if &entry.fourcc == b"encv" || &entry.fourcc == b"enca" {
+            let is_visual = &entry.fourcc == b"encv";
+            match unprotect_sample_entry(entry.payload, is_visual) {
+                Some(plain) => out.extend_from_slice(&plain),
+                None        => out.extend_from_slice(raw), // fallback: keep as-is
+            }
+        } else {
+            out.extend_from_slice(raw);
+        }
+    }
+    out
+}
+
+/// Convert an `encv` or `enca` payload to its unprotected plain-codec form.
+///
+/// * Reads the original codec type from `sinf/frma`.
+/// * Rebuilds the box with the original fourcc and without the `sinf` child.
+/// * Returns full box bytes (8-byte header + fixed fields + child boxes) or `None`.
+///
+/// Fixed-field sizes (after the 8-byte box header, before child boxes):
+///   `encv` VisualSampleEntry  — 78 bytes
+///   `enca` AudioSampleEntry   — 28 bytes
+fn unprotect_sample_entry(payload: &[u8], is_visual: bool) -> Option<Vec<u8>> {
+    let fixed = if is_visual { 78usize } else { 28usize };
+    if payload.len() < fixed { return None; }
+
+    let sinf = find_box(payload, b"sinf")?;
+    let frma = find_box(sinf.payload, b"frma")?;
+    if frma.payload.len() < 4 { return None; }
+    let orig_type: [u8; 4] = frma.payload[..4].try_into().ok()?;
+
+    // Collect child boxes, skipping sinf.
+    let mut children = Vec::new();
+    for child in boxes(&payload[fixed..]) {
+        if &child.fourcc != b"sinf" {
+            let raw = &payload[fixed..][child.offset..child.offset + child.total_size];
+            children.extend_from_slice(raw);
+        }
+    }
+
+    let total = 8 + fixed + children.len();
+    let mut out = Vec::with_capacity(total);
+    out.extend_from_slice(&(total as u32).to_be_bytes());
+    out.extend_from_slice(&orig_type);
+    out.extend_from_slice(&payload[..fixed]);
+    out.extend_from_slice(&children);
+    Some(out)
+}
+
+fn push_iso_box(out: &mut Vec<u8>, fourcc: &[u8; 4], payload: &[u8]) {
+    out.extend_from_slice(&((8 + payload.len()) as u32).to_be_bytes());
+    out.extend_from_slice(fourcc);
+    out.extend_from_slice(payload);
 }
 
 // ─── Media-segment parsing ────────────────────────────────────────────────────
