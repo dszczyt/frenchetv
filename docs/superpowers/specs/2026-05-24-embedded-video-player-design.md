@@ -11,18 +11,20 @@ Replace the subprocess `MpvPlayer` (which opens video in a separate window) with
 
 ### `LibMpvPlayer`
 
-Owns an embedded `libmpv2::Mpv` handle and an `ActiveRenderer`. Public API mirrors `MpvPlayer`:
+Owns an embedded `libmpv2::Mpv` handle and an `ActiveRenderer`. The renderer is selected **once at construction time** by probing the environment — not at `play()` time. Public API mirrors `MpvPlayer`:
 
 ```rust
 pub struct LibMpvPlayer {
     mpv: Arc<libmpv2::Mpv>,
-    renderer: Option<ActiveRenderer>,
+    renderer: ActiveRenderer,   // selected at new(), never changes
     has_cdm_support: bool,
 }
 
 impl LibMpvPlayer {
-    pub fn new() -> Self;
-    pub fn play(&mut self, url: &str, auth_header: Option<&str>, extra_headers: &[(String, String)], egui_ctx: egui::Context);
+    /// Probes GL availability at construction. Selects best renderer and logs the result.
+    /// `force_software`: if true, skips GL probe and always uses software renderer.
+    pub fn new(force_software: bool) -> Self;
+    pub fn play(&mut self, url: &str, auth_header: Option<&str>, extra_headers: &[(String, String)]);
     pub fn stop(&mut self);
     pub fn render_frame(&mut self, ctx: &egui::Context, size: (u32, u32)) -> Option<egui::TextureHandle>;
     pub fn is_playing(&mut self) -> bool;
@@ -31,9 +33,11 @@ impl LibMpvPlayer {
 
 `render_frame()` is new — called every egui frame from `PlayerScreen::show()`. Returns the current video frame as a texture, or `None` if no frame is ready yet.
 
+Note: `egui::Context` is no longer a `play()` parameter — it is captured once during `new()` and stored for the mpv update callback.
+
 ### `ActiveRenderer`
 
-Enum selecting the render backend at runtime:
+Enum holding the selected render backend:
 
 ```rust
 enum ActiveRenderer {
@@ -42,7 +46,14 @@ enum ActiveRenderer {
 }
 ```
 
-`ActiveRenderer::create(mpv, egui_ctx)` tries `GlRenderer::try_new()` first. On any error, logs a warning and falls back to `SoftwareRenderer::new()`. The choice is invisible to the caller.
+`ActiveRenderer::probe(mpv, egui_ctx, force_software)` is called from `LibMpvPlayer::new()`:
+
+1. If `force_software` → construct `SoftwareRenderer`, log `"renderer: software (forced)"`.
+2. Otherwise attempt `GlRenderer::try_new(mpv, egui_ctx)`.
+3. On success → log `"renderer: OpenGL (EGL)"`.
+4. On failure → log `"renderer: software (GL unavailable: <reason>)"`, construct `SoftwareRenderer`.
+
+The decision is made once, before any stream is opened. Subsequent `play()` calls reuse the same renderer instance without re-probing.
 
 ### Render Backends
 
@@ -87,7 +98,7 @@ CDM support detection: probe `mpv --list-options | grep cdm-store` at startup, s
 3. If `None`: keep the existing spinner (reuse the `Loading` state render path).
 4. Info overlay (channel name, key hints) and keyboard handling are unchanged.
 
-`PlayerScreen::new()` gains a reference to `egui::Context` for the update callback wakeup.
+`PlayerScreen::new()` passes `egui::Context` to `LibMpvPlayer::new()` so the update callback is wired at construction. `play()` no longer needs it.
 
 ## File Changes
 
