@@ -369,6 +369,68 @@ fn cdn_path_to_url(cdn_path: &str) -> Result<String> {
     }
 }
 
+// ─── MPD bandwidth filter ─────────────────────────────────────────────────────
+
+/// Extract the numeric value of `bandwidth="N"` from an opening tag string.
+fn bandwidth_attr(opening_tag: &str) -> Option<u64> {
+    let key = "bandwidth=\"";
+    let start = opening_tag.find(key)?;
+    let after = &opening_tag[start + key.len()..];
+    let end = after.find('"')?;
+    after[..end].parse().ok()
+}
+
+/// Remove every `<Representation>` block (or self-closing `<Representation .../>`)
+/// whose `bandwidth` attribute exceeds `max_bps`.
+fn filter_high_bitrate_representations(mpd: &str, max_bps: u64) -> String {
+    const OPEN: &str = "<Representation";
+    const CLOSE: &str = "</Representation>";
+
+    let mut out = String::with_capacity(mpd.len());
+    let mut rest = mpd;
+
+    while let Some(pos) = rest.find(OPEN) {
+        // Everything before this tag passes through unchanged.
+        out.push_str(&rest[..pos]);
+        let chunk = &rest[pos..];
+
+        // Find the end of the opening tag (first `>`).
+        let tag_end = match chunk.find('>') {
+            Some(p) => p,
+            None => {
+                // Malformed XML — pass through verbatim.
+                out.push_str(chunk);
+                return out;
+            }
+        };
+
+        let opening = &chunk[..tag_end + 1];
+        let bw = bandwidth_attr(opening).unwrap_or(0);
+
+        if bw > max_bps {
+            // Drop this representation entirely.
+            if opening.ends_with("/>") {
+                // Self-closing tag.
+                rest = &rest[pos + tag_end + 1..];
+            } else if let Some(close_pos) = chunk.find(CLOSE) {
+                rest = &rest[pos + close_pos + CLOSE.len()..];
+            } else {
+                // No closing tag found — pass through to avoid data loss.
+                out.push_str(chunk);
+                return out;
+            }
+            tracing::debug!("MPD filter: dropped Representation bandwidth={}", bw);
+        } else {
+            // Keep this representation — emit the opening tag and advance past it.
+            out.push_str(opening);
+            rest = &rest[pos + tag_end + 1..];
+        }
+    }
+
+    out.push_str(rest);
+    out
+}
+
 // ─── MPD rewriting ────────────────────────────────────────────────────────────
 
 /// Rewrite a DASH MPD text so that:
@@ -397,7 +459,13 @@ fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> String {
     let mpd_abs = resolve_relative_base_urls(&mpd_no_drm, mpd_base_url);
 
     // Step 3: Rewrite all https://... and http://... CDN URLs through the proxy.
-    rewrite_cdn_urls(&mpd_abs, &proxy_base, mpd_base_url)
+    let mpd_rewritten = rewrite_cdn_urls(&mpd_abs, &proxy_base, mpd_base_url);
+
+    // Step 4: Strip high-bitrate video representations that the CDN cannot
+    // deliver within one segment duration (~1.15 s for Orange live DASH).
+    // Segments > ~1.5 Mbps arrive in 1–6 s, causing mpv to stall and loop
+    // through its decoded buffer.  Force mpv to the lower-bitrate track.
+    filter_high_bitrate_representations(&mpd_rewritten, 1_500_000)
 }
 
 /// Resolve all relative `<BaseURL>` element contents against the MPD's own URL.
