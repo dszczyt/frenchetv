@@ -784,13 +784,12 @@ impl LibMpvPlayer {
         // replays buffered audio to catch up — exactly the "looping" symptom.
         let _ = self.mpv.set_property("cache-pause", "no");
 
-        // Decouple audio and video clocks.
-        // CDN segment delivery is slow regardless of bitrate (server-side
-        // processing, SCTE-35 markers, etc).  Without desync, mpv A/V sync
-        // correction seeks audio backward when video stalls — the "1 s back"
-        // loop symptom.  With desync, audio plays continuously; video shows
-        // last decoded frame during stalls.
-        let _ = self.mpv.set_property("video-sync", "desync");
+        // video-sync=audio (default): video is synced to the audio clock, not
+        // the other way around.  Audio never gets adjusted or seeked backward.
+        // Stalls show the last decoded video frame while audio continues.
+        // desync was previously used but caused burst-then-freeze frame delivery
+        // (irregular pacing) which looked laggy.  Ring-buffer audio underruns
+        // are handled by audio-buffer=2.5 s instead.
 
         // Output silence when the audio output buffer runs dry instead of letting
         // PulseAudio/ALSA replay whatever is in the hardware ring buffer.
