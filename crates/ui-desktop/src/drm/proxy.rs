@@ -466,7 +466,9 @@ fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> String {
     // can pick the 2.1 Mbps track (likely higher frame rate than 1.4 Mbps).
     // If 2.1 Mbps is also slow, logs will show slow-segment warnings for
     // ctv-video=2137600 and we can lower this threshold further.
-    filter_high_bitrate_representations(&mpd_rewritten, 2_000_000)
+    // 2137600 > 2_000_000 so the previous threshold accidentally kept filtering
+    // the 2.1 Mbps track.  2_200_000 allows 2137600 through and only drops 3225200.
+    filter_high_bitrate_representations(&mpd_rewritten, 2_200_000)
 }
 
 /// Resolve all relative `<BaseURL>` element contents against the MPD's own URL.
