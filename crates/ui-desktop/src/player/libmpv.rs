@@ -783,10 +783,13 @@ impl LibMpvPlayer {
         // replays buffered audio to catch up — exactly the "looping" symptom.
         let _ = self.mpv.set_property("cache-pause", "no");
 
-        // Sync video to the audio clock rather than the other way around.
-        // Prevents mpv from adjusting (or briefly seeking) the audio track to
-        // correct A/V drift caused by DRM proxy processing jitter.
-        let _ = self.mpv.set_property("video-sync", "audio");
+        // Fully decouple audio and video clocks.
+        // Video segments (3+ Mbps) take 1-6 s on the CDN; when video falls far
+        // behind, mpv's A/V sync correction seeks audio backward to match video
+        // position — the "1 second back" symptom the user hears.
+        // With video-sync=desync, audio plays continuously and video displays
+        // whatever frame last arrived (may freeze briefly, but audio is stable).
+        let _ = self.mpv.set_property("video-sync", "desync");
 
         // Output silence when the audio output buffer runs dry instead of letting
         // PulseAudio/ALSA replay whatever is in the hardware ring buffer.
