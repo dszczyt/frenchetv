@@ -763,19 +763,19 @@ impl LibMpvPlayer {
         // during codec probing then "rewind" — replaying that 1 s from its buffer,
         // producing the backward-replay loop symptom.
 
-        // Audio: extend the output ring buffer so a brief demuxer stall doesn't
-        // wrap the buffer and cause the "repeating loop" symptom.  Default is
-        // 0.2 s; 3 s spans several DASH segments worth of decoded audio.
-        let _ = self.mpv.set_property("audio-buffer", "3.0");
+        // Audio buffer: default 0.2 s is fine now that the MPD bitrate filter
+        // keeps only representations whose segments arrive well within one
+        // segment duration.  A large buffer caused multi-second startup delay.
+        let _ = self.mpv.set_property("audio-buffer", "0.2");
 
         // Cache: enable the demuxer read-ahead cache and let mpv use its default
         // size (150 MiB forward).  Do NOT set demuxer-max-bytes here — any value
         // lower than the default would reduce the buffer and make stalls more likely.
         let _ = self.mpv.set_property("cache", "yes");
 
-        // Read ahead 10 seconds of segments — enough that CDN fetch latency spikes
-        // don't drain the playback pipeline before the next segment arrives.
-        let _ = self.mpv.set_property("demuxer-readahead-secs", 10.0f64);
+        // 3 seconds of read-ahead is enough to absorb normal CDN jitter on the
+        // low-bitrate representations (≤ 1.5 Mbps) selected by the MPD filter.
+        let _ = self.mpv.set_property("demuxer-readahead-secs", 3.0f64);
 
         // Do NOT use cache-pause for live streams: when mpv pauses at the CDN live
         // edge and then unpauses, it seeks forward to the new live edge.  On DASH
@@ -783,18 +783,14 @@ impl LibMpvPlayer {
         // replays buffered audio to catch up — exactly the "looping" symptom.
         let _ = self.mpv.set_property("cache-pause", "no");
 
-        // Fully decouple audio and video clocks.
-        // Video segments (3+ Mbps) take 1-6 s on the CDN; when video falls far
-        // behind, mpv's A/V sync correction seeks audio backward to match video
-        // position — the "1 second back" symptom the user hears.
-        // With video-sync=desync, audio plays continuously and video displays
-        // whatever frame last arrived (may freeze briefly, but audio is stable).
-        let _ = self.mpv.set_property("video-sync", "desync");
+        // video-sync=audio (default): sync video to the audio clock.
+        // Previously we used video-sync=desync to prevent A/V sync correction
+        // from seeking audio backward when 3+ Mbps video segments stalled 1-6 s.
+        // The MPD bitrate filter eliminates those stalls, so we can use normal
+        // A/V sync again — desync broke frame pacing and caused choppy playback.
 
         // Output silence when the audio output buffer runs dry instead of letting
         // PulseAudio/ALSA replay whatever is in the hardware ring buffer.
-        // Without this, a brief demuxer stall causes the hardware to wrap around
-        // in its ~1-second ring buffer and replay old audio — the "looping" symptom.
         let _ = self.mpv.set_property("audio-stream-silence", "yes");
 
         // Prevent any looping that might have been inherited from user config.
