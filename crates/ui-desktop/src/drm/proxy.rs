@@ -461,11 +461,12 @@ fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> String {
     // Step 3: Rewrite all https://... and http://... CDN URLs through the proxy.
     let mpd_rewritten = rewrite_cdn_urls(&mpd_abs, &proxy_base, mpd_base_url);
 
-    // Step 4: Strip high-bitrate video representations that the CDN cannot
-    // deliver within one segment duration (~1.15 s for Orange live DASH).
-    // Segments > ~1.5 Mbps arrive in 1–6 s, causing mpv to stall and loop
-    // through its decoded buffer.  Force mpv to the lower-bitrate track.
-    filter_high_bitrate_representations(&mpd_rewritten, 1_500_000)
+    // Step 4: Strip the highest-bitrate video representation (3.2 Mbps) which
+    // arrives in 1–6 s per segment on the CDN.  Allow up to 2.0 Mbps so mpv
+    // can pick the 2.1 Mbps track (likely higher frame rate than 1.4 Mbps).
+    // If 2.1 Mbps is also slow, logs will show slow-segment warnings for
+    // ctv-video=2137600 and we can lower this threshold further.
+    filter_high_bitrate_representations(&mpd_rewritten, 2_000_000)
 }
 
 /// Resolve all relative `<BaseURL>` element contents against the MPD's own URL.

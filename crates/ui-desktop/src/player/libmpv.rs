@@ -763,10 +763,11 @@ impl LibMpvPlayer {
         // during codec probing then "rewind" — replaying that 1 s from its buffer,
         // producing the backward-replay loop symptom.
 
-        // Audio buffer: default 0.2 s is fine now that the MPD bitrate filter
-        // keeps only representations whose segments arrive well within one
-        // segment duration.  A large buffer caused multi-second startup delay.
-        let _ = self.mpv.set_property("audio-buffer", "0.2");
+        // Audio buffer: 1.5 s spans ~1 DASH segment's worth of decoded audio.
+        // Default 0.2 s is too small — any brief demuxer stall > 0.2 s drains
+        // the output ring buffer, which wraps and replays ~1 s of old audio.
+        // 3.0 s caused multi-second startup delay; 1.5 s is a safe middle ground.
+        let _ = self.mpv.set_property("audio-buffer", "1.5");
 
         // Cache: enable the demuxer read-ahead cache and let mpv use its default
         // size (150 MiB forward).  Do NOT set demuxer-max-bytes here — any value
