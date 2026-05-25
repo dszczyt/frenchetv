@@ -758,7 +758,10 @@ impl LibMpvPlayer {
         // Live DASH: force software decode — hardware decoders (vaapi/vdpau)
         // refuse to init when pixel_format is "none" during DASH probing.
         let _ = self.mpv.set_property("hwdec", "no");
-        let _ = self.mpv.set_property("demuxer-lavf-analyzeduration", 1i64);
+        // Do NOT set demuxer-lavf-analyzeduration: the default (0 for live streams)
+        // is correct. Setting it to 1 caused lavf to read 1 s of live DASH audio
+        // during codec probing then "rewind" — replaying that 1 s from its buffer,
+        // producing the backward-replay loop symptom.
 
         // Audio: extend the output ring buffer so a brief demuxer stall doesn't
         // wrap the buffer and cause the "repeating loop" symptom.  Default is
