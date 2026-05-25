@@ -419,7 +419,7 @@ fn filter_high_bitrate_representations(mpd: &str, max_bps: u64) -> String {
                 out.push_str(chunk);
                 return out;
             }
-            tracing::debug!("MPD filter: dropped Representation bandwidth={}", bw);
+            tracing::warn!("MPD filter: dropped Representation bandwidth={}", bw);
         } else {
             // Keep this representation — emit the opening tag and advance past it.
             out.push_str(opening);
