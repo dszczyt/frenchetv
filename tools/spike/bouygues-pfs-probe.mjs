@@ -14,7 +14,7 @@ const captured = [];
 
 // Capture Kaltura, the bt-api-int gateway, AND bouyguestelecom.fr (the host that
 // exchanges the OAuth/Keycloak token for the entitled Kaltura KS).
-const HOSTS = /kaltura\.com|bt-api-int\.bouyguestelecom\.fr|(^|\/\/)([a-z0-9.-]*\.)?bouyguestelecom\.fr/;
+const HOSTS = /kaltura\.com|bouyguestelecom\.fr|bouyguesbox\.fr|pfs|iptv/;
 
 page.on('requestfinished', async (req) => {
   const url = req.url();
@@ -22,7 +22,10 @@ page.on('requestfinished', async (req) => {
   const res = await req.response();
   let body = null;
   try { body = await res.text(); } catch {}
-  const hasKs = body ? /"ks"\s*:\s*"[^"]{20,}"|djJ8/.test(body) : false;
+  let resHeaders = {};
+  try { resHeaders = await res.allHeaders(); } catch {}
+  const hay = (body || '') + ' ' + JSON.stringify(resHeaders);
+  const hasKs = /"ks"\s*:\s*"[^"]{20,}"|djJ8|[Kk]altura.?[Ss]ession/.test(hay);
   captured.push({
     url,
     method: req.method(),
@@ -30,6 +33,7 @@ page.on('requestfinished', async (req) => {
     reqBody: req.postData(),
     status: res.status(),
     hasKs,                          // flags the response that mints/echoes a KS
+    resHeaders,
     resBody: body && body.length < 5_000_000 ? body : `<${body?.length} bytes>`,
   });
   writeFileSync(new URL('capture.json', OUT), JSON.stringify(captured, null, 2));
