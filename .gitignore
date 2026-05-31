@@ -12,3 +12,6 @@ Cargo.lock
 !assets/*.png
 !crates/ui-android/android/app/src/main/res/**/*.png
 *.txt
+
+# Bouygues PFS spike capture output (never commit secrets)
+/tools/spike/out/
