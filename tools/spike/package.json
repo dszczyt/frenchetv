@@ -1,0 +1,8 @@
+{
+  "name": "bouygues-pfs-spike",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "playwright": "^1.60.0"
+  }
+}

@@ -15,3 +15,5 @@ Cargo.lock
 
 # Bouygues PFS spike capture output (never commit secrets)
 /tools/spike/out/
+/tools/spike/node_modules/
+/tools/spike/package-lock.json
