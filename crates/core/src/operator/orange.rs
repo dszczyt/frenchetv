@@ -2,12 +2,12 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use tracing::warn;
 
-use crate::channel::{Channel, ChannelCategory, StreamTemplate};
+use super::traits::{AuthPhase, Operator, Result};
 use crate::channel::m3u::parse_m3u;
+use crate::channel::{Channel, ChannelCategory, StreamTemplate};
 use crate::epg::EpgData;
 use crate::error::OperatorError;
 use crate::stream::{ProtectionData, StreamUrl};
-use super::traits::{AuthPhase, Operator, Result};
 
 /// Fallback M3U shipped with the binary.
 const FALLBACK_M3U: &str = include_str!("../../../../assets/channels/orange.m3u");
@@ -20,57 +20,100 @@ fn category_from_name(name: &str) -> ChannelCategory {
     let n = name.to_lowercase();
 
     // ── Info / News ──────────────────────────────────────────────────────────
-    if n == "bfm tv" || n.starts_with("bfm ") || n == "cnews" || n == "lci"
-        || n == "france info" || n.starts_with("france 24") || n == "euronews"
-        || n.contains("météo") || n.contains("meteo") || n == "i24news"
+    if n == "bfm tv"
+        || n.starts_with("bfm ")
+        || n == "cnews"
+        || n == "lci"
+        || n == "france info"
+        || n.starts_with("france 24")
+        || n == "euronews"
+        || n.contains("météo")
+        || n.contains("meteo")
+        || n == "i24news"
         || n == "bfm business"
     {
         return ChannelCategory::News;
     }
 
     // ── Sport ────────────────────────────────────────────────────────────────
-    if n.starts_with("bein sports") || n.starts_with("beinsports")
-        || n.starts_with("canal+ sport") || n.starts_with("eurosport")
-        || n == "l'équipe" || n == "l'equipe" || n.starts_with("rmc sport")
-        || n == "infosport+" || n == "l'équipe 21"
+    if n.starts_with("bein sports")
+        || n.starts_with("beinsports")
+        || n.starts_with("canal+ sport")
+        || n.starts_with("eurosport")
+        || n == "l'équipe"
+        || n == "l'equipe"
+        || n.starts_with("rmc sport")
+        || n == "infosport+"
+        || n == "l'équipe 21"
     {
         return ChannelCategory::Sports;
     }
 
     // ── Kids ─────────────────────────────────────────────────────────────────
-    if n == "gulli" || n.starts_with("disney") || n == "boomerang"
-        || n == "cartoon network" || n.starts_with("nickelodeon") || n == "tiji"
-        || n == "piwi+" || n == "canal j" || n == "j-one" || n == "mangas"
-        || n == "game one" || n == "boing"
+    if n == "gulli"
+        || n.starts_with("disney")
+        || n == "boomerang"
+        || n == "cartoon network"
+        || n.starts_with("nickelodeon")
+        || n == "tiji"
+        || n == "piwi+"
+        || n == "canal j"
+        || n == "j-one"
+        || n == "mangas"
+        || n == "game one"
+        || n == "boing"
     {
         return ChannelCategory::Kids;
     }
 
     // ── Documentary ──────────────────────────────────────────────────────────
-    if n.starts_with("planète") || n.starts_with("planete")
-        || n.starts_with("national geo") || n.starts_with("discovery")
-        || n == "rmc découverte" || n == "rmc decouverte"
-        || n.contains("histoire") || n.contains("science") || n == "animaux"
-        || n == "ushuaïa tv" || n == "ushuaia tv" || n == "toute l'histoire"
-        || n == "crime district" || n == "trek"
+    if n.starts_with("planète")
+        || n.starts_with("planete")
+        || n.starts_with("national geo")
+        || n.starts_with("discovery")
+        || n == "rmc découverte"
+        || n == "rmc decouverte"
+        || n.contains("histoire")
+        || n.contains("science")
+        || n == "animaux"
+        || n == "ushuaïa tv"
+        || n == "ushuaia tv"
+        || n == "toute l'histoire"
+        || n == "crime district"
+        || n == "trek"
     {
         return ChannelCategory::Documentary;
     }
 
     // ── Music ────────────────────────────────────────────────────────────────
-    if n == "mtv" || n == "mcm" || n == "mcm top" || n == "m6 music"
-        || n.starts_with("trace ") || n == "melody" || n == "rfm tv"
-        || n.starts_with("nrj hits") || n == "stingray"
+    if n == "mtv"
+        || n == "mcm"
+        || n == "mcm top"
+        || n == "m6 music"
+        || n.starts_with("trace ")
+        || n == "melody"
+        || n == "rfm tv"
+        || n.starts_with("nrj hits")
+        || n == "stingray"
     {
         return ChannelCategory::Music;
     }
 
     // ── Entertainment ────────────────────────────────────────────────────────
-    if n == "nrj 12" || n == "chérie 25" || n == "cherie 25"
-        || n.contains("paris première") || n.contains("paris premiere")
-        || n.starts_with("comédie") || n.starts_with("comedie")
-        || n == "ab1" || n.contains("virgin tonic") || n == "tv breizh"
-        || n == "polar+" || n == "action" || n == "serie club" || n == "club rtl"
+    if n == "nrj 12"
+        || n == "chérie 25"
+        || n == "cherie 25"
+        || n.contains("paris première")
+        || n.contains("paris premiere")
+        || n.starts_with("comédie")
+        || n.starts_with("comedie")
+        || n == "ab1"
+        || n.contains("virgin tonic")
+        || n == "tv breizh"
+        || n == "polar+"
+        || n == "action"
+        || n == "serie club"
+        || n == "club rtl"
     {
         return ChannelCategory::Entertainment;
     }
@@ -78,9 +121,23 @@ fn category_from_name(name: &str) -> ChannelCategory {
     // ── Generalist ───────────────────────────────────────────────────────────
     if matches!(
         n.as_str(),
-        "tf1" | "france 2" | "france 3" | "france 4" | "france 5" | "m6"
-            | "w9" | "tmc" | "tfx" | "tf1 séries films" | "tf1 series films"
-            | "6ter" | "c8" | "cstar" | "arte" | "france ô" | "france o"
+        "tf1"
+            | "france 2"
+            | "france 3"
+            | "france 4"
+            | "france 5"
+            | "m6"
+            | "w9"
+            | "tmc"
+            | "tfx"
+            | "tf1 séries films"
+            | "tf1 series films"
+            | "6ter"
+            | "c8"
+            | "cstar"
+            | "arte"
+            | "france ô"
+            | "france o"
     ) {
         return ChannelCategory::Generalist;
     }
@@ -203,18 +260,21 @@ impl OrangeOperator {
         }
 
         let html = resp.text().await?;
-        let token = Self::extract_tv_token(&html)
-            .ok_or_else(|| OperatorError::AuthFailed("tv_token not found in homepage HTML".into()))?;
+        let token = Self::extract_tv_token(&html).ok_or_else(|| {
+            OperatorError::AuthFailed("tv_token not found in homepage HTML".into())
+        })?;
 
         tracing::info!("Orange: tv_token extracted (len={})", token.len());
         self.tv_token = Some(token);
-        self.tv_token_expires = Some(
-            std::time::Instant::now() + std::time::Duration::from_secs(25 * 60),
-        );
+        self.tv_token_expires =
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(25 * 60));
 
         // Orange slides session expiry on use — persist the refreshed token.
         if let Some(w) = refreshed_wassup {
-            tracing::debug!("Orange: wassup refreshed in ensure_tv_token (len={})", w.len());
+            tracing::debug!(
+                "Orange: wassup refreshed in ensure_tv_token (len={})",
+                w.len()
+            );
             self.wassup = Some(w);
         }
 
@@ -248,10 +308,7 @@ impl OrangeOperator {
     }
 
     /// Attach the XSRF token header if we have one.
-    fn with_xsrf<'a>(
-        &self,
-        builder: reqwest::RequestBuilder,
-    ) -> reqwest::RequestBuilder {
+    fn with_xsrf<'a>(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.xsrf_token {
             Some(tok) => builder.header("X-XSRF-TOKEN", tok.clone()),
             None => builder,
@@ -354,9 +411,15 @@ impl Operator for OrangeOperator {
             .send()
             .await
         {
-            if let Some(c) = r.cookies().find(|c| c.name().eq_ignore_ascii_case("xsrf-token")) {
+            if let Some(c) = r
+                .cookies()
+                .find(|c| c.name().eq_ignore_ascii_case("xsrf-token"))
+            {
                 self.xsrf_token = Some(c.value().to_string());
-                tracing::debug!("Orange: XSRF captured from step 0 (len={})", c.value().len());
+                tracing::debug!(
+                    "Orange: XSRF captured from step 0 (len={})",
+                    c.value().len()
+                );
             }
         }
 
@@ -371,7 +434,10 @@ impl Operator for OrangeOperator {
         let resp = self.with_xsrf(builder).send().await?;
 
         // Update XSRF-TOKEN if the server rotated it.
-        if let Some(c) = resp.cookies().find(|c| c.name().eq_ignore_ascii_case("xsrf-token")) {
+        if let Some(c) = resp
+            .cookies()
+            .find(|c| c.name().eq_ignore_ascii_case("xsrf-token"))
+        {
             self.xsrf_token = Some(c.value().to_string());
             tracing::debug!("Orange: XSRF updated from step 1 (len={})", c.value().len());
         }
@@ -389,7 +455,10 @@ impl Operator for OrangeOperator {
 
         let body1: serde_json::Value =
             serde_json::from_str(&body1_text).unwrap_or(serde_json::Value::Null);
-        let access_next = body1.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+        let access_next = body1
+            .get("nextStep")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(none)");
         tracing::info!("Orange /api/access nextStep={:?}", access_next);
 
         match access_next {
@@ -460,7 +529,10 @@ impl Operator for OrangeOperator {
 
         let body2: serde_json::Value =
             serde_json::from_str(&body2_text).unwrap_or(serde_json::Value::Null);
-        let next_step = body2.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+        let next_step = body2
+            .get("nextStep")
+            .and_then(|v| v.as_str())
+            .unwrap_or("(none)");
         tracing::info!("Orange /api/login nextStep={:?}", next_step);
 
         match next_step {
@@ -477,7 +549,7 @@ impl Operator for OrangeOperator {
     }
 
     /// Phase 2a: submit password, extract wassup cookie, fetch tv_token.
-    async fn complete_auth_password(&mut self, password: &str) -> Result<()> {
+    async fn complete_auth_password(&mut self, password: &str) -> Result<AuthPhase> {
         let login_base = self.login_base.clone();
         let referer = format!("{}/", login_base);
 
@@ -517,8 +589,14 @@ impl Operator for OrangeOperator {
                 tracing::debug!("Orange /api/password no wassup: {:.300}", body3_text);
                 let body3: serde_json::Value =
                     serde_json::from_str(&body3_text).unwrap_or(serde_json::Value::Null);
-                let next = body3.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
-                tracing::info!("Orange /api/password nextStep={:?} (no wassup cookie)", next);
+                let next = body3
+                    .get("nextStep")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("(none)");
+                tracing::info!(
+                    "Orange /api/password nextStep={:?} (no wassup cookie)",
+                    next
+                );
                 if next == "feedback" {
                     return Err(OperatorError::AuthFailed(format!(
                         "password rejected: {}",
@@ -533,7 +611,8 @@ impl Operator for OrangeOperator {
             }
         }
 
-        self.ensure_tv_token().await
+        self.ensure_tv_token().await?;
+        Ok(AuthPhase::Done)
     }
 
     /// Phase 2b: poll until Orange signals push approval, then fetch tv_token.
@@ -542,7 +621,7 @@ impl Operator for OrangeOperator {
     ///   `pollingABA` → `pollAuthentAOM()` → `GET ${apiURL}/aom`
     /// where apiURL = '/api' (VITE_IDME_FRONT_API_URL runtime config).
     /// Legacy push variant falls back to `POST /api/push`.
-    async fn wait_for_push_auth(&mut self, password: &str) -> Result<()> {
+    async fn wait_for_push_auth(&mut self, password: &str) -> Result<AuthPhase> {
         use std::time::Duration;
 
         const POLL_INTERVAL: Duration = Duration::from_secs(3);
@@ -557,24 +636,33 @@ impl Operator for OrangeOperator {
         } else {
             format!("{}/api/push", login_base)
         };
-        tracing::info!("Orange: polling {} ({})", poll_url, if is_aom { "GET" } else { "POST" });
+        tracing::info!(
+            "Orange: polling {} ({})",
+            poll_url,
+            if is_aom { "GET" } else { "POST" }
+        );
 
         for attempt in 0..MAX_ATTEMPTS {
             tokio::time::sleep(POLL_INTERVAL).await;
 
             // AOM flow: GET /api/aom (no body).  Legacy: POST /api/push with {}.
             let resp = if is_aom {
-                let b = self.client
+                let b = self
+                    .client
                     .get(&poll_url)
                     .header("Origin", &login_base)
                     .header("Referer", &referer)
                     .header("Accept", "application/json, text/plain, */*");
                 match self.with_xsrf(b).send().await {
                     Ok(r) => r,
-                    Err(e) => { tracing::warn!("aom poll {}: {}", attempt + 1, e); continue; }
+                    Err(e) => {
+                        tracing::warn!("aom poll {}: {}", attempt + 1, e);
+                        continue;
+                    }
                 }
             } else {
-                let b = self.client
+                let b = self
+                    .client
                     .post(&poll_url)
                     .header("Origin", &login_base)
                     .header("Referer", &referer)
@@ -582,7 +670,10 @@ impl Operator for OrangeOperator {
                     .json(&serde_json::json!({}));
                 match self.with_xsrf(b).send().await {
                     Ok(r) => r,
-                    Err(e) => { tracing::warn!("push poll {}: {}", attempt + 1, e); continue; }
+                    Err(e) => {
+                        tracing::warn!("push poll {}: {}", attempt + 1, e);
+                        continue;
+                    }
                 }
             };
 
@@ -600,7 +691,10 @@ impl Operator for OrangeOperator {
 
             let body: serde_json::Value =
                 serde_json::from_str(&body_text).unwrap_or(serde_json::Value::Null);
-            let next_step = body.get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+            let next_step = body
+                .get("nextStep")
+                .and_then(|v| v.as_str())
+                .unwrap_or("(none)");
             tracing::info!("poll {}: nextStep={:?}", attempt + 1, next_step);
             if next_step != "authnByApp" && next_step != "pollingABA" {
                 tracing::debug!("poll {}: FULL BODY = {}", attempt + 1, body_text);
@@ -610,17 +704,28 @@ impl Operator for OrangeOperator {
                 // Authentication complete — cookie may arrive here or already be in jar.
                 "end" | "final" => {
                     if let Some(ref w) = wassup {
-                        tracing::info!("Orange: wassup cookie received in {:?} response (len={})", next_step, w.len());
+                        tracing::info!(
+                            "Orange: wassup cookie received in {:?} response (len={})",
+                            next_step,
+                            w.len()
+                        );
                         self.wassup = Some(w.clone());
                     } else {
-                        tracing::info!("Orange: no wassup in {:?} response — relying on cookie_store", next_step);
+                        tracing::info!(
+                            "Orange: no wassup in {:?} response — relying on cookie_store",
+                            next_step
+                        );
                     }
-                    tracing::info!("Orange: AOM approved (nextStep={:?}); fetching tv_token", next_step);
-                    return self.ensure_tv_token().await;
+                    tracing::info!(
+                        "Orange: AOM approved (nextStep={:?}); fetching tv_token",
+                        next_step
+                    );
+                    return self.ensure_tv_token().await.map(|()| AuthPhase::Done);
                 }
                 "feedback" => {
                     return Err(OperatorError::AuthFailed(format!(
-                        "push auth rejected: {}", body_text
+                        "push auth rejected: {}",
+                        body_text
                     )));
                 }
                 "redirect" => {
@@ -629,7 +734,8 @@ impl Operator for OrangeOperator {
                         .and_then(|v| v.as_str())
                         .unwrap_or("(unknown)");
                     return Err(OperatorError::AuthFailed(format!(
-                        "AOM auth redirect to error page: {}", location
+                        "AOM auth redirect to error page: {}",
+                        location
                     )));
                 }
                 "remoteAccounts" => {
@@ -651,7 +757,8 @@ impl Operator for OrangeOperator {
                     let login_val = first.get("login").and_then(|v| v.as_str()).unwrap_or("");
                     tracing::info!("Orange: selecting account {:?}", login_val);
 
-                    let b = self.client
+                    let b = self
+                        .client
                         .post(format!("{}/api/login", login_base))
                         .header("Origin", &login_base)
                         .header("Referer", &referer)
@@ -659,7 +766,10 @@ impl Operator for OrangeOperator {
                         .json(first);
                     let login_resp = match self.with_xsrf(b).send().await {
                         Ok(r) => r,
-                        Err(e) => { tracing::warn!("Orange /api/login: {}", e); continue; }
+                        Err(e) => {
+                            tracing::warn!("Orange /api/login: {}", e);
+                            continue;
+                        }
                     };
 
                     let login_status = login_resp.status();
@@ -669,14 +779,19 @@ impl Operator for OrangeOperator {
                     let login_json: serde_json::Value =
                         serde_json::from_str(&login_body).unwrap_or_default();
                     let login_next = login_json
-                        .get("nextStep").and_then(|v| v.as_str()).unwrap_or("(none)");
+                        .get("nextStep")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("(none)");
 
                     match login_next {
                         "password" => return self.complete_auth_password(password).await,
-                        "end"      => return self.ensure_tv_token().await,
-                        "feedback" => return Err(OperatorError::AuthFailed(format!(
-                            "account selection rejected: {}", login_body
-                        ))),
+                        "end" => return self.ensure_tv_token().await.map(|()| AuthPhase::Done),
+                        "feedback" => {
+                            return Err(OperatorError::AuthFailed(format!(
+                                "account selection rejected: {}",
+                                login_body
+                            )))
+                        }
                         "authnByApp" if !self.trigger_aba_sent => {
                             // Server wants another AOM trigger after account selection.
                             tracing::info!("Orange: re-triggering AOM push after remoteAccounts");
@@ -684,7 +799,10 @@ impl Operator for OrangeOperator {
                             self.trigger_aba_sent = true;
                         }
                         _ => {
-                            tracing::warn!("Orange /api/login unexpected nextStep={:?}", login_next);
+                            tracing::warn!(
+                                "Orange /api/login unexpected nextStep={:?}",
+                                login_next
+                            );
                         }
                     }
                 }
@@ -704,10 +822,11 @@ impl Operator for OrangeOperator {
     /// If the account requires push, returns `AuthFailed` — use the phased methods.
     async fn authenticate(&mut self, username: &str, password: &str) -> Result<()> {
         match self.begin_auth(username).await? {
-            AuthPhase::Password => self.complete_auth_password(password).await,
-            AuthPhase::Push => Err(OperatorError::AuthFailed(
-                "account requires mobile push auth; use the phased auth flow".into(),
+            AuthPhase::Password => self.complete_auth_password(password).await.map(|_| ()),
+            AuthPhase::Push | AuthPhase::Otp => Err(OperatorError::AuthFailed(
+                "account requires out-of-band auth; use the phased auth flow".into(),
             )),
+            AuthPhase::Done => Ok(()),
         }
     }
 
@@ -719,7 +838,8 @@ impl Operator for OrangeOperator {
                 return Ok(parse_m3u(FALLBACK_M3U));
             }
         };
-        let mut req = self.client
+        let mut req = self
+            .client
             .get(&self.channels_url)
             .header("tv_token", format!("Bearer {}", tv_token))
             .timeout(std::time::Duration::from_secs(5));
@@ -737,35 +857,41 @@ impl Operator for OrangeOperator {
                         return Ok(parse_m3u(FALLBACK_M3U));
                     }
                 };
-                let channels_raw: Vec<OrangeChannel> = match serde_json::from_str::<OrangeChannelList>(&body_text) {
-                    Ok(wrapper) => wrapper.channels,
-                    Err(e) => {
-                        warn!("Orange: channel list parse error: {} — body: {:.300}", e, body_text);
-                        return Ok(parse_m3u(FALLBACK_M3U));
-                    }
-                };
+                let channels_raw: Vec<OrangeChannel> =
+                    match serde_json::from_str::<OrangeChannelList>(&body_text) {
+                        Ok(wrapper) => wrapper.channels,
+                        Err(e) => {
+                            warn!(
+                                "Orange: channel list parse error: {} — body: {:.300}",
+                                e, body_text
+                            );
+                            return Ok(parse_m3u(FALLBACK_M3U));
+                        }
+                    };
 
-                let placeholder = url::Url::parse(PLACEHOLDER_URL)
-                    .expect("placeholder URL is valid");
+                let placeholder =
+                    url::Url::parse(PLACEHOLDER_URL).expect("placeholder URL is valid");
 
                 let channels: Vec<Channel> = channels_raw
                     .into_iter()
                     .map(|c| {
                         // Prefer the web TV horizontal logo; fall back to square variant.
                         // Mobile variants use relative paths — skip those.
-                        let logo_url = ["webTVLogo", "webTVSquare"]
-                            .iter()
-                            .find_map(|&def| {
-                                c.logos.iter()
-                                    .find(|l| l.definition_type == def)
-                                    .and_then(|l| l.list_logos.first())
-                                    .map(|item| item.path.clone())
-                                    .filter(|p| p.starts_with("http"))
-                            });
+                        let logo_url = ["webTVLogo", "webTVSquare"].iter().find_map(|&def| {
+                            c.logos
+                                .iter()
+                                .find(|l| l.definition_type == def)
+                                .and_then(|l| l.list_logos.first())
+                                .map(|item| item.path.clone())
+                                .filter(|p| p.starts_with("http"))
+                        });
                         let locked = !c.allowed_device_categories.is_empty()
                             && !c.allowed_device_categories.iter().any(|s| s == "W_PC");
                         // Prefer liveTargetURLRelativePath → techChannelId → idEPG.
-                        let stream_id = c.technical_channels.live.first()
+                        let stream_id = c
+                            .technical_channels
+                            .live
+                            .first()
                             .map(|tc| {
                                 if !tc.live_target_url_relative_path.is_empty() {
                                     tc.live_target_url_relative_path.clone()
@@ -790,19 +916,26 @@ impl Operator for OrangeOperator {
                 let locked_count = channels.iter().filter(|c| c.locked).count();
                 tracing::info!(
                     "Orange: {} channels, {} with logo, {} locked",
-                    channels.len(), with_logo, locked_count
+                    channels.len(),
+                    with_logo,
+                    locked_count
                 );
                 if let Some(ch) = channels.iter().find(|c| c.logo_url.is_some()) {
                     tracing::debug!("Orange: sample logo_url = {:?}", ch.logo_url);
                 }
                 Ok(channels)
             }
-            Ok(r) if r.status() == reqwest::StatusCode::UNAUTHORIZED
-                   || r.status() == reqwest::StatusCode::FORBIDDEN => {
+            Ok(r)
+                if r.status() == reqwest::StatusCode::UNAUTHORIZED
+                    || r.status() == reqwest::StatusCode::FORBIDDEN =>
+            {
                 Err(OperatorError::InvalidCredentials)
             }
             Ok(r) => {
-                warn!("Orange: channel list returned {}, using fallback", r.status());
+                warn!(
+                    "Orange: channel list returned {}, using fallback",
+                    r.status()
+                );
                 Ok(parse_m3u(FALLBACK_M3U))
             }
             Err(e) => {
@@ -828,8 +961,13 @@ impl Operator for OrangeOperator {
             self.stream_base, channel.id
         );
 
-        tracing::debug!("Orange resolve_stream: GET {} (tv_token len={})", stream_url, tv_token.len());
-        let mut req = self.client
+        tracing::debug!(
+            "Orange resolve_stream: GET {} (tv_token len={})",
+            stream_url,
+            tv_token.len()
+        );
+        let mut req = self
+            .client
             .get(&stream_url)
             .header("tv_token", format!("Bearer {}", tv_token))
             .header("Accept", "application/json, text/plain, */*")
@@ -901,7 +1039,10 @@ impl Operator for OrangeOperator {
         // Relative licenseServerURLs must be resolved against the MPD URL's origin (url_str),
         // not the stream API base — the license server lives on the same CDN host as the MPD.
         stream.protection = extract_widevine_protection(
-            &json, &tv_token, &url_str, self.wassup.as_deref().unwrap_or(""),
+            &json,
+            &tv_token,
+            &url_str,
+            self.wassup.as_deref().unwrap_or(""),
         );
         Ok(stream)
     }
@@ -934,7 +1075,10 @@ fn extract_widevine_protection(
 
     let arr = json.get("protectionData")?.as_array()?;
     for entry in arr {
-        let ks = entry.get("keySystem").and_then(|v| v.as_str()).unwrap_or("");
+        let ks = entry
+            .get("keySystem")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
         if ks != "com.widevine.alpha" {
             continue;
         }
@@ -958,7 +1102,8 @@ fn extract_widevine_protection(
             .get("initData")
             .and_then(|v| v.as_str())
             .and_then(|b64| {
-                base64::engine::general_purpose::STANDARD.decode(b64)
+                base64::engine::general_purpose::STANDARD
+                    .decode(b64)
                     .or_else(|_| base64::engine::general_purpose::URL_SAFE.decode(b64))
                     .or_else(|_| base64::engine::general_purpose::STANDARD_NO_PAD.decode(b64))
                     .ok()
@@ -966,8 +1111,8 @@ fn extract_widevine_protection(
 
         // License request headers — same origin as the stream API calls.
         let mut license_headers = Vec::new();
-        license_headers.push(("Origin".to_string(),     "https://tv.orange.fr".to_string()));
-        license_headers.push(("Referer".to_string(),    "https://tv.orange.fr/".to_string()));
+        license_headers.push(("Origin".to_string(), "https://tv.orange.fr".to_string()));
+        license_headers.push(("Referer".to_string(), "https://tv.orange.fr/".to_string()));
         license_headers.push(("User-Agent".to_string(),
             "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/110.0.0.0 Safari/537.36".to_string()));
         if !tv_token.is_empty() {
@@ -977,7 +1122,11 @@ fn extract_widevine_protection(
             license_headers.push(("Cookie".to_string(), format!("wassup={}", wassup)));
         }
 
-        return Some(ProtectionData { la_url, pssh, license_headers });
+        return Some(ProtectionData {
+            la_url,
+            pssh,
+            license_headers,
+        });
     }
     None
 }
@@ -985,9 +1134,9 @@ fn extract_widevine_protection(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use wiremock::{MockServer, Mock, ResponseTemplate};
-    use wiremock::matchers::{method, path};
     use serde_json::json;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     // ---------------------------------------------------------------------------
     // Test 1 — successful authentication sets wassup and tv_token
@@ -1012,10 +1161,7 @@ mod tests {
             .and(path("/api/password"))
             .respond_with(
                 ResponseTemplate::new(200)
-                    .insert_header(
-                        "Set-Cookie",
-                        "wassup=test_wassup_value; Path=/; HttpOnly",
-                    )
+                    .insert_header("Set-Cookie", "wassup=test_wassup_value; Path=/; HttpOnly")
                     .set_body_json(json!({})),
             )
             .mount(&mock)
@@ -1150,7 +1296,10 @@ mod tests {
             Some(std::time::Instant::now() + std::time::Duration::from_secs(25 * 60));
 
         let channels = op.fetch_channels().await.unwrap();
-        assert!(!channels.is_empty(), "fallback M3U must supply at least 1 channel");
+        assert!(
+            !channels.is_empty(),
+            "fallback M3U must supply at least 1 channel"
+        );
     }
 
     // ---------------------------------------------------------------------------
@@ -1222,11 +1371,9 @@ mod tests {
 
         Mock::given(method("GET"))
             .and(path("/stream/TF1"))
-            .respond_with(
-                ResponseTemplate::new(200).set_body_json(json!({
-                    "url": "https://cdn.example.com/TF1/index.mpd"
-                })),
-            )
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "url": "https://cdn.example.com/TF1/index.mpd"
+            })))
             .mount(&mock)
             .await;
 
@@ -1247,9 +1394,7 @@ mod tests {
             logo_url: None,
             number: Some(1),
             category: ChannelCategory::Generalist,
-            stream_template: StreamTemplate::Direct(
-                url::Url::parse(PLACEHOLDER_URL).unwrap(),
-            ),
+            stream_template: StreamTemplate::Direct(url::Url::parse(PLACEHOLDER_URL).unwrap()),
             locked: false,
         };
 

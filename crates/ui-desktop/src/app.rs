@@ -1,13 +1,16 @@
+use crate::drm::DrmProxy;
+use crate::screens::channel_list::ChannelListAction;
+use crate::screens::otp::OtpAction;
+use crate::screens::player::PlayerAction;
+use crate::screens::setup::SetupAction;
+use crate::screens::{ChannelListScreen, OtpScreen, PlayerScreen, PushWaitScreen, SetupScreen};
+use frenchetv_core::session as keyring_session;
+use frenchetv_core::{
+    AuthPhase, Channel, Config, Operator, OperatorError, OperatorKind, OperatorRegistry, StreamUrl,
+};
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
-use frenchetv_core::{AuthPhase, Channel, Config, Operator, OperatorError, OperatorKind, OperatorRegistry, StreamUrl};
-use frenchetv_core::session as keyring_session;
-use crate::drm::DrmProxy;
-use crate::screens::{ChannelListScreen, PlayerScreen, PushWaitScreen, SetupScreen};
-use crate::screens::setup::SetupAction;
-use crate::screens::channel_list::ChannelListAction;
-use crate::screens::player::PlayerAction;
 
 type SharedOperator = Arc<TokioMutex<Box<dyn Operator>>>;
 /// Shared logo cache: logo_url → decoded egui texture.
@@ -18,6 +21,11 @@ enum AsyncMsg {
     AuthErr(String),
     /// Operator requires mobile push approval — show the push-wait screen.
     PushAuthPending,
+    /// Operator requires a one-time code; show the OTP entry screen. The code
+    /// the user types is sent back through `responder`.
+    OtpRequired {
+        responder: tokio::sync::oneshot::Sender<String>,
+    },
     /// Authentication + channel fetch both succeeded.
     ChannelsOk {
         channels: Vec<Channel>,
@@ -27,10 +35,15 @@ enum AsyncMsg {
         username: String,
     },
     ChannelsErr(String),
-    StreamOk { stream: StreamUrl },
+    StreamOk {
+        stream: StreamUrl,
+    },
     StreamErr(String),
     /// DRM proxy started; pass proxy_mpd_url to mpv instead of the real stream URL.
-    DrmProxyReady { proxy_mpd_url: String, proxy: Box<DrmProxy> },
+    DrmProxyReady {
+        proxy_mpd_url: String,
+        proxy: Box<DrmProxy>,
+    },
     DrmProxyErr(String),
     /// A 401/403 was received after login — session is invalid, must re-authenticate.
     SessionExpired,
@@ -43,6 +56,7 @@ enum AsyncMsg {
 enum Screen {
     Setup(SetupScreen),
     PushWait(PushWaitScreen),
+    Otp(OtpScreen),
     ChannelList(ChannelListScreen),
     Player(PlayerScreen),
 }
@@ -62,6 +76,8 @@ pub struct App {
     egui_ctx: egui::Context,
     /// Keep the DRM proxy alive while playback is active (Drop aborts the listener).
     _drm_proxy: Option<Box<DrmProxy>>,
+    /// Channel back to the auth task waiting for the user's one-time code.
+    pending_otp: Option<tokio::sync::oneshot::Sender<String>>,
 }
 
 impl App {
@@ -89,10 +105,11 @@ impl App {
             egui_ctx: cc.egui_ctx.clone(),
             force_software_renderer,
             _drm_proxy: None,
+            pending_otp: None,
         };
 
         let kind_str = config.operator.kind.clone();
-        let username  = config.operator.username.clone();
+        let username = config.operator.username.clone();
         if !kind_str.is_empty() && !username.is_empty() {
             if let Some(kind) = OperatorKind::from_config_str(&kind_str) {
                 if let Some(token) = keyring_session::load_session(&kind_str, &username) {
@@ -105,7 +122,10 @@ impl App {
         if !crate::widevine::is_installed() {
             app.start_download_widevine();
         } else {
-            tracing::info!("widevine: CDM already present at {:?}", crate::widevine::cdm_path());
+            tracing::info!(
+                "widevine: CDM already present at {:?}",
+                crate::widevine::cdm_path()
+            );
         }
 
         app
@@ -116,7 +136,7 @@ impl App {
     /// each insertion triggers a repaint so the UI updates incrementally.
     fn start_fetch_logos(&self, channels: Vec<Channel>) {
         let logos = Arc::clone(&self.logos);
-        let ctx   = self.egui_ctx.clone();
+        let ctx = self.egui_ctx.clone();
         self.rt.spawn(async move {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -131,14 +151,14 @@ impl App {
             for url in channels.into_iter().filter_map(|c| c.logo_url) {
                 if seen.insert(url.clone()) {
                     let client = client.clone();
-                    let logos  = Arc::clone(&logos);
-                    let ctx    = ctx.clone();
-                    let sem    = Arc::clone(&sem);
+                    let logos = Arc::clone(&logos);
+                    let ctx = ctx.clone();
+                    let sem = Arc::clone(&sem);
                     set.spawn(async move {
                         let _permit = sem.acquire().await.ok()?;
                         let bytes = client.get(&url).send().await.ok()?.bytes().await.ok()?;
-                        let img   = image::load_from_memory(&bytes).ok()?;
-                        let rgba  = img.to_rgba8();
+                        let img = image::load_from_memory(&bytes).ok()?;
+                        let rgba = img.to_rgba8();
                         let (w, h) = rgba.dimensions();
                         let pixels: Vec<egui::Color32> = rgba
                             .pixels()
@@ -146,7 +166,10 @@ impl App {
                             .collect();
                         let texture = ctx.load_texture(
                             url.as_str(),
-                            egui::ColorImage { size: [w as usize, h as usize], pixels },
+                            egui::ColorImage {
+                                size: [w as usize, h as usize],
+                                pixels,
+                            },
                             egui::TextureOptions::LINEAR,
                         );
                         logos.lock().ok()?.insert(url, texture);
@@ -160,7 +183,7 @@ impl App {
     }
 
     fn start_download_widevine(&self) {
-        let tx  = self.tx.clone();
+        let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         self.rt.spawn(async move {
             tracing::info!("widevine: starting CDM download");
@@ -185,7 +208,7 @@ impl App {
         username: String,
         token: String,
     ) {
-        let tx  = self.tx.clone();
+        let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
@@ -200,56 +223,54 @@ impl App {
                     let session_token = op.session_token().map(str::to_string);
                     let shared = Arc::new(TokioMutex::new(op));
                     let _ = tx.send(AsyncMsg::ChannelsOk {
-                        channels, operator: shared, session_token, kind_str, username,
+                        channels,
+                        operator: shared,
+                        session_token,
+                        kind_str,
+                        username,
                     });
                 }
                 Err(OperatorError::InvalidCredentials) => {
                     let _ = tx.send(AsyncMsg::SessionExpired);
                 }
-                Err(e) => { let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string())); }
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string()));
+                }
             }
             ctx.request_repaint();
         });
     }
 
-    fn start_auth(&self, kind: OperatorKind, username: String, password: String) {
-        let tx       = self.tx.clone();
-        let ctx      = self.egui_ctx.clone();
+    fn start_auth(
+        &self,
+        kind: OperatorKind,
+        username: String,
+        password: String,
+        extra: Option<String>,
+    ) {
+        let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
         let kind_str = kind.config_str().to_string();
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
+            if let Some(extra) = extra.as_deref() {
+                op.set_extra_credential(extra);
+            }
 
-            let auth_ok = if op.uses_phased_auth() {
+            // Drive the (possibly multi-step) auth flow to completion. Each phase
+            // method returns the next AuthPhase; loop until `Done`.
+            let mut phase = if op.uses_phased_auth() {
                 match op.begin_auth(&username).await {
+                    Ok(p) => p,
                     Err(e) => {
                         let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
                         ctx.request_repaint();
                         return;
                     }
-                    Ok(AuthPhase::Password) => match op.complete_auth_password(&password).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
-                            ctx.request_repaint();
-                            return;
-                        }
-                    },
-                    Ok(AuthPhase::Push) => {
-                        let _ = tx.send(AsyncMsg::PushAuthPending);
-                        ctx.request_repaint();
-                        match op.wait_for_push_auth(&password).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
-                                ctx.request_repaint();
-                                return;
-                            }
-                        }
-                    }
                 }
             } else {
                 match op.authenticate(&username, &password).await {
-                    Ok(()) => true,
+                    Ok(()) => AuthPhase::Done,
                     Err(e) => {
                         let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
                         ctx.request_repaint();
@@ -258,35 +279,79 @@ impl App {
                 }
             };
 
-            if !auth_ok { return; }
+            loop {
+                let next = match phase {
+                    AuthPhase::Done => break,
+                    AuthPhase::Password => op.complete_auth_password(&password).await,
+                    AuthPhase::Push => {
+                        let _ = tx.send(AsyncMsg::PushAuthPending);
+                        ctx.request_repaint();
+                        op.wait_for_push_auth(&password).await
+                    }
+                    AuthPhase::Otp => {
+                        // Ask the UI for the one-time code; await the user's reply.
+                        let (code_tx, code_rx) = tokio::sync::oneshot::channel::<String>();
+                        let _ = tx.send(AsyncMsg::OtpRequired { responder: code_tx });
+                        ctx.request_repaint();
+                        match code_rx.await {
+                            Ok(code) => op.submit_otp(&code).await,
+                            Err(_) => return, // user cancelled OTP entry
+                        }
+                    }
+                };
+                phase = match next {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
+            }
 
             match op.fetch_channels().await {
                 Ok(channels) => {
                     let session_token = op.session_token().map(str::to_string);
                     let shared = Arc::new(TokioMutex::new(op));
                     let _ = tx.send(AsyncMsg::ChannelsOk {
-                        channels, operator: shared, session_token, kind_str, username,
+                        channels,
+                        operator: shared,
+                        session_token,
+                        kind_str,
+                        username,
                     });
                 }
                 Err(OperatorError::InvalidCredentials) => {
                     let _ = tx.send(AsyncMsg::SessionExpired);
                 }
-                Err(e) => { let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string())); }
+                Err(e) => {
+                    let _ = tx.send(AsyncMsg::ChannelsErr(e.to_string()));
+                }
             }
             ctx.request_repaint();
         });
     }
 
     fn start_resolve_stream(&self, channel: Channel) {
-        let tx  = self.tx.clone();
+        let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
-        let op  = match &self.current_operator {
+        let op = match &self.current_operator {
             Some(op) => op.clone(),
-            None => { tracing::error!("resolve_stream called with no operator"); return; }
+            None => {
+                tracing::error!("resolve_stream called with no operator");
+                return;
+            }
         };
-        tracing::debug!("resolve_stream: starting for channel '{}' (id={})", channel.name, channel.id);
+        tracing::debug!(
+            "resolve_stream: starting for channel '{}' (id={})",
+            channel.name,
+            channel.id
+        );
         self.rt.spawn(async move {
-            let result = { let op = op.lock().await; op.resolve_stream(&channel).await };
+            let result = {
+                let op = op.lock().await;
+                op.resolve_stream(&channel).await
+            };
             match result {
                 Ok(stream) => {
                     tracing::debug!("resolve_stream: ok → {}", stream.url);
@@ -320,16 +385,18 @@ impl App {
     /// 5. Send `DrmProxyReady` so the player can start mpv against the proxy URL.
     fn start_drm_proxy(&self, stream: StreamUrl) {
         use crate::drm::cdm::CdmHandle;
-        use crate::drm::{license, proxy, fmp4};
+        use crate::drm::{fmp4, license, proxy};
 
-        let tx  = self.tx.clone();
+        let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
 
         self.rt.spawn(async move {
             let protection = match stream.protection.as_ref() {
                 Some(p) => p.clone(),
                 None => {
-                    let _ = tx.send(AsyncMsg::DrmProxyErr("stream has no protection data".into()));
+                    let _ = tx.send(AsyncMsg::DrmProxyErr(
+                        "stream has no protection data".into(),
+                    ));
                     ctx.request_repaint();
                     return;
                 }
@@ -366,7 +433,10 @@ impl App {
             {
                 Ok(c) => c,
                 Err(e) => {
-                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!("CDN client build failed: {}", e)));
+                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!(
+                        "CDN client build failed: {}",
+                        e
+                    )));
                     ctx.request_repaint();
                     return;
                 }
@@ -413,10 +483,16 @@ impl App {
             tracing::info!(
                 "widevine: protection la_url={} pssh={:?} mpd_len={}",
                 protection.la_url,
-                protection.pssh.as_ref().map(|p| format!("{} bytes", p.len())),
+                protection
+                    .pssh
+                    .as_ref()
+                    .map(|p| format!("{} bytes", p.len())),
                 mpd_text.len()
             );
-            tracing::debug!("widevine: MPD text =\n{}", &mpd_text[..mpd_text.len().min(4000)]);
+            tracing::debug!(
+                "widevine: MPD text =\n{}",
+                &mpd_text[..mpd_text.len().min(4000)]
+            );
 
             // ── Fetch init segment: extract Widevine PSSH for license exchange ──
             // The init segment's moov/pssh (authored by Orange) contains the full
@@ -424,34 +500,47 @@ impl App {
             // server requires to return the correct content key.  Our hand-built PSSH
             // (from cenc:default_KID only) causes the server to return a key under a
             // different ID, producing CDM NoKey errors.
-            let init_pssh: Option<Vec<u8>> = if let Some(probe_url) = probe_init_segment_url(&mpd_text, &final_mpd_url) {
-                tracing::info!("DRM: fetching init segment for Widevine PSSH: {}", &probe_url[..probe_url.len().min(150)]);
-                let mut req = cdn_client.get(&probe_url);
-                for (k, v) in &stream.headers {
-                    req = req.header(k.as_str(), v.as_str());
-                }
-                match req.send().await {
-                    Ok(r) if r.status().is_success() => {
-                        match r.bytes().await {
+            let init_pssh: Option<Vec<u8>> =
+                if let Some(probe_url) = probe_init_segment_url(&mpd_text, &final_mpd_url) {
+                    tracing::info!(
+                        "DRM: fetching init segment for Widevine PSSH: {}",
+                        &probe_url[..probe_url.len().min(150)]
+                    );
+                    let mut req = cdn_client.get(&probe_url);
+                    for (k, v) in &stream.headers {
+                        req = req.header(k.as_str(), v.as_str());
+                    }
+                    match req.send().await {
+                        Ok(r) if r.status().is_success() => match r.bytes().await {
                             Ok(bytes) => {
                                 let pssh = fmp4::extract_widevine_pssh(&bytes);
                                 tracing::info!(
                                     "DRM: init segment {} bytes, Widevine PSSH: {}",
                                     bytes.len(),
-                                    pssh.as_ref().map(|p| format!("{} bytes", p.len())).unwrap_or_else(|| "not found".into())
+                                    pssh.as_ref()
+                                        .map(|p| format!("{} bytes", p.len()))
+                                        .unwrap_or_else(|| "not found".into())
                                 );
                                 pssh
                             }
-                            Err(e) => { tracing::warn!("DRM: init segment body error: {}", e); None }
+                            Err(e) => {
+                                tracing::warn!("DRM: init segment body error: {}", e);
+                                None
+                            }
+                        },
+                        Ok(r) => {
+                            tracing::warn!("DRM: init segment → HTTP {} (no PSSH)", r.status());
+                            None
+                        }
+                        Err(e) => {
+                            tracing::warn!("DRM: init segment fetch error: {}", e);
+                            None
                         }
                     }
-                    Ok(r) => { tracing::warn!("DRM: init segment → HTTP {} (no PSSH)", r.status()); None }
-                    Err(e) => { tracing::warn!("DRM: init segment fetch error: {}", e); None }
-                }
-            } else {
-                tracing::warn!("DRM: cannot derive init segment URL from MPD");
-                None
-            };
+                } else {
+                    tracing::warn!("DRM: cannot derive init segment URL from MPD");
+                    None
+                };
 
             // PSSH priority: (1) init segment moov/pssh, (2) operator-provided, (3) MPD-derived.
             let pssh = if let Some(p) = init_pssh {
@@ -462,7 +551,9 @@ impl App {
                 match license::extract_pssh_from_mpd(&mpd_text) {
                     Some(p) => p,
                     None => {
-                        let _ = tx.send(AsyncMsg::DrmProxyErr("PSSH not found in init segment or MPD".into()));
+                        let _ = tx.send(AsyncMsg::DrmProxyErr(
+                            "PSSH not found in init segment or MPD".into(),
+                        ));
                         ctx.request_repaint();
                         return;
                     }
@@ -470,25 +561,40 @@ impl App {
             };
 
             // --- 3. License exchange ---
-            if let Err(e) = license::acquire_license(&cdm, &pssh, &protection.la_url, &protection.license_headers).await {
-                let _ = tx.send(AsyncMsg::DrmProxyErr(format!("License exchange failed: {}", e)));
+            if let Err(e) = license::acquire_license(
+                &cdm,
+                &pssh,
+                &protection.la_url,
+                &protection.license_headers,
+            )
+            .await
+            {
+                let _ = tx.send(AsyncMsg::DrmProxyErr(format!(
+                    "License exchange failed: {}",
+                    e
+                )));
                 ctx.request_repaint();
                 return;
             }
 
             // --- 4. Start proxy (pass the same cdn_client so its cookie jar is reused) ---
             let cdn_headers = stream.headers.clone();
-            let drm_proxy = match proxy::start(cdm, mpd_text, final_mpd_url, cdn_headers, cdn_client).await {
-                Ok(p) => p,
-                Err(e) => {
-                    let _ = tx.send(AsyncMsg::DrmProxyErr(format!("Proxy start failed: {}", e)));
-                    ctx.request_repaint();
-                    return;
-                }
-            };
+            let drm_proxy =
+                match proxy::start(cdm, mpd_text, final_mpd_url, cdn_headers, cdn_client).await {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ =
+                            tx.send(AsyncMsg::DrmProxyErr(format!("Proxy start failed: {}", e)));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
 
             let proxy_mpd_url = drm_proxy.mpd_url.clone();
-            let _ = tx.send(AsyncMsg::DrmProxyReady { proxy_mpd_url, proxy: Box::new(drm_proxy) });
+            let _ = tx.send(AsyncMsg::DrmProxyReady {
+                proxy_mpd_url,
+                proxy: Box::new(drm_proxy),
+            });
             ctx.request_repaint();
         });
     }
@@ -501,8 +607,11 @@ impl App {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
                 AsyncMsg::AuthErr(err) => match &mut self.screen {
-                    Screen::Setup(s) => { s.set_error(format!("Connexion échouée : {}", err)); }
-                    Screen::PushWait(_) => {
+                    Screen::Setup(s) => {
+                        s.set_error(format!("Connexion échouée : {}", err));
+                    }
+                    Screen::PushWait(_) | Screen::Otp(_) => {
+                        self.pending_otp = None;
                         let mut s = SetupScreen::new();
                         s.set_error(format!("Connexion échouée : {}", err));
                         self.screen = Screen::Setup(s);
@@ -512,11 +621,21 @@ impl App {
                 AsyncMsg::PushAuthPending => {
                     self.screen = Screen::PushWait(PushWaitScreen::new());
                 }
-                AsyncMsg::ChannelsOk { channels, operator, session_token, kind_str, username } => {
+                AsyncMsg::OtpRequired { responder } => {
+                    self.pending_otp = Some(responder);
+                    self.screen = Screen::Otp(OtpScreen::new());
+                }
+                AsyncMsg::ChannelsOk {
+                    channels,
+                    operator,
+                    session_token,
+                    kind_str,
+                    username,
+                } => {
                     if let Some(ref token) = session_token {
                         keyring_session::save_session(&kind_str, &username, token);
                         let mut cfg = Config::load().unwrap_or_default();
-                        cfg.operator.kind     = kind_str.clone();
+                        cfg.operator.kind = kind_str.clone();
                         cfg.operator.username = username.clone();
                         if let Err(e) = cfg.save() {
                             tracing::warn!("Failed to save config: {}", e);
@@ -542,7 +661,10 @@ impl App {
                         player.start_playing(&stream);
                     }
                 }
-                AsyncMsg::DrmProxyReady { proxy_mpd_url, proxy } => {
+                AsyncMsg::DrmProxyReady {
+                    proxy_mpd_url,
+                    proxy,
+                } => {
                     // Keep proxy alive; give mpv the local URL.
                     self._drm_proxy = Some(proxy);
                     if let Screen::Player(player) = &mut self.screen {
@@ -594,13 +716,34 @@ impl eframe::App for App {
 
         match &mut self.screen {
             Screen::Setup(setup) => {
-                if let SetupAction::StartAuth { operator, username, password } = setup.show(ctx) {
-                    self.start_auth(operator, username, password);
+                if let SetupAction::StartAuth {
+                    operator,
+                    username,
+                    password,
+                    extra,
+                } = setup.show(ctx)
+                {
+                    self.start_auth(operator, username, password, extra);
                 }
             }
-            Screen::PushWait(pw) => { pw.show(ctx); }
-            Screen::ChannelList(list) => {
-                if let ChannelListAction::SelectChannel(channel) = list.show(ctx) {
+            Screen::PushWait(pw) => {
+                pw.show(ctx);
+            }
+            Screen::Otp(otp) => match otp.show(ctx) {
+                OtpAction::Submit(code) => {
+                    if let Some(tx) = self.pending_otp.take() {
+                        let _ = tx.send(code);
+                    }
+                }
+                OtpAction::Cancel => {
+                    // Dropping the responder aborts the waiting auth task.
+                    self.pending_otp = None;
+                    self.screen = Screen::Setup(SetupScreen::new());
+                }
+                OtpAction::None => {}
+            },
+            Screen::ChannelList(list) => match list.show(ctx) {
+                ChannelListAction::SelectChannel(channel) => {
                     self.start_resolve_stream(channel.clone());
                     self.screen = Screen::Player(PlayerScreen::new(
                         channel,
@@ -608,9 +751,15 @@ impl eframe::App for App {
                         self.force_software_renderer,
                     ));
                 }
-            }
+                ChannelListAction::ChangeProvider => {
+                    self.current_operator = None;
+                    self.channels = Vec::new();
+                    self.screen = Screen::Setup(SetupScreen::new());
+                }
+                ChannelListAction::None => {}
+            },
             Screen::Player(player) => {
-                let channels   = self.channels.clone();
+                let channels = self.channels.clone();
                 let current_id = player.channel.id.clone();
                 match player.show(ctx) {
                     PlayerAction::Back => {
@@ -626,7 +775,11 @@ impl eframe::App for App {
                     PlayerAction::PrevChannel => {
                         if let Some(idx) = channels.iter().position(|c| c.id == current_id) {
                             if !channels.is_empty() {
-                                let prev = if idx == 0 { channels.len() - 1 } else { idx - 1 };
+                                let prev = if idx == 0 {
+                                    channels.len() - 1
+                                } else {
+                                    idx - 1
+                                };
                                 self.start_resolve_stream(channels[prev].clone());
                             }
                         }
@@ -645,7 +798,7 @@ fn probe_init_segment_url(mpd: &str, mpd_base_url: &str) -> Option<String> {
     // Strip query string first.
     let mpd_path = mpd_base_url.split('?').next().unwrap_or(mpd_base_url);
     let mpd_dir = if let Some(pos) = mpd_path.rfind('/') {
-        &mpd_base_url[..pos + 1]   // keep the trailing slash; excludes query
+        &mpd_base_url[..pos + 1] // keep the trailing slash; excludes query
     } else {
         mpd_base_url
     };
@@ -667,7 +820,11 @@ fn probe_init_segment_url(mpd: &str, mpd_base_url: &str) -> Option<String> {
     } else {
         format!("{}{}", mpd_dir, raw_base)
     };
-    let base_url = if base_url.ends_with('/') { base_url } else { format!("{}/", base_url) };
+    let base_url = if base_url.ends_with('/') {
+        base_url
+    } else {
+        format!("{}/", base_url)
+    };
 
     // Extract first initialization template attribute value.
     let init_pos = mpd.find("initialization=\"")?;

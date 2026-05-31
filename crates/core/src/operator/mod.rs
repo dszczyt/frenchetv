@@ -26,12 +26,24 @@ impl OperatorKind {
     }
     pub fn from_config_str(s: &str) -> Option<Self> {
         match s {
-            "orange"   => Some(Self::Orange),
+            "orange" => Some(Self::Orange),
             "bouygues" => Some(Self::Bouygues),
             _ => None,
         }
     }
-    pub fn requires_auth(&self) -> bool { true }
+    pub fn requires_auth(&self) -> bool {
+        true
+    }
+
+    /// Label for an operator-specific extra credential field shown on the setup
+    /// screen, or `None` when only username + password are required. Bouygues
+    /// requires the account holder's last name in its CAS login form.
+    pub fn extra_credential_label(&self) -> Option<&'static str> {
+        match self {
+            Self::Bouygues => Some("Nom de famille"),
+            Self::Orange => None,
+        }
+    }
 }
 
 pub struct OperatorRegistry;

@@ -1,8 +1,8 @@
 use egui::{Color32, FontId, RichText, ScrollArea, TextEdit, Vec2};
 
 const LOGO_BYTES: &[u8] = include_bytes!("../../../../assets/logo.png");
-use frenchetv_core::{Channel, ChannelCategory};
 use crate::app::LogoCache;
+use frenchetv_core::{Channel, ChannelCategory};
 
 pub struct ChannelListScreen {
     channels: Vec<Channel>,
@@ -22,6 +22,8 @@ enum CategoryFilter {
 pub enum ChannelListAction {
     None,
     SelectChannel(Channel),
+    /// User wants to switch operator — return to the Setup screen.
+    ChangeProvider,
 }
 
 impl ChannelListScreen {
@@ -58,6 +60,17 @@ impl ChannelListScreen {
                                 .desired_width(200.0),
                         );
                         ui.add_space(12.0);
+                        if ui
+                            .button(
+                                RichText::new("⇄ Changer d'opérateur")
+                                    .font(FontId::proportional(13.0))
+                                    .color(Color32::from_rgb(180, 180, 180)),
+                            )
+                            .clicked()
+                        {
+                            action = ChannelListAction::ChangeProvider;
+                        }
+                        ui.add_space(12.0);
                         let locked_count = self.channels.iter().filter(|c| c.locked).count();
                         if locked_count > 0 {
                             let lock_label = if self.show_locked {
@@ -65,12 +78,15 @@ impl ChannelListScreen {
                             } else {
                                 format!("🔒 Afficher ({} canal(s))", locked_count)
                             };
-                            if ui.selectable_label(
-                                self.show_locked,
-                                RichText::new(lock_label)
-                                    .font(FontId::proportional(13.0))
-                                    .color(Color32::from_rgb(180, 180, 180)),
-                            ).clicked() {
+                            if ui
+                                .selectable_label(
+                                    self.show_locked,
+                                    RichText::new(lock_label)
+                                        .font(FontId::proportional(13.0))
+                                        .color(Color32::from_rgb(180, 180, 180)),
+                                )
+                                .clicked()
+                            {
                                 self.show_locked = !self.show_locked;
                             }
                         }
@@ -83,24 +99,34 @@ impl ChannelListScreen {
                 ui.horizontal(|ui| {
                     ui.add_space(12.0);
                     let selected_color = Color32::from_rgb(10, 132, 255);
-                    let normal_color   = Color32::from_rgb(180, 180, 180);
+                    let normal_color = Color32::from_rgb(180, 180, 180);
 
                     let is_all = self.filter == CategoryFilter::All;
-                    if ui.button(
-                        RichText::new("Tout")
-                            .color(if is_all { selected_color } else { normal_color })
-                            .font(FontId::proportional(15.0)),
-                    ).clicked() {
+                    if ui
+                        .button(
+                            RichText::new("Tout")
+                                .color(if is_all { selected_color } else { normal_color })
+                                .font(FontId::proportional(15.0)),
+                        )
+                        .clicked()
+                    {
                         self.filter = CategoryFilter::All;
                     }
 
                     for cat in ChannelCategory::fixed() {
                         let is_active = self.filter == CategoryFilter::Category(cat.clone());
-                        if ui.button(
-                            RichText::new(cat.label())
-                                .color(if is_active { selected_color } else { normal_color })
-                                .font(FontId::proportional(15.0)),
-                        ).clicked() {
+                        if ui
+                            .button(
+                                RichText::new(cat.label())
+                                    .color(if is_active {
+                                        selected_color
+                                    } else {
+                                        normal_color
+                                    })
+                                    .font(FontId::proportional(15.0)),
+                            )
+                            .clicked()
+                        {
                             self.filter = CategoryFilter::Category(cat.clone());
                         }
                     }
@@ -110,25 +136,30 @@ impl ChannelListScreen {
 
                 // ── Filtering ────────────────────────────────────────────────
                 let search_lower = self.search.to_lowercase();
-                let visible: Vec<&Channel> = self.channels.iter().filter(|c| {
-                    let matches_filter = match &self.filter {
-                        CategoryFilter::All => true,
-                        CategoryFilter::Category(cat) => &c.category == cat,
-                    };
-                    let matches_search = search_lower.is_empty()
-                        || c.name.to_lowercase().contains(&search_lower)
-                        || c.number.map_or(false, |n| n.to_string().contains(&search_lower));
-                    let matches_locked = self.show_locked || !c.locked;
-                    matches_filter && matches_search && matches_locked
-                }).collect();
+                let visible: Vec<&Channel> = self
+                    .channels
+                    .iter()
+                    .filter(|c| {
+                        let matches_filter = match &self.filter {
+                            CategoryFilter::All => true,
+                            CategoryFilter::Category(cat) => &c.category == cat,
+                        };
+                        let matches_search = search_lower.is_empty()
+                            || c.name.to_lowercase().contains(&search_lower)
+                            || c.number
+                                .map_or(false, |n| n.to_string().contains(&search_lower));
+                        let matches_locked = self.show_locked || !c.locked;
+                        matches_filter && matches_search && matches_locked
+                    })
+                    .collect();
 
                 // ── Grid ─────────────────────────────────────────────────────
                 ScrollArea::vertical().show(ui, |ui| {
                     let available_width = (ui.available_width() - 16.0).max(0.0);
                     const COLS: usize = 4;
-                    let tile_width  = (available_width / COLS as f32 - 12.0).max(160.0);
+                    let tile_width = (available_width / COLS as f32 - 12.0).max(160.0);
                     let tile_height = 100.0f32;
-                    let logo_size   = Vec2::new(tile_width - 20.0, 50.0);
+                    let logo_size = Vec2::new(tile_width - 20.0, 50.0);
                     let placeholder_color = Color32::from_rgb(40, 42, 50);
 
                     egui::Grid::new("channel_grid")
@@ -163,15 +194,18 @@ impl ChannelListScreen {
                                             ui.set_min_size(Vec2::new(tile_width, tile_height));
                                             ui.vertical(|ui| {
                                                 // ── Logo ────────────────────
-                                                let cached_texture = channel.logo_url.as_ref()
-                                                    .and_then(|url| {
-                                                        self.logos.lock().ok()
-                                                            .and_then(|m| m.get(url.as_str()).cloned())
+                                                let cached_texture =
+                                                    channel.logo_url.as_ref().and_then(|url| {
+                                                        self.logos.lock().ok().and_then(|m| {
+                                                            m.get(url.as_str()).cloned()
+                                                        })
                                                     });
                                                 if let Some(texture) = cached_texture {
                                                     ui.add(
                                                         egui::Image::from_texture(
-                                                            egui::load::SizedTexture::from_handle(&texture),
+                                                            egui::load::SizedTexture::from_handle(
+                                                                &texture,
+                                                            ),
                                                         )
                                                         .max_size(logo_size)
                                                         .maintain_aspect_ratio(true)
@@ -183,12 +217,19 @@ impl ChannelListScreen {
                                                         logo_size,
                                                         egui::Sense::hover(),
                                                     );
-                                                    ui.painter().rect_filled(rect, 4.0, placeholder_color);
+                                                    ui.painter().rect_filled(
+                                                        rect,
+                                                        4.0,
+                                                        placeholder_color,
+                                                    );
                                                     let spin_rect = egui::Rect::from_center_size(
                                                         rect.center(),
                                                         egui::Vec2::splat(24.0),
                                                     );
-                                                    ui.put(spin_rect, egui::Spinner::new().size(16.0));
+                                                    ui.put(
+                                                        spin_rect,
+                                                        egui::Spinner::new().size(16.0),
+                                                    );
                                                 } else {
                                                     // No logo for this channel
                                                     let (rect, _) = ui.allocate_exact_size(
@@ -205,10 +246,12 @@ impl ChannelListScreen {
                                                 ui.add_space(4.0);
 
                                                 // ── Name + number ────────────
-                                                let num_prefix = channel.number
+                                                let num_prefix = channel
+                                                    .number
                                                     .map(|n| format!("{} · ", n))
                                                     .unwrap_or_default();
-                                                let lock_suffix = if is_locked { " 🔒" } else { "" };
+                                                let lock_suffix =
+                                                    if is_locked { " 🔒" } else { "" };
                                                 ui.label(
                                                     RichText::new(format!(
                                                         "{}{}{}",
