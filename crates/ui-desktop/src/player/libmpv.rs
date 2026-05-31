@@ -44,7 +44,9 @@ unsafe extern "C" fn update_callback(cb_ctx: *mut std::ffi::c_void) {
     state.flag.store(true, Ordering::Release);
     // Rate-limit egui wakeups to ~25 fps. The callback fires for every mpv
     // internal event; uncapped it keeps the event loop spinning at 100+ Hz.
-    state.egui_ctx.request_repaint_after(std::time::Duration::from_millis(40));
+    state
+        .egui_ctx
+        .request_repaint_after(std::time::Duration::from_millis(40));
 }
 
 impl SoftwareRenderer {
@@ -63,7 +65,10 @@ impl SoftwareRenderer {
                 type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_API_TYPE,
                 data: api_type_str.as_ptr() as *mut std::ffi::c_void,
             },
-            libmpv2_sys::mpv_render_param { type_: 0, data: ptr::null_mut() },
+            libmpv2_sys::mpv_render_param {
+                type_: 0,
+                data: ptr::null_mut(),
+            },
         ];
 
         let mut raw_ctx: *mut libmpv2_sys::mpv_render_context = ptr::null_mut();
@@ -122,7 +127,8 @@ impl SoftwareRenderer {
         // The callback fires for *every* mpv internal event, not only new frames.
         // Check the authoritative flag before doing any pixel work.
         let update_flags = unsafe { libmpv2_sys::mpv_render_context_update(self.ctx) };
-        if update_flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
+        if update_flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0
+        {
             return self.texture.as_ref().map(|t| {
                 egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
             });
@@ -159,7 +165,10 @@ impl SoftwareRenderer {
                 type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_SW_POINTER,
                 data: pixels.as_mut_ptr() as *mut std::ffi::c_void,
             },
-            libmpv2_sys::mpv_render_param { type_: 0, data: std::ptr::null_mut() },
+            libmpv2_sys::mpv_render_param {
+                type_: 0,
+                data: std::ptr::null_mut(),
+            },
         ];
 
         let err = unsafe {
@@ -183,9 +192,9 @@ impl SoftwareRenderer {
         }
 
         // Return render dimensions — egui uses this for maintain_aspect_ratio.
-        self.texture.as_ref().map(|t| {
-            egui::load::SizedTexture::new(t.id(), egui::vec2(rw as f32, rh as f32))
-        })
+        self.texture
+            .as_ref()
+            .map(|t| egui::load::SizedTexture::new(t.id(), egui::vec2(rw as f32, rh as f32)))
     }
 }
 
@@ -193,7 +202,11 @@ impl Drop for SoftwareRenderer {
     fn drop(&mut self) {
         unsafe {
             // Unregister callback before freeing context to prevent use-after-free.
-            libmpv2_sys::mpv_render_context_set_update_callback(self.ctx, None, std::ptr::null_mut());
+            libmpv2_sys::mpv_render_context_set_update_callback(
+                self.ctx,
+                None,
+                std::ptr::null_mut(),
+            );
             libmpv2_sys::mpv_render_context_free(self.ctx);
             // Drop the callback state box.
             if !self.callback_state_ptr.is_null() {
@@ -259,18 +272,25 @@ impl GlRenderer {
             egl.get_display(khronos_egl::DEFAULT_DISPLAY)
                 .ok_or("eglGetDisplay(DEFAULT_DISPLAY) returned None")?
         };
-        egl.initialize(display).map_err(|e| format!("eglInitialize: {e:?}"))?;
+        egl.initialize(display)
+            .map_err(|e| format!("eglInitialize: {e:?}"))?;
 
         // Bind OpenGL (desktop) API before choosing config.
         let _ = egl.bind_api(khronos_egl::OPENGL_API);
 
         let config_attribs = [
-            khronos_egl::SURFACE_TYPE,    khronos_egl::PBUFFER_BIT,
-            khronos_egl::RENDERABLE_TYPE, khronos_egl::OPENGL_BIT,
-            khronos_egl::RED_SIZE,        8,
-            khronos_egl::GREEN_SIZE,      8,
-            khronos_egl::BLUE_SIZE,       8,
-            khronos_egl::ALPHA_SIZE,      8,
+            khronos_egl::SURFACE_TYPE,
+            khronos_egl::PBUFFER_BIT,
+            khronos_egl::RENDERABLE_TYPE,
+            khronos_egl::OPENGL_BIT,
+            khronos_egl::RED_SIZE,
+            8,
+            khronos_egl::GREEN_SIZE,
+            8,
+            khronos_egl::BLUE_SIZE,
+            8,
+            khronos_egl::ALPHA_SIZE,
+            8,
             khronos_egl::NONE,
         ];
         let config = egl
@@ -280,8 +300,10 @@ impl GlRenderer {
 
         // Minimal 1×1 PBuffer — actual rendering goes into an FBO.
         let pbuffer_attribs = [
-            khronos_egl::WIDTH,  1,
-            khronos_egl::HEIGHT, 1,
+            khronos_egl::WIDTH,
+            1,
+            khronos_egl::HEIGHT,
+            1,
             khronos_egl::NONE,
         ];
         let surface = egl
@@ -289,8 +311,10 @@ impl GlRenderer {
             .map_err(|e| format!("eglCreatePbufferSurface: {e:?}"))?;
 
         let ctx_attribs = [
-            khronos_egl::CONTEXT_MAJOR_VERSION, 3,
-            khronos_egl::CONTEXT_MINOR_VERSION, 3,
+            khronos_egl::CONTEXT_MAJOR_VERSION,
+            3,
+            khronos_egl::CONTEXT_MINOR_VERSION,
+            3,
             khronos_egl::NONE,
         ];
         let egl_ctx = egl
@@ -371,7 +395,8 @@ impl GlRenderer {
             get_proc_address_ctx: egl_raw,
         };
 
-        let api_type_ptr = libmpv2_sys::MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut std::ffi::c_void;
+        let api_type_ptr =
+            libmpv2_sys::MPV_RENDER_API_TYPE_OPENGL.as_ptr() as *mut std::ffi::c_void;
         let mut flip_y: std::os::raw::c_int = 0;
 
         let params: [libmpv2_sys::mpv_render_param; 4] = [
@@ -387,7 +412,10 @@ impl GlRenderer {
                 type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_FLIP_Y,
                 data: &mut flip_y as *mut _ as *mut std::ffi::c_void,
             },
-            libmpv2_sys::mpv_render_param { type_: 0, data: ptr::null_mut() },
+            libmpv2_sys::mpv_render_param {
+                type_: 0,
+                data: ptr::null_mut(),
+            },
         ];
 
         let mut raw_ctx: *mut libmpv2_sys::mpv_render_context = ptr::null_mut();
@@ -401,7 +429,9 @@ impl GlRenderer {
         if err != 0 {
             // Clean up GL resources before returning.
             unsafe {
-                let egl_reclaim = Box::from_raw(egl_raw as *mut khronos_egl::DynamicInstance<khronos_egl::EGL1_4>);
+                let egl_reclaim = Box::from_raw(
+                    egl_raw as *mut khronos_egl::DynamicInstance<khronos_egl::EGL1_4>,
+                );
                 gl::DeleteRenderbuffers(1, &rbo);
                 gl::DeleteFramebuffers(1, &fbo);
                 egl_reclaim.make_current(display, None, None, None).ok();
@@ -458,7 +488,10 @@ impl GlRenderer {
         }
 
         // Fast pre-check: callback has not fired since last poll.
-        if !self.needs_update.swap(false, std::sync::atomic::Ordering::AcqRel) {
+        if !self
+            .needs_update
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
             return self.texture.as_ref().map(|t| {
                 egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
             });
@@ -467,7 +500,8 @@ impl GlRenderer {
         // Gate on mpv's authoritative frame-ready flag — the callback fires for
         // every internal mpv event, not only new decoded frames.
         let update_flags = unsafe { libmpv2_sys::mpv_render_context_update(self.ctx) };
-        if update_flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0 {
+        if update_flags & (libmpv2_sys::mpv_render_update_flag_MPV_RENDER_UPDATE_FRAME as u64) == 0
+        {
             return self.texture.as_ref().map(|t| {
                 egui::load::SizedTexture::new(t.id(), egui::vec2(width as f32, height as f32))
             });
@@ -512,8 +546,8 @@ impl GlRenderer {
         // Ask mpv to render into the FBO.
         let mut fbo_params = libmpv2_sys::mpv_opengl_fbo {
             fbo: self.fbo as std::os::raw::c_int,
-            w:   rw as std::os::raw::c_int,
-            h:   rh as std::os::raw::c_int,
+            w: rw as std::os::raw::c_int,
+            h: rh as std::os::raw::c_int,
             internal_format: 0, // 0 means use default (GL_RGBA)
         };
         // flip_y=0: mpv renders with video row 0 at the top of the FBO (OpenGL y=h).
@@ -531,7 +565,10 @@ impl GlRenderer {
                 type_: libmpv2_sys::mpv_render_param_type_MPV_RENDER_PARAM_FLIP_Y,
                 data: &mut flip_y as *mut _ as *mut std::ffi::c_void,
             },
-            libmpv2_sys::mpv_render_param { type_: 0, data: std::ptr::null_mut() },
+            libmpv2_sys::mpv_render_param {
+                type_: 0,
+                data: std::ptr::null_mut(),
+            },
         ];
 
         let err = unsafe {
@@ -552,7 +589,8 @@ impl GlRenderer {
         unsafe {
             gl::BindFramebuffer(gl::FRAMEBUFFER, self.fbo);
             gl::ReadPixels(
-                0, 0,
+                0,
+                0,
                 rw as gl::types::GLsizei,
                 rh as gl::types::GLsizei,
                 gl::RGBA,
@@ -562,10 +600,7 @@ impl GlRenderer {
             gl::BindFramebuffer(gl::FRAMEBUFFER, 0);
         }
 
-        let image = egui::ColorImage::from_rgba_unmultiplied(
-            [rw as usize, rh as usize],
-            &pixels,
-        );
+        let image = egui::ColorImage::from_rgba_unmultiplied([rw as usize, rh as usize], &pixels);
 
         if let Some(ref mut tex) = self.texture {
             tex.set(image, egui::TextureOptions::LINEAR);
@@ -575,9 +610,9 @@ impl GlRenderer {
         }
 
         // Return render dimensions — egui uses this for maintain_aspect_ratio.
-        self.texture.as_ref().map(|t| {
-            egui::load::SizedTexture::new(t.id(), egui::vec2(rw as f32, rh as f32))
-        })
+        self.texture
+            .as_ref()
+            .map(|t| egui::load::SizedTexture::new(t.id(), egui::vec2(rw as f32, rh as f32)))
     }
 }
 
@@ -587,7 +622,9 @@ impl Drop for GlRenderer {
         unsafe {
             // Unregister mpv callback first, then free mpv render context.
             libmpv2_sys::mpv_render_context_set_update_callback(
-                self.ctx, None, std::ptr::null_mut(),
+                self.ctx,
+                None,
+                std::ptr::null_mut(),
             );
             libmpv2_sys::mpv_render_context_free(self.ctx);
 
@@ -607,8 +644,12 @@ impl Drop for GlRenderer {
             self.egl
                 .make_current(self.egl_display, None, None, None)
                 .ok();
-            self.egl.destroy_surface(self.egl_display, self.egl_surface).ok();
-            self.egl.destroy_context(self.egl_display, self.egl_ctx).ok();
+            self.egl
+                .destroy_surface(self.egl_display, self.egl_surface)
+                .ok();
+            self.egl
+                .destroy_context(self.egl_display, self.egl_ctx)
+                .ok();
             self.egl.terminate(self.egl_display).ok();
 
             // Drop the update-callback state box.
@@ -630,16 +671,14 @@ enum ActiveRenderer {
 
 impl ActiveRenderer {
     /// Probe at startup: try GL (Linux only), fall back to software.
-    fn probe(
-        mpv: &libmpv2::Mpv,
-        egui_ctx: egui::Context,
-        force_software: bool,
-    ) -> Self {
+    fn probe(mpv: &libmpv2::Mpv, egui_ctx: egui::Context, force_software: bool) -> Self {
         #[cfg(target_os = "linux")]
         if !force_software {
             match GlRenderer::try_new(mpv, egui_ctx.clone()) {
                 Ok(r) => return Self::Gl(r),
-                Err(e) => tracing::warn!("renderer: GL unavailable ({}), falling back to software", e),
+                Err(e) => {
+                    tracing::warn!("renderer: GL unavailable ({}), falling back to software", e)
+                }
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -647,8 +686,7 @@ impl ActiveRenderer {
         tracing::info!("renderer: software (pixel buffer)");
         // SoftwareRenderer::new can only fail if libmpv itself errors — treat as fatal.
         Self::Software(
-            SoftwareRenderer::new(mpv, egui_ctx)
-                .expect("software render context creation failed"),
+            SoftwareRenderer::new(mpv, egui_ctx).expect("software render context creation failed"),
         )
     }
 
@@ -673,7 +711,7 @@ impl ActiveRenderer {
 /// Drop order: `renderer` is declared before `mpv` so the `RenderContext`
 /// inside is destroyed before the mpv handle.
 pub struct LibMpvPlayer {
-    renderer: ActiveRenderer,       // MUST be declared before mpv (drop order)
+    renderer: ActiveRenderer, // MUST be declared before mpv (drop order)
     mpv: libmpv2::Mpv,
     has_cdm_support: bool,
     /// Last observed time-pos, used to detect backward jumps in the audio stream.
@@ -700,7 +738,8 @@ impl LibMpvPlayer {
 
         let mpv = libmpv2::Mpv::new().expect("failed to create mpv instance");
         // Must set vo=libmpv before any loadfile so mpv uses the render context.
-        mpv.set_property("vo", "libmpv").expect("mpv: set vo=libmpv failed");
+        mpv.set_property("vo", "libmpv")
+            .expect("mpv: set vo=libmpv failed");
         // Override any user config that might enable looping (loop=yes in
         // ~/.config/mpv/mpv.conf is a common culprit for the "audio repeats"
         // symptom because libmpv loads user config by default).
@@ -715,7 +754,12 @@ impl LibMpvPlayer {
 
         let renderer = ActiveRenderer::probe(&mpv, egui_ctx, force_software);
 
-        Self { renderer, mpv, has_cdm_support, last_time_pos: f64::NAN }
+        Self {
+            renderer,
+            mpv,
+            has_cdm_support,
+            last_time_pos: f64::NAN,
+        }
     }
 
     /// Start playing a stream URL.
@@ -729,12 +773,18 @@ impl LibMpvPlayer {
         let _ = self.mpv.command("stop", &[]);
 
         // Clear header list, then rebuild.
-        let _ = self.mpv.command("change-list", &["http-header-fields", "clr", ""]);
+        let _ = self
+            .mpv
+            .command("change-list", &["http-header-fields", "clr", ""]);
 
         if let Some(auth) = auth_header {
             let _ = self.mpv.command(
                 "change-list",
-                &["http-header-fields", "append", &format!("Authorization: {}", auth)],
+                &[
+                    "http-header-fields",
+                    "append",
+                    &format!("Authorization: {}", auth),
+                ],
             );
         }
 
@@ -749,7 +799,11 @@ impl LibMpvPlayer {
                 _ => {
                     let _ = self.mpv.command(
                         "change-list",
-                        &["http-header-fields", "append", &format!("{}: {}", name, value)],
+                        &[
+                            "http-header-fields",
+                            "append",
+                            &format!("{}: {}", name, value),
+                        ],
                     );
                 }
             }
@@ -830,9 +884,7 @@ impl LibMpvPlayer {
         loop {
             match self.mpv.event_context_mut().wait_event(0.0) {
                 Some(Ok(libmpv2::events::Event::Seek)) => {
-                    let pos = self.mpv
-                        .get_property::<f64>("time-pos")
-                        .unwrap_or(f64::NAN);
+                    let pos = self.mpv.get_property::<f64>("time-pos").unwrap_or(f64::NAN);
                     tracing::warn!("mpv: seek event (time-pos={:.3})", pos);
                 }
                 Some(Ok(libmpv2::events::Event::PlaybackRestart)) => {
@@ -852,7 +904,9 @@ impl LibMpvPlayer {
             if self.last_time_pos.is_finite() && pos < self.last_time_pos - 0.5 {
                 tracing::warn!(
                     "mpv: time-pos jumped backward {:.3} → {:.3} (Δ={:.3} s)",
-                    self.last_time_pos, pos, pos - self.last_time_pos
+                    self.last_time_pos,
+                    pos,
+                    pos - self.last_time_pos
                 );
             }
             self.last_time_pos = pos;
@@ -863,7 +917,8 @@ impl LibMpvPlayer {
     /// Returns true if mpv is playing (not idle/stopped).
     #[allow(dead_code)]
     pub fn is_playing(&self) -> bool {
-        self.mpv.get_property::<bool>("core-idle")
+        self.mpv
+            .get_property::<bool>("core-idle")
             .map(|idle| !idle)
             .unwrap_or(false)
     }

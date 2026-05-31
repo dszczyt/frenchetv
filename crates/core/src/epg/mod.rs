@@ -1,6 +1,6 @@
 pub mod xmltv;
-use serde::{Deserialize, Serialize};
 use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpgProgram {
@@ -19,8 +19,8 @@ pub struct EpgData {
 impl EpgData {
     pub fn current_program(&self, channel_id: &str) -> Option<&EpgProgram> {
         let now = chrono::Utc::now();
-        self.programs.iter().find(|p| {
-            p.channel_id == channel_id && p.start <= now && p.stop > now
-        })
+        self.programs
+            .iter()
+            .find(|p| p.channel_id == channel_id && p.start <= now && p.stop > now)
     }
 }

@@ -1,6 +1,6 @@
+use crate::app::LogoCache;
 use egui::{Color32, FontId, Key, RichText, Vec2};
 use frenchetv_core::{Channel, ChannelCategory};
-use crate::app::LogoCache;
 
 const LOGO_BYTES: &[u8] = include_bytes!("../../../../assets/logo.png");
 
@@ -49,8 +49,7 @@ impl ChannelListScreen {
     }
 
     fn all_filter_labels() -> Vec<(&'static str, Option<ChannelCategory>)> {
-        let mut labels: Vec<(&'static str, Option<ChannelCategory>)> =
-            vec![("Tout", None)];
+        let mut labels: Vec<(&'static str, Option<ChannelCategory>)> = vec![("Tout", None)];
         for cat in ChannelCategory::fixed() {
             labels.push((cat.label(), Some(cat.clone())));
         }
@@ -60,12 +59,14 @@ impl ChannelListScreen {
     pub fn show(&mut self, ctx: &egui::Context) -> ChannelListAction {
         let mut action = ChannelListAction::None;
 
-        let visible: Vec<&Channel> = self.channels.iter().filter(|c| {
-            match &self.filter {
+        let visible: Vec<&Channel> = self
+            .channels
+            .iter()
+            .filter(|c| match &self.filter {
                 CategoryFilter::All => true,
                 CategoryFilter::Category(cat) => &c.category == cat,
-            }
-        }).collect();
+            })
+            .collect();
 
         let row_count = if visible.is_empty() {
             0
@@ -106,12 +107,14 @@ impl ChannelListScreen {
                         Some(cat) => CategoryFilter::Category(cat.clone()),
                     };
                     // Clamp focus after filter change
-                    let new_visible_count = self.channels.iter().filter(|c| {
-                        match &self.filter {
+                    let new_visible_count = self
+                        .channels
+                        .iter()
+                        .filter(|c| match &self.filter {
                             CategoryFilter::All => true,
                             CategoryFilter::Category(cat) => &c.category == cat,
-                        }
-                    }).count();
+                        })
+                        .count();
                     let new_row_count = if new_visible_count == 0 {
                         0
                     } else {
@@ -234,8 +237,8 @@ impl ChannelListScreen {
                         .spacing([12.0, 16.0])
                         .show(ui, |ui| {
                             for (i, channel) in visible.iter().enumerate() {
-                                let is_focused = self.focus_layer == FocusLayer::Grid
-                                    && i == focused_idx;
+                                let is_focused =
+                                    self.focus_layer == FocusLayer::Grid && i == focused_idx;
                                 let is_locked = channel.locked;
 
                                 let bg_color = if is_locked {
@@ -268,10 +271,9 @@ impl ChannelListScreen {
                                                 // Logo
                                                 let cached_texture =
                                                     channel.logo_url.as_ref().and_then(|url| {
-                                                        self.logos
-                                                            .lock()
-                                                            .ok()
-                                                            .and_then(|m| m.get(url.as_str()).cloned())
+                                                        self.logos.lock().ok().and_then(|m| {
+                                                            m.get(url.as_str()).cloned()
+                                                        })
                                                     });
                                                 if let Some(texture) = cached_texture {
                                                     ui.add(
@@ -289,13 +291,17 @@ impl ChannelListScreen {
                                                         logo_size,
                                                         egui::Sense::hover(),
                                                     );
-                                                    ui.painter()
-                                                        .rect_filled(rect, 4.0, placeholder_color);
+                                                    ui.painter().rect_filled(
+                                                        rect,
+                                                        4.0,
+                                                        placeholder_color,
+                                                    );
                                                     if channel.logo_url.is_some() {
-                                                        let spin_rect = egui::Rect::from_center_size(
-                                                            rect.center(),
-                                                            egui::Vec2::splat(28.0),
-                                                        );
+                                                        let spin_rect =
+                                                            egui::Rect::from_center_size(
+                                                                rect.center(),
+                                                                egui::Vec2::splat(28.0),
+                                                            );
                                                         ui.put(
                                                             spin_rect,
                                                             egui::Spinner::new().size(20.0),

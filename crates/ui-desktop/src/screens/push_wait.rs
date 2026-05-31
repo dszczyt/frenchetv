@@ -30,10 +30,7 @@ impl PushWaitScreen {
                         ui.add_space(ui.available_height() / 3.0);
 
                         // Orange logo-colour spinner text
-                        ui.label(
-                            RichText::new("📱")
-                                .font(FontId::proportional(56.0)),
-                        );
+                        ui.label(RichText::new("📱").font(FontId::proportional(56.0)));
 
                         ui.add_space(24.0);
 
@@ -79,24 +76,16 @@ impl PushWaitScreen {
                         ui.add_space(24.0);
                         let progress = (self.elapsed / 90.0).min(1.0);
                         let bar_width = 260.0_f32.min(ui.available_width() - 32.0);
-                        let (rect, _) = ui.allocate_exact_size(
-                            Vec2::new(bar_width, 4.0),
-                            egui::Sense::hover(),
-                        );
-                        ui.painter().rect_filled(
-                            rect,
-                            2.0,
-                            Color32::from_rgb(40, 40, 50),
-                        );
+                        let (rect, _) =
+                            ui.allocate_exact_size(Vec2::new(bar_width, 4.0), egui::Sense::hover());
+                        ui.painter()
+                            .rect_filled(rect, 2.0, Color32::from_rgb(40, 40, 50));
                         let fill_rect = egui::Rect::from_min_size(
                             rect.min,
                             Vec2::new(rect.width() * progress, rect.height()),
                         );
-                        ui.painter().rect_filled(
-                            fill_rect,
-                            2.0,
-                            Color32::from_rgb(255, 120, 0),
-                        );
+                        ui.painter()
+                            .rect_filled(fill_rect, 2.0, Color32::from_rgb(255, 120, 0));
                     });
                 });
             });

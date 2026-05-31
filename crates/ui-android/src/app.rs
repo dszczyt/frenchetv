@@ -1,15 +1,15 @@
-use std::collections::HashMap;
-use std::sync::{mpsc, Arc, Mutex};
-use tokio::sync::Mutex as TokioMutex;
+use crate::screens::channel_list::ChannelListAction;
+use crate::screens::player::PlayerAction;
+use crate::screens::setup::SetupAction;
+use crate::screens::{ChannelListScreen, PlayerScreen, SetupScreen};
 use android_activity::AndroidApp;
+use frenchetv_core::session as session_store;
 use frenchetv_core::{
     AuthPhase, Channel, Config, OperatorError, OperatorKind, OperatorRegistry, StreamUrl,
 };
-use frenchetv_core::session as session_store;
-use crate::screens::{ChannelListScreen, PlayerScreen, SetupScreen};
-use crate::screens::setup::SetupAction;
-use crate::screens::channel_list::ChannelListAction;
-use crate::screens::player::PlayerAction;
+use std::collections::HashMap;
+use std::sync::{mpsc, Arc, Mutex};
+use tokio::sync::Mutex as TokioMutex;
 
 type SharedOperator = Arc<TokioMutex<Box<dyn frenchetv_core::Operator>>>;
 
@@ -30,7 +30,9 @@ enum AsyncMsg {
         username: String,
     },
     ChannelsErr(String),
-    StreamOk { stream: StreamUrl },
+    StreamOk {
+        stream: StreamUrl,
+    },
     StreamErr(String),
     /// A 401/403 was received — session is invalid, must re-authenticate.
     SessionExpired,
@@ -186,9 +188,7 @@ impl App {
                         let (w, h) = rgba.dimensions();
                         let pixels: Vec<egui::Color32> = rgba
                             .pixels()
-                            .map(|p| {
-                                egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3])
-                            })
+                            .map(|p| egui::Color32::from_rgba_unmultiplied(p[0], p[1], p[2], p[3]))
                             .collect();
                         let texture = ctx.load_texture(
                             url.as_str(),
@@ -262,16 +262,14 @@ impl App {
                         ctx.request_repaint();
                         return;
                     }
-                    Ok(AuthPhase::Password) => {
-                        match op.complete_auth_password(&password).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
-                                ctx.request_repaint();
-                                return;
-                            }
+                    Ok(AuthPhase::Password) => match op.complete_auth_password(&password).await {
+                        Ok(()) => true,
+                        Err(e) => {
+                            let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                            ctx.request_repaint();
+                            return;
                         }
-                    }
+                    },
                     Ok(AuthPhase::Push) => {
                         let _ = tx.send(AsyncMsg::PushAuthPending);
                         ctx.request_repaint();
@@ -334,7 +332,11 @@ impl App {
             }
         };
         self.pending_channel = Some(channel.clone());
-        log::info!("resolve_stream: starting for channel '{}' (id={})", channel.name, channel.id);
+        log::info!(
+            "resolve_stream: starting for channel '{}' (id={})",
+            channel.name,
+            channel.id
+        );
         self.rt.spawn(async move {
             let result = {
                 let op = op.lock().await;
@@ -471,7 +473,11 @@ impl eframe::App for App {
                     PlayerAction::PrevChannel => {
                         if let Some(idx) = channels.iter().position(|c| c.id == current_id) {
                             if !channels.is_empty() {
-                                let prev = if idx == 0 { channels.len() - 1 } else { idx - 1 };
+                                let prev = if idx == 0 {
+                                    channels.len() - 1
+                                } else {
+                                    idx - 1
+                                };
                                 self.start_resolve_stream(channels[prev].clone());
                             }
                         }

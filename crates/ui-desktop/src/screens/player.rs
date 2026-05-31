@@ -1,6 +1,6 @@
+use crate::player::libmpv::LibMpvPlayer;
 use egui::{Color32, FontId, Key, RichText, Vec2};
 use frenchetv_core::Channel;
-use crate::player::libmpv::LibMpvPlayer;
 use frenchetv_core::StreamUrl;
 
 enum PlayerState {
@@ -67,7 +67,7 @@ impl PlayerScreen {
                 PlayerAction::None
             };
             let toggle_info = i.key_pressed(Key::Enter);
-            let toggle_fs   = i.key_pressed(Key::F);
+            let toggle_fs = i.key_pressed(Key::F);
             (dt, action, toggle_info, toggle_fs)
         });
 
@@ -112,25 +112,23 @@ impl PlayerScreen {
                         });
                         ctx.request_repaint();
                     }
-                    PlayerState::Playing => {
-                        match self.player.render_frame(ctx, w, h) {
-                            Some(sized_texture) => {
-                                ui.centered_and_justified(|ui| {
-                                    ui.add(
-                                        egui::Image::new(sized_texture)
-                                            .maintain_aspect_ratio(true)
-                                            .fit_to_exact_size(available),
-                                    );
-                                });
-                            }
-                            None => {
-                                ui.centered_and_justified(|ui| {
-                                    ui.add(egui::Spinner::new().size(40.0).color(Color32::WHITE));
-                                });
-                                ctx.request_repaint();
-                            }
+                    PlayerState::Playing => match self.player.render_frame(ctx, w, h) {
+                        Some(sized_texture) => {
+                            ui.centered_and_justified(|ui| {
+                                ui.add(
+                                    egui::Image::new(sized_texture)
+                                        .maintain_aspect_ratio(true)
+                                        .fit_to_exact_size(available),
+                                );
+                            });
                         }
-                    }
+                        None => {
+                            ui.centered_and_justified(|ui| {
+                                ui.add(egui::Spinner::new().size(40.0).color(Color32::WHITE));
+                            });
+                            ctx.request_repaint();
+                        }
+                    },
                 }
 
                 // Info overlay (channel name + key hints).

@@ -8,8 +8,7 @@ use super::cdm::CdmHandle;
 
 /// Widevine system UUID bytes (network byte order).
 const WV_SYSTEM_ID: [u8; 16] = [
-    0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
-    0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed,
+    0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce, 0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed,
 ];
 
 /// Extract the Widevine PSSH bytes from a DASH MPD XML string.
@@ -38,9 +37,14 @@ pub fn extract_pssh_from_mpd(mpd_text: &str) -> Option<Vec<u8>> {
                         let b64 = remaining[content_start..content_start + rel_end].trim();
                         if let Ok(bytes) = base64::engine::general_purpose::STANDARD
                             .decode(b64)
-                            .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64))
+                            .or_else(|_| {
+                                base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64)
+                            })
                         {
-                            tracing::debug!("widevine: PSSH from <cenc:pssh> ({} bytes)", bytes.len());
+                            tracing::debug!(
+                                "widevine: PSSH from <cenc:pssh> ({} bytes)",
+                                bytes.len()
+                            );
                             return Some(bytes);
                         }
                     }
@@ -51,7 +55,12 @@ pub fn extract_pssh_from_mpd(mpd_text: &str) -> Option<Vec<u8>> {
 
     // ── Strategy 2: extract KID from default_KID attribute ───────────────────────
     // Look for cenc:default_KID or default_KID (both upper and lower case in the original text).
-    for attr_name in ["cenc:default_KID", "default_KID", "cenc:default_kid", "default_kid"] {
+    for attr_name in [
+        "cenc:default_KID",
+        "default_KID",
+        "cenc:default_kid",
+        "default_kid",
+    ] {
         let pattern = format!("{}=\"", attr_name);
         if let Some(pos) = mpd_text.find(&pattern) {
             let after = &mpd_text[pos + pattern.len()..];
@@ -71,15 +80,19 @@ pub fn extract_pssh_from_mpd(mpd_text: &str) -> Option<Vec<u8>> {
         }
     }
 
-    tracing::warn!("widevine: no PSSH or default_KID found in MPD (first 500 chars: {})",
-        &mpd_text[..mpd_text.len().min(500)]);
+    tracing::warn!(
+        "widevine: no PSSH or default_KID found in MPD (first 500 chars: {})",
+        &mpd_text[..mpd_text.len().min(500)]
+    );
     None
 }
 
 /// Parse a UUID string like `"12345678-1234-1234-1234-123456789abc"` into 16 bytes.
 fn parse_uuid_to_bytes(uuid: &str) -> Option<[u8; 16]> {
     let hex: String = uuid.chars().filter(|c| c.is_ascii_hexdigit()).collect();
-    if hex.len() != 32 { return None; }
+    if hex.len() != 32 {
+        return None;
+    }
     let mut out = [0u8; 16];
     for (i, chunk) in hex.as_bytes().chunks(2).enumerate() {
         let hi = (chunk[0] as char).to_digit(16)? as u8;
@@ -131,13 +144,13 @@ pub fn build_pssh_from_kid(kid: &[u8; 16]) -> Vec<u8> {
     let data = build_widevine_cenc_header(kid);
     let total = (4 + 4 + 1 + 3 + 16 + 4 + data.len()) as u32;
     let mut out = Vec::with_capacity(total as usize);
-    out.extend_from_slice(&total.to_be_bytes());            // size
-    out.extend_from_slice(b"pssh");                         // type
-    out.push(0);                                            // version 0
-    out.extend_from_slice(&[0u8; 3]);                       // flags
-    out.extend_from_slice(&WV_SYSTEM_ID);                   // system_id
+    out.extend_from_slice(&total.to_be_bytes()); // size
+    out.extend_from_slice(b"pssh"); // type
+    out.push(0); // version 0
+    out.extend_from_slice(&[0u8; 3]); // flags
+    out.extend_from_slice(&WV_SYSTEM_ID); // system_id
     out.extend_from_slice(&(data.len() as u32).to_be_bytes()); // data_size
-    out.extend_from_slice(&data);                           // WidevineCencHeader
+    out.extend_from_slice(&data); // WidevineCencHeader
     out
 }
 
@@ -149,7 +162,10 @@ pub fn build_pssh_from_kid(kid: &[u8; 16]) -> Vec<u8> {
 fn log_pssh_kids(pssh: &[u8]) {
     // Minimum: size(4)+fourcc(4)+version(1)+flags(3)+SystemID(16)+data_size(4) = 32 bytes.
     if pssh.len() < 32 {
-        tracing::info!("widevine: license PSSH {} bytes (too short to decode KID)", pssh.len());
+        tracing::info!(
+            "widevine: license PSSH {} bytes (too short to decode KID)",
+            pssh.len()
+        );
         return;
     }
     let version = pssh[8];
@@ -163,7 +179,10 @@ fn log_pssh_kids(pssh: &[u8]) {
                 tracing::info!(
                     "widevine: license PSSH v1 KID[{}]: {}",
                     i,
-                    pssh[start..start + 16].iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                    pssh[start..start + 16]
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
                 );
             }
         }
@@ -176,24 +195,41 @@ fn log_pssh_kids(pssh: &[u8]) {
             // Minimal protobuf scan: field 2 (key_id), wire type 2 (LEN), length 16.
             let mut pos = 0usize;
             while pos < proto.len() {
-                let tag = proto[pos]; pos += 1;
+                let tag = proto[pos];
+                pos += 1;
                 let wire = tag & 0x07;
                 let field = (tag >> 3) as u32;
                 match wire {
-                    0 => { // varint — skip
-                        while pos < proto.len() && proto[pos] & 0x80 != 0 { pos += 1; }
-                        if pos < proto.len() { pos += 1; }
+                    0 => {
+                        // varint — skip
+                        while pos < proto.len() && proto[pos] & 0x80 != 0 {
+                            pos += 1;
+                        }
+                        if pos < proto.len() {
+                            pos += 1;
+                        }
                     }
-                    2 => { // LEN
-                        if pos >= proto.len() { break; }
-                        let len = proto[pos] as usize; pos += 1;
+                    2 => {
+                        // LEN
+                        if pos >= proto.len() {
+                            break;
+                        }
+                        let len = proto[pos] as usize;
+                        pos += 1;
                         if field == 2 && len == 16 && pos + 16 <= proto.len() {
                             tracing::info!(
                                 "widevine: license PSSH v0 key_id: {}",
-                                proto[pos..pos + 16].iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                                proto[pos..pos + 16]
+                                    .iter()
+                                    .map(|b| format!("{:02x}", b))
+                                    .collect::<String>()
                             );
                         }
-                        if pos + len <= proto.len() { pos += len; } else { break; }
+                        if pos + len <= proto.len() {
+                            pos += len;
+                        } else {
+                            break;
+                        }
                     }
                     _ => break,
                 }
@@ -253,7 +289,11 @@ async fn send_challenge(
         let status = resp.status();
         tracing::debug!("widevine: license HTTP status = {}", status);
         for (k, v) in resp.headers() {
-            tracing::debug!("widevine: license error header: {}: {}", k, v.to_str().unwrap_or("?"));
+            tracing::debug!(
+                "widevine: license error header: {}: {}",
+                k,
+                v.to_str().unwrap_or("?")
+            );
         }
         let body = resp.text().await.unwrap_or_default();
         tracing::debug!("widevine: license error body = {}", body);
@@ -267,15 +307,24 @@ async fn send_challenge(
         .unwrap_or("")
         .to_string();
 
-    let raw = resp.bytes().await.context("license response body")?.to_vec();
-    tracing::info!("widevine: license response {} bytes (content-type: {})", raw.len(), content_type);
+    let raw = resp
+        .bytes()
+        .await
+        .context("license response body")?
+        .to_vec();
+    tracing::info!(
+        "widevine: license response {} bytes (content-type: {})",
+        raw.len(),
+        content_type
+    );
 
     // If JSON, try to extract base64-encoded license from known field names.
     if content_type.contains("json") || raw.first() == Some(&b'{') {
         if let Ok(json) = serde_json::from_slice::<serde_json::Value>(&raw) {
             for field in &["license", "data", "rawLicenseResponse", "licenseResponse"] {
                 if let Some(b64) = json.get(field).and_then(|v| v.as_str()) {
-                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD.decode(b64)
+                    if let Ok(decoded) = base64::engine::general_purpose::STANDARD
+                        .decode(b64)
                         .or_else(|_| base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(b64))
                     {
                         tracing::debug!("widevine: license from JSON field '{}'", field);
@@ -329,12 +378,14 @@ pub async fn acquire_license(
         .context("reqwest client")?;
 
     // Step 2: send challenge to license server.
-    let license_response: Vec<u8> = send_challenge(&client, la_url, &challenge, license_headers).await?;
+    let license_response: Vec<u8> =
+        send_challenge(&client, la_url, &challenge, license_headers).await?;
 
     // Step 3: feed response to CDM.
     {
         let mut h = cdm.lock().unwrap();
-        h.update_session(&session_id, &license_response).context("CDM update_session")?;
+        h.update_session(&session_id, &license_response)
+            .context("CDM update_session")?;
     }
 
     tracing::info!("widevine: keys loaded for session {}", session_id);

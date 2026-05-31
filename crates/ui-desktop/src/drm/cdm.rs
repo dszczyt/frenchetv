@@ -1,3 +1,4 @@
+use anyhow::{bail, Context, Result};
 /// Safe Rust wrapper around the C CDM shim (cdm_shim.cpp).
 ///
 /// # Thread safety
@@ -7,7 +8,6 @@
 use std::ffi::CString;
 use std::os::raw::{c_char, c_int, c_void};
 use std::sync::{Arc, Mutex};
-use anyhow::{bail, Context, Result};
 
 // ─── FFI types (must match cdm_shim.cpp exactly) ─────────────────────────────
 
@@ -45,7 +45,8 @@ pub struct RawDecryptOutput {
 #[repr(C)]
 struct RawCallbacks {
     on_initialized: Option<unsafe extern "C" fn(*mut c_void, bool)>,
-    on_license_request: Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *const u8, u32)>,
+    on_license_request:
+        Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, *const u8, u32)>,
     on_keys_change: Option<unsafe extern "C" fn(*mut c_void, *const c_char, u32, bool)>,
     on_promise_ok: Option<unsafe extern "C" fn(*mut c_void, u32, *const c_char, u32)>,
     on_promise_err: Option<unsafe extern "C" fn(*mut c_void, u32, *const c_char, u32)>,
@@ -61,7 +62,12 @@ enum CdmStateOpaque {}
 extern "C" {
     fn cdm_create(lib_path: *const c_char, callbacks: *const RawCallbacks) -> *mut CdmStateOpaque;
     fn cdm_initialize(state: *mut CdmStateOpaque);
-    fn cdm_create_session(state: *mut CdmStateOpaque, promise_id: u32, pssh: *const u8, pssh_len: u32);
+    fn cdm_create_session(
+        state: *mut CdmStateOpaque,
+        promise_id: u32,
+        pssh: *const u8,
+        pssh_len: u32,
+    );
     fn cdm_update_session(
         state: *mut CdmStateOpaque,
         promise_id: u32,
@@ -104,9 +110,11 @@ unsafe extern "C" fn cb_license_request(
 ) {
     let state = &*(ctx as *const Mutex<CallbackState>);
     if let Ok(mut s) = state.lock() {
-        let sid_bytes = std::slice::from_raw_parts(session_id as *const u8, session_id_len as usize);
+        let sid_bytes =
+            std::slice::from_raw_parts(session_id as *const u8, session_id_len as usize);
         s.session_id = String::from_utf8(sid_bytes.to_vec()).ok();
-        s.license_challenge = Some(std::slice::from_raw_parts(request, request_len as usize).to_vec());
+        s.license_challenge =
+            Some(std::slice::from_raw_parts(request, request_len as usize).to_vec());
     }
 }
 
@@ -131,7 +139,8 @@ unsafe extern "C" fn cb_promise_ok(
     let state = &*(ctx as *const Mutex<CallbackState>);
     if let Ok(mut s) = state.lock() {
         if !session_id.is_null() && session_id_len > 0 {
-            let sid_bytes = std::slice::from_raw_parts(session_id as *const u8, session_id_len as usize);
+            let sid_bytes =
+                std::slice::from_raw_parts(session_id as *const u8, session_id_len as usize);
             s.session_id = String::from_utf8(sid_bytes.to_vec()).ok();
         }
     }
@@ -183,11 +192,11 @@ impl CdmHandle {
         let ctx_ptr = Arc::as_ptr(&shared) as *mut c_void;
 
         let callbacks = RawCallbacks {
-            on_initialized:    Some(cb_initialized),
+            on_initialized: Some(cb_initialized),
             on_license_request: Some(cb_license_request),
-            on_keys_change:    Some(cb_keys_change),
-            on_promise_ok:     Some(cb_promise_ok),
-            on_promise_err:    Some(cb_promise_err),
+            on_keys_change: Some(cb_keys_change),
+            on_promise_ok: Some(cb_promise_ok),
+            on_promise_err: Some(cb_promise_err),
             ctx: ctx_ptr,
         };
 
@@ -197,7 +206,11 @@ impl CdmHandle {
             bail!("cdm_create failed for '{}'", lib_path);
         }
 
-        Ok(Self { raw, shared: Arc::clone(&shared), _ctx_arc: shared })
+        Ok(Self {
+            raw,
+            shared: Arc::clone(&shared),
+            _ctx_arc: shared,
+        })
     }
 
     /// Call `CDM::Initialize`.  Must be called once after `open`.
@@ -207,7 +220,9 @@ impl CdmHandle {
             let mut s = self.shared.lock().unwrap();
             s.init_ok = false;
         }
-        unsafe { cdm_initialize(self.raw); }
+        unsafe {
+            cdm_initialize(self.raw);
+        }
         let s = self.shared.lock().unwrap();
         if !s.init_ok {
             bail!("CDM Initialize returned failure");
@@ -226,14 +241,20 @@ impl CdmHandle {
             s.license_challenge = None;
             s.promise_err = None;
         }
-        unsafe { cdm_create_session(self.raw, 1, pssh.as_ptr(), pssh.len() as u32); }
+        unsafe {
+            cdm_create_session(self.raw, 1, pssh.as_ptr(), pssh.len() as u32);
+        }
         let s = self.shared.lock().unwrap();
         if let Some(ref err) = s.promise_err {
             bail!("CDM create_session rejected: {}", err);
         }
-        let session_id = s.session_id.clone()
+        let session_id = s
+            .session_id
+            .clone()
             .context("CDM: no session_id after CreateSessionAndGenerateRequest")?;
-        let challenge = s.license_challenge.clone()
+        let challenge = s
+            .license_challenge
+            .clone()
             .context("CDM: no license challenge after CreateSessionAndGenerateRequest")?;
         Ok((session_id, challenge))
     }
@@ -286,7 +307,10 @@ impl CdmHandle {
     ) -> Result<Vec<u8>> {
         let raw_subsamples: Vec<SubsampleEntry> = subsamples
             .iter()
-            .map(|&(c, e)| SubsampleEntry { clear_bytes: c, cipher_bytes: e })
+            .map(|&(c, e)| SubsampleEntry {
+                clear_bytes: c,
+                cipher_bytes: e,
+            })
             .collect();
 
         // CENC (AES-CTR): 8-byte IVs go in the upper 8 bytes of the 16-byte counter block;
@@ -308,7 +332,11 @@ impl CdmHandle {
             key_id_size: key_id.len() as u32,
             iv: iv_padded.as_ptr(),
             iv_size: iv_padded.len() as u32,
-            subsamples: if raw_subsamples.is_empty() { std::ptr::null() } else { raw_subsamples.as_ptr() },
+            subsamples: if raw_subsamples.is_empty() {
+                std::ptr::null()
+            } else {
+                raw_subsamples.as_ptr()
+            },
             num_subsamples: raw_subsamples.len() as u32,
             timestamp,
         };
@@ -320,10 +348,11 @@ impl CdmHandle {
         if out.data.is_null() {
             bail!("CDM Decrypt returned null data");
         }
-        let decrypted = unsafe {
-            std::slice::from_raw_parts(out.data, out.data_size as usize).to_vec()
-        };
-        unsafe { cdm_free_output(&mut out); }
+        let decrypted =
+            unsafe { std::slice::from_raw_parts(out.data, out.data_size as usize).to_vec() };
+        unsafe {
+            cdm_free_output(&mut out);
+        }
         Ok(decrypted)
     }
 }
@@ -331,7 +360,9 @@ impl CdmHandle {
 impl Drop for CdmHandle {
     fn drop(&mut self) {
         if !self.raw.is_null() {
-            unsafe { cdm_destroy(self.raw); }
+            unsafe {
+                cdm_destroy(self.raw);
+            }
             self.raw = std::ptr::null_mut();
         }
     }

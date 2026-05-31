@@ -5,8 +5,7 @@ use android_activity::AndroidApp;
 #[no_mangle]
 fn android_main(app: AndroidApp) {
     android_logger::init_once(
-        android_logger::Config::default()
-            .with_max_level(log::LevelFilter::Info),
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
     let native_options = eframe::NativeOptions {
@@ -25,6 +24,6 @@ fn android_main(app: AndroidApp) {
 #[cfg(target_os = "android")]
 mod app;
 #[cfg(target_os = "android")]
-mod screens;
-#[cfg(target_os = "android")]
 mod player;
+#[cfg(target_os = "android")]
+mod screens;

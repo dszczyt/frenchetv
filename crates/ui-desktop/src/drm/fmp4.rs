@@ -41,7 +41,9 @@ impl<'a> Iterator for BoxIter<'a> {
         let size32 = u32::from_be_bytes(self.data[start..start + 4].try_into().ok()?) as usize;
         let fourcc: [u8; 4] = self.data[start + 4..start + 8].try_into().ok()?;
         let (header_size, total_size) = if size32 == 1 {
-            if start + 16 > self.data.len() { return None; }
+            if start + 16 > self.data.len() {
+                return None;
+            }
             let s64 = u64::from_be_bytes(self.data[start + 8..start + 16].try_into().ok()?);
             (16, s64 as usize)
         } else if size32 == 0 {
@@ -54,7 +56,12 @@ impl<'a> Iterator for BoxIter<'a> {
         }
         let payload = &self.data[start + header_size..start + total_size];
         self.pos = start + total_size;
-        Some(BoxRef { fourcc, payload, offset: start, total_size })
+        Some(BoxRef {
+            fourcc,
+            payload,
+            offset: start,
+            total_size,
+        })
     }
 }
 
@@ -68,13 +75,17 @@ pub fn find_box<'a>(container: &'a [u8], fourcc: &[u8; 4]) -> Option<BoxRef<'a>>
 /// (avcC, tkhd, mvhd, …) as box streams.  Used for diagnostics only.
 pub fn find_box_in_init<'a>(data: &'a [u8], fourcc: &[u8; 4]) -> Option<BoxRef<'a>> {
     const CONTAINERS: &[[u8; 4]] = &[
-        *b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd",
-        *b"sinf", *b"schi", *b"encv", *b"enca", *b"avc1", *b"mp4a",
+        *b"moov", *b"trak", *b"mdia", *b"minf", *b"stbl", *b"stsd", *b"sinf", *b"schi", *b"encv",
+        *b"enca", *b"avc1", *b"mp4a",
     ];
     for b in boxes(data) {
-        if &b.fourcc == fourcc { return Some(b); }
+        if &b.fourcc == fourcc {
+            return Some(b);
+        }
         if CONTAINERS.contains(&b.fourcc) {
-            if let Some(found) = find_box_in_init(b.payload, fourcc) { return Some(found); }
+            if let Some(found) = find_box_in_init(b.payload, fourcc) {
+                return Some(found);
+            }
         }
     }
     None
@@ -83,9 +94,15 @@ pub fn find_box_in_init<'a>(data: &'a [u8], fourcc: &[u8; 4]) -> Option<BoxRef<'
 /// Recursively find a box by path (e.g. `["moov","trak","mdia"]`).
 #[allow(dead_code)]
 pub fn find_box_path<'a>(data: &'a [u8], path: &[&[u8; 4]]) -> Option<BoxRef<'a>> {
-    if path.is_empty() { return None; }
+    if path.is_empty() {
+        return None;
+    }
     let b = find_box(data, path[0])?;
-    if path.len() == 1 { Some(b) } else { find_box_path(b.payload, &path[1..]) }
+    if path.len() == 1 {
+        Some(b)
+    } else {
+        find_box_path(b.payload, &path[1..])
+    }
 }
 
 // ─── Init-segment parsing ─────────────────────────────────────────────────────
@@ -158,8 +175,7 @@ pub fn extract_widevine_pssh(data: &[u8]) -> Option<Vec<u8>> {
 
 /// Widevine system ID bytes.
 const WV_SYSTEM_ID: [u8; 16] = [
-    0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce,
-    0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed,
+    0xed, 0xef, 0x8b, 0xa9, 0x79, 0xd6, 0x4a, 0xce, 0xa3, 0xc8, 0x27, 0xdc, 0xd5, 0x1d, 0x21, 0xed,
 ];
 
 /// Extract the first KID from a Widevine PSSH box payload (the bytes after the
@@ -169,37 +185,57 @@ const WV_SYSTEM_ID: [u8; 16] = [
 /// PSSH v1 (KID list in the box header).
 fn extract_kid_from_widevine_pssh(payload: &[u8]) -> Option<[u8; 16]> {
     // Full-box header: version(1) + flags(3) = 4 bytes, then SystemID(16).
-    if payload.len() < 20 { return None; }
+    if payload.len() < 20 {
+        return None;
+    }
     let version = payload[0];
-    if &payload[4..20] != WV_SYSTEM_ID { return None; }
+    if &payload[4..20] != WV_SYSTEM_ID {
+        return None;
+    }
 
     if version == 1 {
         // v1: KID count (4 bytes) then KIDs.
-        if payload.len() < 24 { return None; }
+        if payload.len() < 24 {
+            return None;
+        }
         let kid_count = u32::from_be_bytes(payload[20..24].try_into().ok()?) as usize;
         if kid_count > 0 && payload.len() >= 40 {
             return Some(payload[24..40].try_into().ok()?);
         }
     } else {
         // v0: data_size(4) + WidevineCencHeader protobuf.
-        if payload.len() < 24 { return None; }
+        if payload.len() < 24 {
+            return None;
+        }
         let data_size = u32::from_be_bytes(payload[20..24].try_into().ok()?) as usize;
-        if payload.len() < 24 + data_size { return None; }
+        if payload.len() < 24 + data_size {
+            return None;
+        }
         let proto = &payload[24..24 + data_size];
         // Minimal protobuf scan for field 2 (key_id), wire type 2 (LEN).
         let mut pos = 0;
         while pos < proto.len() {
-            let tag = proto[pos]; pos += 1;
+            let tag = proto[pos];
+            pos += 1;
             let wire = tag & 0x07;
             let field = tag >> 3;
             match wire {
-                0 => { // varint — skip
-                    while pos < proto.len() && proto[pos] & 0x80 != 0 { pos += 1; }
-                    if pos < proto.len() { pos += 1; }
+                0 => {
+                    // varint — skip
+                    while pos < proto.len() && proto[pos] & 0x80 != 0 {
+                        pos += 1;
+                    }
+                    if pos < proto.len() {
+                        pos += 1;
+                    }
                 }
-                2 => { // LEN
-                    if pos >= proto.len() { break; }
-                    let len = proto[pos] as usize; pos += 1;
+                2 => {
+                    // LEN
+                    if pos >= proto.len() {
+                        break;
+                    }
+                    let len = proto[pos] as usize;
+                    pos += 1;
                     if field == 2 && len == 16 && pos + 16 <= proto.len() {
                         return Some(proto[pos..pos + 16].try_into().ok()?);
                     }
@@ -213,12 +249,26 @@ fn extract_kid_from_widevine_pssh(payload: &[u8]) -> Option<[u8; 16]> {
 }
 
 fn parse_trak_tenc(trak: &[u8]) -> Result<Option<InitInfo>> {
-    let mdia = match find_box(trak, b"mdia") { Some(b) => b, None => return Ok(None) };
-    let minf = match find_box(mdia.payload, b"minf") { Some(b) => b, None => return Ok(None) };
-    let stbl = match find_box(minf.payload, b"stbl") { Some(b) => b, None => return Ok(None) };
-    let stsd = match find_box(stbl.payload, b"stsd") { Some(b) => b, None => return Ok(None) };
+    let mdia = match find_box(trak, b"mdia") {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let minf = match find_box(mdia.payload, b"minf") {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let stbl = match find_box(minf.payload, b"stbl") {
+        Some(b) => b,
+        None => return Ok(None),
+    };
+    let stsd = match find_box(stbl.payload, b"stsd") {
+        Some(b) => b,
+        None => return Ok(None),
+    };
     // stsd version(1)+flags(3)+entry_count(4) then N entries
-    if stsd.payload.len() < 8 { return Ok(None); }
+    if stsd.payload.len() < 8 {
+        return Ok(None);
+    }
     let entry_data = &stsd.payload[8..];
     // Try encv then enca
     for enc_type in [b"encv", b"enca"] {
@@ -231,7 +281,13 @@ fn parse_trak_tenc(trak: &[u8]) -> Result<Option<InitInfo>> {
                 // SchemeTypeBox layout: FullBox header (version 1B + flags 3B) + scheme_type 4CC.
                 let encryption_scheme = find_box(sinf.payload, b"schm")
                     .filter(|b| b.payload.len() >= 8)
-                    .map(|b| if &b.payload[4..8] == b"cbcs" { 2u32 } else { 1u32 })
+                    .map(|b| {
+                        if &b.payload[4..8] == b"cbcs" {
+                            2u32
+                        } else {
+                            1u32
+                        }
+                    })
                     .unwrap_or(1u32);
                 if let Some(schi) = find_box(sinf.payload, b"schi") {
                     if let Some(tenc) = find_box(schi.payload, b"tenc") {
@@ -253,7 +309,11 @@ fn parse_tenc(payload: &[u8], encryption_scheme: u32) -> Result<InitInfo> {
     let default_iv_size = payload[7];
     let mut default_kid = [0u8; 16];
     default_kid.copy_from_slice(&payload[8..24]);
-    Ok(InitInfo { default_kid, default_iv_size, encryption_scheme })
+    Ok(InitInfo {
+        default_kid,
+        default_iv_size,
+        encryption_scheme,
+    })
 }
 
 /// Rewrite an init segment: replace `encv`/`enca` sample entries with their
@@ -283,11 +343,10 @@ fn strip_enc_moov(payload: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(payload.len());
     for b in boxes(payload) {
         match &b.fourcc {
-            b"pssh" => {}  // remove all pssh boxes
+            b"pssh" => {} // remove all pssh boxes
             b"trak" => {
                 // Path: trak → mdia → minf → stbl → stsd
-                let inner = strip_enc_path(b.payload,
-                    &[b"mdia", b"minf", b"stbl", b"stsd"]);
+                let inner = strip_enc_path(b.payload, &[b"mdia", b"minf", b"stbl", b"stsd"]);
                 push_iso_box(&mut out, b"trak", &inner);
             }
             _ => out.extend_from_slice(&payload[b.offset..b.offset + b.total_size]),
@@ -299,14 +358,16 @@ fn strip_enc_moov(payload: &[u8]) -> Vec<u8> {
 /// Walk a chain of container boxes, passing unrelated boxes through verbatim,
 /// and recursing into the named containers.  The last name in `chain` is `stsd`.
 fn strip_enc_path(payload: &[u8], chain: &[&[u8; 4]]) -> Vec<u8> {
-    if chain.is_empty() { return payload.to_vec(); }
+    if chain.is_empty() {
+        return payload.to_vec();
+    }
     let target = chain[0];
-    let rest   = &chain[1..];
+    let rest = &chain[1..];
     let mut out = Vec::with_capacity(payload.len());
     for b in boxes(payload) {
         if &b.fourcc == target {
             let inner = if rest.is_empty() {
-                strip_enc_stsd(b.payload)       // reached stsd
+                strip_enc_stsd(b.payload) // reached stsd
             } else {
                 strip_enc_path(b.payload, rest) // keep descending
             };
@@ -321,7 +382,9 @@ fn strip_enc_path(payload: &[u8], chain: &[&[u8; 4]]) -> Vec<u8> {
 /// Rebuild `stsd` payload: convert `encv`/`enca` entries to plain codec form.
 fn strip_enc_stsd(payload: &[u8]) -> Vec<u8> {
     // stsd: version(1)+flags(3)+entry_count(4) = 8-byte prefix before entries.
-    if payload.len() < 8 { return payload.to_vec(); }
+    if payload.len() < 8 {
+        return payload.to_vec();
+    }
     let mut out = payload[..8].to_vec();
     let entries = &payload[8..];
     for entry in boxes(entries) {
@@ -330,7 +393,7 @@ fn strip_enc_stsd(payload: &[u8]) -> Vec<u8> {
             let is_visual = &entry.fourcc == b"encv";
             match unprotect_sample_entry(entry.payload, is_visual) {
                 Some(plain) => out.extend_from_slice(&plain),
-                None        => out.extend_from_slice(raw), // fallback: keep as-is
+                None => out.extend_from_slice(raw), // fallback: keep as-is
             }
         } else {
             out.extend_from_slice(raw);
@@ -350,11 +413,15 @@ fn strip_enc_stsd(payload: &[u8]) -> Vec<u8> {
 ///   `enca` AudioSampleEntry   — 28 bytes
 fn unprotect_sample_entry(payload: &[u8], is_visual: bool) -> Option<Vec<u8>> {
     let fixed = if is_visual { 78usize } else { 28usize };
-    if payload.len() < fixed { return None; }
+    if payload.len() < fixed {
+        return None;
+    }
 
     let sinf = find_box(payload, b"sinf")?;
     let frma = find_box(sinf.payload, b"frma")?;
-    if frma.payload.len() < 4 { return None; }
+    if frma.payload.len() < 4 {
+        return None;
+    }
     let orig_type: [u8; 4] = frma.payload[..4].try_into().ok()?;
 
     // Collect child boxes, skipping sinf.
@@ -437,7 +504,11 @@ pub fn parse_media_segment<'a>(data: &'a [u8], iv_size: u8) -> Result<ParsedSegm
     let mut samples = Vec::with_capacity(sample_sizes.len());
     let mut offset_in_mdat: usize = 0;
     for (i, &sz) in sample_sizes.iter().enumerate() {
-        let enc = if i < enc_infos.len() { Some(enc_infos[i].clone()) } else { None };
+        let enc = if i < enc_infos.len() {
+            Some(enc_infos[i].clone())
+        } else {
+            None
+        };
         samples.push(SampleInfo {
             mdat_offset: offset_in_mdat,
             size: sz,
@@ -447,13 +518,23 @@ pub fn parse_media_segment<'a>(data: &'a [u8], iv_size: u8) -> Result<ParsedSegm
         offset_in_mdat += sz;
     }
 
-    Ok(ParsedSegment { samples, mdat_payload, mdat_box_offset, mdat_box_size })
+    Ok(ParsedSegment {
+        samples,
+        mdat_payload,
+        mdat_box_offset,
+        mdat_box_size,
+    })
 }
 
 fn parse_tfdt(traf_payload: &[u8]) -> u64 {
-    let b = match find_box(traf_payload, b"tfdt") { Some(b) => b, None => return 0 };
+    let b = match find_box(traf_payload, b"tfdt") {
+        Some(b) => b,
+        None => return 0,
+    };
     let p = b.payload;
-    if p.is_empty() { return 0; }
+    if p.is_empty() {
+        return 0;
+    }
     let version = p[0];
     if version == 1 && p.len() >= 12 {
         u64::from_be_bytes(p[4..12].try_into().unwrap_or([0u8; 8]))
@@ -465,38 +546,52 @@ fn parse_tfdt(traf_payload: &[u8]) -> u64 {
 }
 
 fn parse_trun(payload: &[u8]) -> Result<(i32, Vec<usize>)> {
-    if payload.len() < 8 { bail!("trun too short"); }
+    if payload.len() < 8 {
+        bail!("trun too short");
+    }
     let _version = payload[0];
     let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
     let sample_count = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
 
     let mut cursor = 8usize;
     let data_offset = if flags & 0x000001 != 0 {
-        if cursor + 4 > payload.len() { bail!("trun data_offset truncated"); }
+        if cursor + 4 > payload.len() {
+            bail!("trun data_offset truncated");
+        }
         let v = i32::from_be_bytes(payload[cursor..cursor + 4].try_into().unwrap());
         cursor += 4;
         v
-    } else { 0 };
+    } else {
+        0
+    };
 
-    if flags & 0x000004 != 0 { cursor += 4; } // first_sample_flags
+    if flags & 0x000004 != 0 {
+        cursor += 4;
+    } // first_sample_flags
 
     let has_duration = flags & 0x000100 != 0;
-    let has_size     = flags & 0x000200 != 0;
-    let has_sflags   = flags & 0x000400 != 0;
-    let has_cts      = flags & 0x000800 != 0;
+    let has_size = flags & 0x000200 != 0;
+    let has_sflags = flags & 0x000400 != 0;
+    let has_cts = flags & 0x000800 != 0;
 
-    let per_sample_size = (has_duration as usize + has_size as usize
-        + has_sflags as usize + has_cts as usize) * 4;
+    let per_sample_size =
+        (has_duration as usize + has_size as usize + has_sflags as usize + has_cts as usize) * 4;
 
     let mut sizes = Vec::with_capacity(sample_count);
     for _ in 0..sample_count {
-        if cursor + per_sample_size > payload.len() { break; }
+        if cursor + per_sample_size > payload.len() {
+            break;
+        }
         let mut c2 = cursor;
-        if has_duration { c2 += 4; }
+        if has_duration {
+            c2 += 4;
+        }
         let sz = if has_size {
             let v = u32::from_be_bytes(payload[c2..c2 + 4].try_into().unwrap()) as usize;
             v
-        } else { 0 };
+        } else {
+            0
+        };
         sizes.push(sz);
         cursor += per_sample_size;
     }
@@ -505,7 +600,9 @@ fn parse_trun(payload: &[u8]) -> Result<(i32, Vec<usize>)> {
 }
 
 fn parse_senc(payload: &[u8], iv_size: u8, sample_count: usize) -> Result<Vec<SampleEncInfo>> {
-    if payload.len() < 8 { bail!("senc too short"); }
+    if payload.len() < 8 {
+        bail!("senc too short");
+    }
     let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
     let cnt = u32::from_be_bytes(payload[4..8].try_into().unwrap()) as usize;
     let has_subsamples = flags & 0x000002 != 0;
@@ -515,19 +612,27 @@ fn parse_senc(payload: &[u8], iv_size: u8, sample_count: usize) -> Result<Vec<Sa
 
     for _ in 0..cnt.min(sample_count) {
         let iv_sz = iv_size as usize;
-        if cursor + iv_sz > payload.len() { break; }
+        if cursor + iv_sz > payload.len() {
+            break;
+        }
         let iv = payload[cursor..cursor + iv_sz].to_vec();
         cursor += iv_sz;
 
         let subsamples = if has_subsamples {
-            if cursor + 2 > payload.len() { break; }
+            if cursor + 2 > payload.len() {
+                break;
+            }
             let n = u16::from_be_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as usize;
             cursor += 2;
             let mut subs = Vec::with_capacity(n);
             for _ in 0..n {
-                if cursor + 6 > payload.len() { break; }
-                let clear = u16::from_be_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as u32;
-                let cipher = u32::from_be_bytes(payload[cursor + 2..cursor + 6].try_into().unwrap());
+                if cursor + 6 > payload.len() {
+                    break;
+                }
+                let clear =
+                    u16::from_be_bytes(payload[cursor..cursor + 2].try_into().unwrap()) as u32;
+                let cipher =
+                    u32::from_be_bytes(payload[cursor + 2..cursor + 6].try_into().unwrap());
                 subs.push((clear, cipher));
                 cursor += 6;
             }
@@ -546,7 +651,11 @@ fn parse_senc(payload: &[u8], iv_size: u8, sample_count: usize) -> Result<Vec<Sa
 ///
 /// Replaces the mdat payload and removes the `senc` box from `traf`.
 /// All other boxes (moof, trun, etc.) are preserved.
-pub fn rebuild_segment(original: &[u8], decrypted_samples: &[Vec<u8>], parsed: &ParsedSegment) -> Vec<u8> {
+pub fn rebuild_segment(
+    original: &[u8],
+    decrypted_samples: &[Vec<u8>],
+    parsed: &ParsedSegment,
+) -> Vec<u8> {
     // Build new mdat payload.
     let mut new_mdat_payload: Vec<u8> = Vec::new();
     for s in decrypted_samples {
@@ -648,7 +757,9 @@ fn remove_enc_boxes_from_traf(traf_payload: &[u8]) -> (Vec<u8>, usize) {
 /// When we shorten `moof` by removing enc boxes from `traf`, `data_offset`
 /// must decrease by the same amount so ffmpeg finds the sample data correctly.
 fn fix_traf_trun_offset(traf_payload: &[u8], delta: i32) -> Vec<u8> {
-    if delta == 0 { return traf_payload.to_vec(); }
+    if delta == 0 {
+        return traf_payload.to_vec();
+    }
     let mut out = Vec::with_capacity(traf_payload.len());
     for b in boxes(traf_payload) {
         if &b.fourcc == b"trun" {
@@ -666,9 +777,13 @@ fn fix_traf_trun_offset(traf_payload: &[u8], delta: i32) -> Vec<u8> {
 
 /// Add `delta` to `trun.data_offset` if the data-offset flag is set.
 fn adjust_trun_data_offset(payload: &[u8], delta: i32) -> Vec<u8> {
-    if payload.len() < 12 { return payload.to_vec(); }
+    if payload.len() < 12 {
+        return payload.to_vec();
+    }
     let flags = u32::from_be_bytes([0, payload[1], payload[2], payload[3]]);
-    if flags & 0x000001 == 0 { return payload.to_vec(); } // no data-offset field
+    if flags & 0x000001 == 0 {
+        return payload.to_vec();
+    } // no data-offset field
     let old = i32::from_be_bytes(payload[8..12].try_into().unwrap());
     let mut out = payload.to_vec();
     out[8..12].copy_from_slice(&(old + delta).to_be_bytes());

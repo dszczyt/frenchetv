@@ -7,7 +7,6 @@
 ///
 /// Session tokens (e.g. `wassup` cookie) are not passwords — treating them like
 /// browser cookies and storing on disk is appropriate.
-
 use std::collections::HashMap;
 use std::path::PathBuf;
 

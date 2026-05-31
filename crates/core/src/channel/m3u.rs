@@ -31,11 +31,10 @@ pub fn parse_m3u(content: &str) -> Vec<Channel> {
         };
 
         let tvg_id = extract_attr(attrs_str, "tvg-id").unwrap_or_default();
-        let tvg_name = extract_attr(attrs_str, "tvg-name")
-            .unwrap_or_else(|| display_name.to_string());
+        let tvg_name =
+            extract_attr(attrs_str, "tvg-name").unwrap_or_else(|| display_name.to_string());
         let tvg_logo = extract_attr(attrs_str, "tvg-logo");
-        let tvg_chno = extract_attr(attrs_str, "tvg-chno")
-            .and_then(|s| s.parse::<u32>().ok());
+        let tvg_chno = extract_attr(attrs_str, "tvg-chno").and_then(|s| s.parse::<u32>().ok());
         let group_title = extract_attr(attrs_str, "group-title").unwrap_or_default();
 
         // Next non-empty, non-comment line is the stream URL
@@ -67,7 +66,11 @@ pub fn parse_m3u(content: &str) -> Vec<Channel> {
 
         channels.push(Channel {
             id,
-            name: if !tvg_name.is_empty() { tvg_name } else { display_name.to_string() },
+            name: if !tvg_name.is_empty() {
+                tvg_name
+            } else {
+                display_name.to_string()
+            },
             logo_url: tvg_logo.filter(|s| !s.is_empty()),
             number: tvg_chno,
             category: ChannelCategory::from_group_title(&group_title),
@@ -107,7 +110,10 @@ mod tests {
         let tf1 = &channels[0];
         assert_eq!(tf1.id, "TF1.fr");
         assert_eq!(tf1.name, "TF1");
-        assert_eq!(tf1.logo_url.as_deref(), Some("https://logos.example.com/tf1.png"));
+        assert_eq!(
+            tf1.logo_url.as_deref(),
+            Some("https://logos.example.com/tf1.png")
+        );
         assert_eq!(tf1.category, ChannelCategory::Generalist);
     }
 

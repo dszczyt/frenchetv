@@ -1,5 +1,5 @@
-use url::Url;
 use serde::{Deserialize, Serialize};
+use url::Url;
 
 /// Widevine DRM protection parameters extracted from the stream API.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,11 +34,21 @@ pub struct StreamUrl {
 
 impl StreamUrl {
     pub fn direct(url: Url) -> Self {
-        Self { url, auth_header: None, headers: vec![], protection: None }
+        Self {
+            url,
+            auth_header: None,
+            headers: vec![],
+            protection: None,
+        }
     }
 
     pub fn authenticated(url: Url, bearer_token: &str) -> Self {
-        Self { url, auth_header: Some(format!("Bearer {}", bearer_token)), headers: vec![], protection: None }
+        Self {
+            url,
+            auth_header: Some(format!("Bearer {}", bearer_token)),
+            headers: vec![],
+            protection: None,
+        }
     }
 
     /// Attach an extra (name, value) header.

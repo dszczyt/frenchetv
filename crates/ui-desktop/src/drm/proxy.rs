@@ -1,3 +1,4 @@
+use anyhow::{bail, Context, Result};
 /// Local HTTP proxy that pre-decrypts CENC segments for mpv.
 ///
 /// ## URL scheme
@@ -9,7 +10,6 @@
 /// The MPD is rewritten so every `https://HOST/...` CDN URL becomes
 /// `/cdn/https/HOST/...` and `ContentProtection` elements are stripped.
 use std::sync::{Arc, Mutex};
-use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -26,7 +26,9 @@ pub struct DrmProxy {
 }
 
 impl Drop for DrmProxy {
-    fn drop(&mut self) { self._task.abort(); }
+    fn drop(&mut self) {
+        self._task.abort();
+    }
 }
 
 /// Start the DRM proxy.
@@ -58,12 +60,22 @@ pub async fn start(
     // Extract encryption scheme from MPD BEFORE stripping ContentProtection elements.
     // Orange DASH MPD uses value="cenc" or value="cbcs" on ContentProtection.
     let mpd_scheme = extract_mpd_scheme(&mpd_text);
-    tracing::info!("DRM proxy: MPD encryption scheme={} ({})", mpd_scheme,
-        if mpd_scheme == 2 { "CBCS/AES-CBC" } else { "CENC/AES-CTR" });
+    tracing::info!(
+        "DRM proxy: MPD encryption scheme={} ({})",
+        mpd_scheme,
+        if mpd_scheme == 2 {
+            "CBCS/AES-CBC"
+        } else {
+            "CENC/AES-CTR"
+        }
+    );
 
     // Build initial MPD as a fallback (used if the first CDN refresh fails).
     let mpd_fallback = rewrite_mpd(&mpd_text, &mpd_base_url, port);
-    tracing::info!("DRM proxy initial MPD:\n{}", &mpd_fallback[..mpd_fallback.len().min(4000)]);
+    tracing::info!(
+        "DRM proxy initial MPD:\n{}",
+        &mpd_fallback[..mpd_fallback.len().min(4000)]
+    );
 
     let state = Arc::new(ProxyState {
         cdm,
@@ -98,7 +110,10 @@ pub async fn start(
 
     let mpd_url = format!("http://127.0.0.1:{}/manifest.mpd", port);
     tracing::info!("DRM proxy started at {}", mpd_url);
-    Ok(DrmProxy { mpd_url, _task: task })
+    Ok(DrmProxy {
+        mpd_url,
+        _task: task,
+    })
 }
 
 // ─── Proxy internals ──────────────────────────────────────────────────────────
@@ -130,18 +145,25 @@ struct ProxyState {
 async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<()> {
     let mut reader = BufReader::new(stream);
     let mut request_line = String::new();
-    reader.read_line(&mut request_line).await.context("read request line")?;
+    reader
+        .read_line(&mut request_line)
+        .await
+        .context("read request line")?;
 
     // Parse: "GET /path HTTP/1.1\r\n"
     let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
-    if parts.len() < 2 { bail!("malformed request"); }
+    if parts.len() < 2 {
+        bail!("malformed request");
+    }
     let path = parts[1];
 
     // Drain headers (we don't need them)
     loop {
         let mut line = String::new();
         reader.read_line(&mut line).await?;
-        if line == "\r\n" || line == "\n" || line.is_empty() { break; }
+        if line == "\r\n" || line == "\n" || line.is_empty() {
+            break;
+        }
     }
 
     tracing::debug!("DRM proxy request: {}", &path[..path.len().min(200)]);
@@ -215,7 +237,11 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
             let final_url = resp.url().to_string();
             match resp.text().await {
                 Ok(text) => {
-                    tracing::debug!("DRM proxy: refreshed live MPD ({} bytes, url={})", text.len(), &final_url[..final_url.len().min(120)]);
+                    tracing::debug!(
+                        "DRM proxy: refreshed live MPD ({} bytes, url={})",
+                        text.len(),
+                        &final_url[..final_url.len().min(120)]
+                    );
                     rewrite_mpd(&text, &final_url, state.proxy_port)
                 }
                 Err(e) => {
@@ -225,7 +251,10 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
             }
         }
         Ok(resp) => {
-            tracing::warn!("DRM proxy: MPD refresh returned {} — using fallback", resp.status());
+            tracing::warn!(
+                "DRM proxy: MPD refresh returned {} — using fallback",
+                resp.status()
+            );
             state.mpd_fallback.clone()
         }
         Err(e) => {
@@ -246,7 +275,11 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     // Log URL after url-crate normalization so we can detect encoding changes.
     if let Ok(parsed) = url::Url::parse(&real_url) {
         if parsed.as_str() != real_url {
-            tracing::warn!("DRM proxy URL normalised: {} → {}", real_url, parsed.as_str());
+            tracing::warn!(
+                "DRM proxy URL normalised: {} → {}",
+                real_url,
+                parsed.as_str()
+            );
         }
     }
 
@@ -264,7 +297,11 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     if !resp.status().is_success() {
         let status = resp.status();
         for (k, v) in resp.headers() {
-            tracing::info!("DRM proxy CDN error header: {}: {}", k, v.to_str().unwrap_or("?"));
+            tracing::info!(
+                "DRM proxy CDN error header: {}: {}",
+                k,
+                v.to_str().unwrap_or("?")
+            );
         }
         let body = resp.text().await.unwrap_or_default();
         tracing::info!("DRM proxy CDN error body: {}", &body[..body.len().min(500)]);
@@ -281,13 +318,22 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
             Ok(Some(info)) => {
                 tracing::info!(
                     "DRM proxy: init segment parsed ok (scheme={}, iv_size={}, kid={})",
-                    if info.encryption_scheme == 2 { "CBCS" } else { "CENC" },
+                    if info.encryption_scheme == 2 {
+                        "CBCS"
+                    } else {
+                        "CENC"
+                    },
                     info.default_iv_size,
-                    info.default_kid.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                    info.default_kid
+                        .iter()
+                        .map(|b| format!("{:02x}", b))
+                        .collect::<String>()
                 );
                 *state.init_info.lock().unwrap() = Some(info);
             }
-            Ok(None) => tracing::warn!("DRM proxy: init segment has no tenc box — init_info stays None"),
+            Ok(None) => {
+                tracing::warn!("DRM proxy: init segment has no tenc box — init_info stays None")
+            }
             Err(e) => tracing::warn!("DRM proxy: init segment parse failed: {:#}", e),
         }
         let plain_init = fmp4::strip_encryption_from_init(&data);
@@ -297,7 +343,11 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
         let has_avcc = fmp4::find_box_in_init(&plain_init, b"avcC").is_some();
         tracing::info!(
             "DRM proxy: init stripped ({} → {} bytes) encv={} avc1={} avcC={}",
-            data.len(), plain_init.len(), has_encv, has_avc1, has_avcc
+            data.len(),
+            plain_init.len(),
+            has_encv,
+            has_avc1,
+            has_avcc
         );
         return Ok(plain_init);
     }
@@ -310,24 +360,41 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
                 tracing::warn!("DRM proxy: init auto-fetch failed: {:#}", e);
             }
         } else {
-            tracing::warn!("DRM proxy: cannot derive init URL from: {}", &real_url[..real_url.len().min(120)]);
+            tracing::warn!(
+                "DRM proxy: cannot derive init URL from: {}",
+                &real_url[..real_url.len().min(120)]
+            );
         }
     }
 
     let init_info = state.init_info.lock().unwrap().clone();
     let iv_size = init_info.as_ref().map(|i| i.default_iv_size).unwrap_or(8);
-    let default_kid = init_info.as_ref().map(|i| i.default_kid).unwrap_or([0u8; 16]);
-    let encryption_scheme = init_info.as_ref().map(|i| i.encryption_scheme).unwrap_or(state.mpd_scheme);
+    let default_kid = init_info
+        .as_ref()
+        .map(|i| i.default_kid)
+        .unwrap_or([0u8; 16]);
+    let encryption_scheme = init_info
+        .as_ref()
+        .map(|i| i.encryption_scheme)
+        .unwrap_or(state.mpd_scheme);
     if init_info.is_none() {
         tracing::warn!("DRM proxy: init still None after auto-fetch — decrypt will fail (NoKey)");
     } else {
-        tracing::debug!("DRM proxy: decrypt scheme={} kid={}",
-            if encryption_scheme == 2 { "CBCS" } else { "CENC" },
-            default_kid.iter().map(|b| format!("{:02x}", b)).collect::<String>());
+        tracing::debug!(
+            "DRM proxy: decrypt scheme={} kid={}",
+            if encryption_scheme == 2 {
+                "CBCS"
+            } else {
+                "CENC"
+            },
+            default_kid
+                .iter()
+                .map(|b| format!("{:02x}", b))
+                .collect::<String>()
+        );
     }
 
-    let parsed = fmp4::parse_media_segment(&data, iv_size)
-        .context("parse media segment")?;
+    let parsed = fmp4::parse_media_segment(&data, iv_size).context("parse media segment")?;
 
     let mut decrypted_samples = Vec::with_capacity(parsed.samples.len());
     for sample in &parsed.samples {
@@ -338,7 +405,14 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
                 .cdm
                 .lock()
                 .unwrap()
-                .decrypt(raw, &default_kid, &enc.iv, &subs, sample.decode_time as i64, encryption_scheme)
+                .decrypt(
+                    raw,
+                    &default_kid,
+                    &enc.iv,
+                    &subs,
+                    sample.decode_time as i64,
+                    encryption_scheme,
+                )
                 .context("CDM decrypt")?;
             decrypted_samples.push(decrypted);
         } else {
@@ -351,7 +425,11 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     // Log every segment fetch; WARN if it took > 1 s (likely stall cause).
     let seg_name = cdn_path.rsplit('/').next().unwrap_or(cdn_path);
     if elapsed.as_millis() > 1000 {
-        tracing::warn!("DRM proxy: slow segment {}ms {}", elapsed.as_millis(), seg_name);
+        tracing::warn!(
+            "DRM proxy: slow segment {}ms {}",
+            elapsed.as_millis(),
+            seg_name
+        );
     } else {
         tracing::debug!("DRM proxy: segment {}ms {}", elapsed.as_millis(), seg_name);
     }
@@ -508,7 +586,9 @@ fn resolve_relative_base_urls(mpd: &str, mpd_base_url: &str) -> String {
                         out.push_str(mpd_dir);
                         tracing::debug!(
                             "DRM proxy: resolved relative BaseURL {:?} → {}{}",
-                            content, mpd_dir, content
+                            content,
+                            mpd_dir,
+                            content
                         );
                     }
                     out.push_str(content);
@@ -581,7 +661,7 @@ fn rewrite_cdn_urls(mpd: &str, proxy_base: &str, _mpd_base_url: &str) -> String 
     // We do a simple pass: scan for `https://` or `http://` and replace.
     // We skip replacing the proxy_base itself (already local).
     let mpd_replace_https = mpd.replace("https://", &format!("{}https/", proxy_base));
-    let mpd_replace_http  = mpd_replace_https.replace("http://", &format!("{}http/", proxy_base));
+    let mpd_replace_http = mpd_replace_https.replace("http://", &format!("{}http/", proxy_base));
     // But we may have accidentally rewritten our own proxy URLs — fix that.
     // Pattern: <proxy_base>http/<proxy_base>http/... should not happen because
     // the original MPD has real CDN URLs, not proxy URLs.
@@ -604,11 +684,15 @@ fn derive_init_url(media_url: &str) -> Option<String> {
     } else {
         (media_url, "")
     };
-    if !base.ends_with(".dash") { return None; }
+    if !base.ends_with(".dash") {
+        return None;
+    }
     let stem = &base[..base.len() - 5]; // strip ".dash"
     let last_dash = stem.rfind('-')?;
     let after = &stem[last_dash + 1..];
-    if after.is_empty() || !after.chars().all(|c| c.is_ascii_digit()) { return None; }
+    if after.is_empty() || !after.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
     let init_stem = &stem[..last_dash];
     Some(if query.is_empty() {
         format!("{}.dash", init_stem)
@@ -619,7 +703,10 @@ fn derive_init_url(media_url: &str) -> Option<String> {
 
 /// Fetch the DASH init segment directly from the CDN and populate `state.init_info`.
 async fn fetch_and_store_init(init_url: &str, state: &Arc<ProxyState>) -> Result<()> {
-    tracing::info!("DRM proxy: fetching init segment: {}", &init_url[..init_url.len().min(120)]);
+    tracing::info!(
+        "DRM proxy: fetching init segment: {}",
+        &init_url[..init_url.len().min(120)]
+    );
     let mut req = state.client.get(init_url);
     for (name, value) in &state.cdn_headers {
         req = req.header(name.as_str(), value.as_str());
@@ -628,16 +715,27 @@ async fn fetch_and_store_init(init_url: &str, state: &Arc<ProxyState>) -> Result
     if !resp.status().is_success() {
         let status = resp.status();
         let body = resp.text().await.unwrap_or_default();
-        bail!("init segment CDN returned {} (body: {})", status, &body[..body.len().min(200)]);
+        bail!(
+            "init segment CDN returned {} (body: {})",
+            status,
+            &body[..body.len().min(200)]
+        );
     }
     let data = resp.bytes().await.context("init segment CDN body")?;
     match fmp4::parse_init_segment(&data, state.mpd_scheme) {
         Ok(Some(info)) => {
             tracing::info!(
                 "DRM proxy: init segment ok (scheme={}, iv_size={}, kid={})",
-                if info.encryption_scheme == 2 { "CBCS" } else { "CENC" },
+                if info.encryption_scheme == 2 {
+                    "CBCS"
+                } else {
+                    "CENC"
+                },
                 info.default_iv_size,
-                info.default_kid.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+                info.default_kid
+                    .iter()
+                    .map(|b| format!("{:02x}", b))
+                    .collect::<String>()
             );
             *state.init_info.lock().unwrap() = Some(info);
             Ok(())
@@ -647,7 +745,11 @@ async fn fetch_and_store_init(init_url: &str, state: &Arc<ProxyState>) -> Result
             let top_boxes: Vec<String> = fmp4::boxes(&data)
                 .map(|b| String::from_utf8_lossy(&b.fourcc).into_owned())
                 .collect();
-            tracing::warn!("DRM proxy: init segment no tenc — top boxes: {:?} (data len={})", top_boxes, data.len());
+            tracing::warn!(
+                "DRM proxy: init segment no tenc — top boxes: {:?} (data len={})",
+                top_boxes,
+                data.len()
+            );
             if let Some(moov) = fmp4::find_box(&data, b"moov") {
                 let moov_children: Vec<String> = fmp4::boxes(moov.payload)
                     .map(|b| String::from_utf8_lossy(&b.fourcc).into_owned())

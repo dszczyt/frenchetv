@@ -40,7 +40,10 @@ pub struct CacheConfig {
 
 impl Default for CacheConfig {
     fn default() -> Self {
-        Self { epg_ttl_minutes: 60, logo_ttl_hours: 24 }
+        Self {
+            epg_ttl_minutes: 60,
+            logo_ttl_hours: 24,
+        }
     }
 }
 
@@ -119,7 +122,10 @@ logo_ttl_hours = 24
         let serialized = toml::to_string(&cfg).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
         assert_eq!(deserialized.operator.kind, "bouygues");
-        assert_eq!(deserialized.preferences.startup_channel.as_deref(), Some("tf1"));
+        assert_eq!(
+            deserialized.preferences.startup_channel.as_deref(),
+            Some("tf1")
+        );
     }
 
     #[test]

@@ -150,9 +150,17 @@ impl SetupScreen {
                             let is_focused = self.field_focus == FieldFocus::OperatorCards
                                 && self.selected_op_idx == idx;
                             let (border_color, bg_color, stroke_width) = if is_focused {
-                                (Color32::from_rgb(10, 132, 255), Color32::from_rgb(20, 40, 70), 3.0)
+                                (
+                                    Color32::from_rgb(10, 132, 255),
+                                    Color32::from_rgb(20, 40, 70),
+                                    3.0,
+                                )
                             } else {
-                                (Color32::from_rgb(60, 60, 70), Color32::from_rgb(25, 27, 34), 1.5)
+                                (
+                                    Color32::from_rgb(60, 60, 70),
+                                    Color32::from_rgb(25, 27, 34),
+                                    1.5,
+                                )
                             };
 
                             let card = egui::Frame::none()
@@ -254,18 +262,31 @@ impl SetupScreen {
                         // Submit button
                         let submit_focused = self.field_focus == FieldFocus::SubmitButton;
                         let (btn_bg, btn_border) = if submit_focused {
-                            (Color32::from_rgb(10, 132, 255), Color32::from_rgb(80, 180, 255))
+                            (
+                                Color32::from_rgb(10, 132, 255),
+                                Color32::from_rgb(80, 180, 255),
+                            )
                         } else {
-                            (Color32::from_rgb(30, 80, 160), Color32::from_rgb(60, 60, 70))
+                            (
+                                Color32::from_rgb(30, 80, 160),
+                                Color32::from_rgb(60, 60, 70),
+                            )
                         };
-                        let btn_label = if self.loading { "Connexion…" } else { "Regarder la TV" };
+                        let btn_label = if self.loading {
+                            "Connexion…"
+                        } else {
+                            "Regarder la TV"
+                        };
                         let btn = egui::Button::new(
                             RichText::new(btn_label)
                                 .font(FontId::proportional(28.0))
                                 .color(Color32::WHITE),
                         )
                         .fill(btn_bg)
-                        .stroke(egui::Stroke::new(if submit_focused { 3.0 } else { 1.5 }, btn_border))
+                        .stroke(egui::Stroke::new(
+                            if submit_focused { 3.0 } else { 1.5 },
+                            btn_border,
+                        ))
                         .rounding(12.0)
                         .min_size(Vec2::new(280.0, 64.0));
 
