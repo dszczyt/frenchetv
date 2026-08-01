@@ -737,11 +737,6 @@ impl LibMpvPlayer {
         }
 
         let mpv = libmpv2::Mpv::new().expect("failed to create mpv instance");
-        // TEMP DIAGNOSTIC: dump mpv's own internal log to a file so demuxer/decoder
-        // messages are visible while investigating the Orange freeze-at-start bug.
-        // Remove once root cause is confirmed.
-        let _ = mpv.set_property("msg-level", "all=trace");
-        let _ = mpv.set_property("log-file", "/tmp/mpv-debug.log");
         // Must set vo=libmpv before any loadfile so mpv uses the render context.
         mpv.set_property("vo", "libmpv")
             .expect("mpv: set vo=libmpv failed");
