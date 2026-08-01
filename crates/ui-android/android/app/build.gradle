@@ -15,7 +15,14 @@ android {
         // Play/Amazon Appstore reject a non-incrementing versionCode, so a real
         // release build must override this — see .github/workflows/release.yml,
         // which sets it from the Actions run number (always increasing).
-        versionCode (System.getenv("FRENCHETV_VERSION_CODE") ?: "1").toInteger()
+        //
+        // Computed into a local first: `versionCode (expr).toInteger()` parses as
+        // `(versionCode(expr)).toInteger()` in Groovy (the parenthesized group
+        // right after the DSL method name closes its call), not
+        // `versionCode((expr).toInteger())` -- silently passing a String where
+        // AGP expects an Integer.
+        def releaseVersionCode = (System.getenv("FRENCHETV_VERSION_CODE") ?: "1").toInteger()
+        versionCode releaseVersionCode
         versionName System.getenv("FRENCHETV_VERSION_NAME") ?: "0.1.0"
 
         ndk {
