@@ -484,82 +484,6 @@ fn ensure_allowed_host(real_url: &str, allowed_hosts: &HashSet<String>) -> Resul
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn hosts(entries: &[&str]) -> HashSet<String> {
-        entries.iter().map(|s| s.to_string()).collect()
-    }
-
-    #[test]
-    fn test_ensure_allowed_host_matches() {
-        let real_url = "https://cdnfr.orange.fr/live/ch1/seg-1.dash";
-        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_ok());
-    }
-
-    #[test]
-    fn test_ensure_allowed_host_case_insensitive() {
-        let real_url = "https://CDNfr.orange.fr/live/ch1/seg-1.dash";
-        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_ok());
-    }
-
-    #[test]
-    fn test_ensure_allowed_host_rejects_disallowed_host() {
-        // This is the exploit path: a request-path-controlled host that
-        // doesn't match any CDN host the MPD referenced must be refused, not
-        // silently dialed with the session cookie attached.
-        let real_url = "https://evil.example/steal";
-        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_err());
-    }
-
-    #[test]
-    fn test_ensure_allowed_host_rejects_unparseable_url() {
-        assert!(ensure_allowed_host("not a url", &hosts(&["https://cdnfr.orange.fr"])).is_err());
-    }
-
-    #[test]
-    fn test_ensure_allowed_host_supports_multi_cdn_failover() {
-        // Broadpeak-style multi-CDN manifests list more than one host; both
-        // must be dialable, not just whichever one the fetch URL used.
-        let allowed = hosts(&["https://cdnfr.orange.fr", "https://cdn2fr.orange.fr"]);
-        assert!(ensure_allowed_host("https://cdnfr.orange.fr/a.dash", &allowed).is_ok());
-        assert!(ensure_allowed_host("https://cdn2fr.orange.fr/b.dash", &allowed).is_ok());
-    }
-
-    #[test]
-    fn test_ensure_allowed_host_pins_scheme() {
-        // A host the manifest only ever referenced over https must not be
-        // dialable over plain http — that would replay cdn_headers (the
-        // session cookie) in cleartext.
-        let allowed = hosts(&["https://cdnfr.orange.fr"]);
-        assert!(ensure_allowed_host("http://cdnfr.orange.fr/a.dash", &allowed).is_err());
-    }
-
-    #[test]
-    fn test_extract_cdn_hosts_multiple_base_urls() {
-        let mpd = r#"<MPD>
-            <BaseURL serviceLocation="cdn1">https://cdnfr.orange.fr/live/ch1/</BaseURL>
-            <BaseURL serviceLocation="cdn2">https://cdn2fr.orange.fr/live/ch1/</BaseURL>
-        </MPD>"#;
-        let found = extract_cdn_hosts(mpd);
-        assert_eq!(
-            found,
-            hosts(&["https://cdnfr.orange.fr", "https://cdn2fr.orange.fr"])
-        );
-    }
-
-    #[test]
-    fn test_rewrite_mpd_allowlist_falls_back_to_fetch_host_when_no_absolute_urls() {
-        // A manifest with only relative SegmentTemplate paths has no
-        // scheme://host substrings at all — the fetch URL's own host must
-        // still end up in the allowlist, or every segment 403s.
-        let mpd = r#"<MPD><SegmentTemplate media="seg-$Number$.dash" /></MPD>"#;
-        let (_, found) = rewrite_mpd(mpd, "https://cdnfr.orange.fr/live/ch1/manifest.mpd", 12345);
-        assert!(found.contains("https://cdnfr.orange.fr"));
-    }
-}
-
 fn cdn_path_to_url(cdn_path: &str) -> Result<String> {
     // cdn_path: "https/HOST/PATH?QUERY" or "http/HOST/PATH?QUERY"
     if let Some(rest) = cdn_path.strip_prefix("https/") {
@@ -932,5 +856,81 @@ async fn fetch_and_store_init(init_url: &str, state: &Arc<ProxyState>) -> Result
             bail!("init segment has no tenc box")
         }
         Err(e) => Err(e).context("init segment parse"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hosts(entries: &[&str]) -> HashSet<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_matches() {
+        let real_url = "https://cdnfr.orange.fr/live/ch1/seg-1.dash";
+        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_case_insensitive() {
+        let real_url = "https://CDNfr.orange.fr/live/ch1/seg-1.dash";
+        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_rejects_disallowed_host() {
+        // This is the exploit path: a request-path-controlled host that
+        // doesn't match any CDN host the MPD referenced must be refused, not
+        // silently dialed with the session cookie attached.
+        let real_url = "https://evil.example/steal";
+        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_err());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_rejects_unparseable_url() {
+        assert!(ensure_allowed_host("not a url", &hosts(&["https://cdnfr.orange.fr"])).is_err());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_supports_multi_cdn_failover() {
+        // Broadpeak-style multi-CDN manifests list more than one host; both
+        // must be dialable, not just whichever one the fetch URL used.
+        let allowed = hosts(&["https://cdnfr.orange.fr", "https://cdn2fr.orange.fr"]);
+        assert!(ensure_allowed_host("https://cdnfr.orange.fr/a.dash", &allowed).is_ok());
+        assert!(ensure_allowed_host("https://cdn2fr.orange.fr/b.dash", &allowed).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_pins_scheme() {
+        // A host the manifest only ever referenced over https must not be
+        // dialable over plain http — that would replay cdn_headers (the
+        // session cookie) in cleartext.
+        let allowed = hosts(&["https://cdnfr.orange.fr"]);
+        assert!(ensure_allowed_host("http://cdnfr.orange.fr/a.dash", &allowed).is_err());
+    }
+
+    #[test]
+    fn test_extract_cdn_hosts_multiple_base_urls() {
+        let mpd = r#"<MPD>
+            <BaseURL serviceLocation="cdn1">https://cdnfr.orange.fr/live/ch1/</BaseURL>
+            <BaseURL serviceLocation="cdn2">https://cdn2fr.orange.fr/live/ch1/</BaseURL>
+        </MPD>"#;
+        let found = extract_cdn_hosts(mpd);
+        assert_eq!(
+            found,
+            hosts(&["https://cdnfr.orange.fr", "https://cdn2fr.orange.fr"])
+        );
+    }
+
+    #[test]
+    fn test_rewrite_mpd_allowlist_falls_back_to_fetch_host_when_no_absolute_urls() {
+        // A manifest with only relative SegmentTemplate paths has no
+        // scheme://host substrings at all — the fetch URL's own host must
+        // still end up in the allowlist, or every segment 403s.
+        let mpd = r#"<MPD><SegmentTemplate media="seg-$Number$.dash" /></MPD>"#;
+        let (_, found) = rewrite_mpd(mpd, "https://cdnfr.orange.fr/live/ch1/manifest.mpd", 12345);
+        assert!(found.contains("https://cdnfr.orange.fr"));
     }
 }

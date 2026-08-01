@@ -12,12 +12,19 @@ jobs:
   # fmt + clippy + unit tests. This is the fast, authoritative gate; it runs
   # on ubuntu-latest only (libmpv-dev is a one-line apt install here, and the
   # unit tests use wiremock — no real network/platform dependency).
+  #
+  # Pinned (not floating `stable`): `-D warnings` means a new clippy lint in a
+  # future stable release turns this red on code nobody touched (this
+  # happened once already, on `clippy::items_after_test_module`). Bump this
+  # version deliberately, alongside a check that the workspace still passes
+  # clippy under it, and keep it in sync with CLAUDE.md's MSRV / Cargo.toml's
+  # rust-version.
   quality:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
@@ -67,7 +74,13 @@ jobs:
 
       - name: Install mpv (macOS)
         if: matrix.name == 'macos'
-        run: brew install mpv
+        # libmpv2-sys just emits a plain `-lmpv` with no search path of its own
+        # (see release.yml's Windows job for the same issue) — Homebrew's
+        # prefix isn't on the linker's default search path, so `-lmpv` isn't
+        # found without this.
+        run: |
+          brew install mpv
+          echo "LIBRARY_PATH=$(brew --prefix mpv)/lib" >> "$GITHUB_ENV"
 
       - name: Install mingw-w64 + fetch libmpv dev archive (Windows cross)
         if: matrix.name == 'windows-cross'

@@ -106,19 +106,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-macos
-      - run: brew install mpv
+      - name: Install mpv
+        # libmpv2-sys emits a plain `-lmpv` with no search path of its own;
+        # Homebrew's prefix isn't on the linker's default search path.
+        run: |
+          brew install mpv
+          echo "LIBRARY_PATH=$(brew --prefix mpv)/lib" >> "$GITHUB_ENV"
       - run: cargo build -p ui-desktop --release --locked
       - name: Package
         run: |
-          dir=frenchetv-macos-universal
+          dir=frenchetv-macos-arm64
           mkdir "$dir"
           cp target/release/ui-desktop "$dir/frenchetv"
           cp README.md "$dir/" 2>/dev/null || true
           tar czf "$dir.tar.gz" "$dir"
       - uses: actions/upload-artifact@v4
         with:
-          name: frenchetv-macos-universal
-          path: frenchetv-macos-universal.tar.gz
+          name: frenchetv-macos-arm64
+          path: frenchetv-macos-arm64.tar.gz
 
   # ── Android (Android TV + FireTV; FireTV needs armeabi-v7a for older sticks) ─
   android:
