@@ -8,7 +8,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
  
 - GitHub: https://github.com/dszczyt/frenchetv (public from day one)
 - License: MIT
-- **MSRV: 1.75** — do not use language or standard library features introduced after Rust 1.75.
+- **MSRV: 1.97** — do not use language or standard library features introduced after Rust 1.97. (Bumped from a stale 1.75: a transitive dependency already required edition2024, i.e. Rust ≥1.85, so the old claim was unenforceable. CI's quality gate is pinned to 1.97.1 — see `.github/workflows/ci.yml`.)
 ---
  
 ## Build Commands

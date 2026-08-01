@@ -283,7 +283,7 @@ impl ChannelListScreen {
                                     ui.end_row();
                                 }
                             }
-                            if !visible.is_empty() && visible.len() % COLS != 0 {
+                            if !visible.is_empty() && !visible.len().is_multiple_of(COLS) {
                                 ui.end_row();
                             }
                         });

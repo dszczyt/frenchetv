@@ -17,9 +17,8 @@ jobs:
   # future stable release turns this red on code nobody touched (this
   # happened once already, on `clippy::items_after_test_module`). Bump this
   # version deliberately, alongside a check that the workspace still passes
-  # clippy under it. CLAUDE.md's declared MSRV (1.75) is stale — a transitive
-  # dependency already requires edition2024 (Rust >=1.85) — so this pin is
-  # also the closest thing to an honest "supported compiler" version right now.
+  # clippy under it, and keep it in sync with CLAUDE.md's MSRV / Cargo.toml's
+  # rust-version.
   quality:
     name: fmt + clippy + test
     runs-on: ubuntu-latest
