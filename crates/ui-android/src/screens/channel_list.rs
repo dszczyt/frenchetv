@@ -247,9 +247,9 @@ impl ChannelListScreen {
                                     Color32::from_rgb(25, 27, 34)
                                 };
                                 let (border_color, stroke_width) = if is_focused {
-                                    (Color32::from_rgb(10, 132, 255), 3.0)
+                                    (Color32::from_rgb(10, 132, 255), 3.0_f32)
                                 } else {
-                                    (Color32::from_rgb(50, 50, 60), 1.0)
+                                    (Color32::from_rgb(50, 50, 60), 1.0_f32)
                                 };
                                 let text_color = if is_locked {
                                     Color32::from_rgb(100, 100, 110)

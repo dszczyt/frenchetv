@@ -114,14 +114,7 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        // android_app is available via eframe on android-native-activity builds.
-        let android_app = cc
-            .integration_info
-            .android_app
-            .clone()
-            .expect("android_app must be set in NativeOptions");
-
+    pub fn new(cc: &eframe::CreationContext<'_>, android_app: AndroidApp) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         let (tx, rx) = mpsc::sync_channel(16);

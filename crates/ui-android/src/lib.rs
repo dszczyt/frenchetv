@@ -9,14 +9,16 @@ fn android_main(app: AndroidApp) {
     );
 
     let native_options = eframe::NativeOptions {
-        android_app: Some(app),
+        android_app: Some(app.clone()),
         ..Default::default()
     };
 
+    // eframe's `IntegrationInfo` no longer carries `android_app` (as of 0.30) —
+    // capture it from here instead, where `android_main` already has it.
     eframe::run_native(
         "FrenchTV",
         native_options,
-        Box::new(|cc| Box::new(crate::app::App::new(cc))),
+        Box::new(move |cc| Ok(Box::new(crate::app::App::new(cc, app)))),
     )
     .expect("eframe failed");
 }
