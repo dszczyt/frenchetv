@@ -49,12 +49,31 @@ fn save_map(map: &HashMap<String, String>) {
             if let Err(e) = std::fs::write(&path, content) {
                 tracing::warn!("session: failed to write {}: {}", path.display(), e);
             } else {
+                restrict_permissions(&path);
                 tracing::debug!("session: saved to {}", path.display());
             }
         }
         Err(e) => tracing::warn!("session: serialize error: {}", e),
     }
 }
+
+/// Restrict the session file to owner-only access. Session tokens are
+/// bearer-equivalent to the live account login, so they shouldn't be
+/// world-readable on shared/multi-user machines.
+#[cfg(unix)]
+fn restrict_permissions(path: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    if let Err(e) = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)) {
+        tracing::warn!(
+            "session: failed to restrict permissions on {}: {}",
+            path.display(),
+            e
+        );
+    }
+}
+
+#[cfg(not(unix))]
+fn restrict_permissions(_path: &std::path::Path) {}
 
 /// Store `token` for the given operator + username.
 pub fn save_session(operator: &str, username: &str, token: &str) {

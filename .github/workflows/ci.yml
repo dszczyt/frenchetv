@@ -1,0 +1,124 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # fmt + clippy + unit tests. This is the fast, authoritative gate; it runs
+  # on ubuntu-latest only (libmpv-dev is a one-line apt install here, and the
+  # unit tests use wiremock — no real network/platform dependency).
+  quality:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install libmpv
+        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+      - name: cargo fmt --check
+        run: cargo fmt --all -- --check
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+      - name: cargo test
+        run: cargo test --workspace --locked
+
+  # Desktop build-only sanity check across all three release OSes, on every
+  # push/PR (not just tags) so a platform-specific break is caught immediately
+  # rather than at release time. Linux and macOS build natively; Windows is
+  # cross-compiled from ubuntu-latest via mingw-w64 (see release.yml for why —
+  # same reasoning applies here, kept in sync so this job proves what the
+  # release job will do).
+  build-desktop:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: linux
+            os: ubuntu-latest
+            targets: ""
+          - name: macos
+            os: macos-latest
+            targets: ""
+          - name: windows-cross
+            os: ubuntu-latest
+            targets: x86_64-pc-windows-gnu
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.name }}
+
+      - name: Install libmpv (Linux)
+        if: matrix.name == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+
+      - name: Install mpv (macOS)
+        if: matrix.name == 'macos'
+        run: brew install mpv
+
+      - name: Install mingw-w64 + fetch libmpv dev archive (Windows cross)
+        if: matrix.name == 'windows-cross'
+        run: |
+          sudo apt-get update && sudo apt-get install -y mingw-w64 p7zip-full
+          asset=$(gh api repos/shinchiro/mpv-winbuild-cmake/releases/latest \
+            --jq '.assets[] | select(.name | test("^mpv-dev-x86_64-[0-9].*\\.7z$")) | .browser_download_url' | head -n1)
+          echo "Fetching $asset"
+          curl -sL -o /tmp/mpv-dev.7z "$asset"
+          mkdir -p /tmp/mpv-dev
+          7z x -o/tmp/mpv-dev /tmp/mpv-dev.7z
+          mkdir -p ~/.cargo
+          {
+            echo "[target.x86_64-pc-windows-gnu]"
+            echo "rustflags = [\"-L\", \"/tmp/mpv-dev\"]"
+          } >> ~/.cargo/config.toml
+        env:
+          GH_TOKEN: ${{ github.token }}
+
+      - name: cargo build (native)
+        if: matrix.name != 'windows-cross'
+        run: cargo build -p ui-desktop --release --locked
+
+      - name: cargo build (windows-gnu cross)
+        if: matrix.name == 'windows-cross'
+        run: cargo build -p ui-desktop --release --locked --target x86_64-pc-windows-gnu
+
+  # Build-only check (no signing, no packaging) — cargo-ndk compiling the Rust
+  # side for both ABIs frenchetv ships on Android is the thing host `cargo
+  # check` structurally cannot catch, since ui-android's app/player/screens
+  # modules are #[cfg(target_os = "android")]-gated.
+  build-android:
+    name: build (android, arm64-v8a + armeabi-v7a)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+      - run: cargo install cargo-ndk --locked
+      - name: cargo ndk build
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a \
+            -o crates/ui-android/android/app/src/main/jniLibs \
+            build -p ui-android --release

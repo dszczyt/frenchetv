@@ -308,7 +308,7 @@ impl OrangeOperator {
     }
 
     /// Attach the XSRF token header if we have one.
-    fn with_xsrf<'a>(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+    fn with_xsrf(&self, builder: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
         match &self.xsrf_token {
             Some(tok) => builder.header("X-XSRF-TOKEN", tok.clone()),
             None => builder,
@@ -345,9 +345,6 @@ struct OrangeChannel {
     /// Technical stream descriptors — live[0].techChannelId is the stream API key.
     #[serde(default)]
     technical_channels: OrangeTechnicalChannels,
-    /// Human-readable channel identifier used in editorial/content systems.
-    #[serde(default)]
-    edito_channel_id: String,
 }
 
 #[derive(Deserialize, Default)]
@@ -1031,7 +1028,7 @@ impl Operator for OrangeOperator {
 
         // Pass the session cookie so the CDN can authenticate the signed URL.
         if let Some(ref wassup) = self.wassup {
-            stream = stream.with_header("Cookie", &format!("wassup={}", wassup));
+            stream = stream.with_header("Cookie", format!("wassup={}", wassup));
         }
 
         // Extract Widevine DRM parameters from protectionData array if present.
@@ -1040,7 +1037,7 @@ impl Operator for OrangeOperator {
         // not the stream API base — the license server lives on the same CDN host as the MPD.
         stream.protection = extract_widevine_protection(
             &json,
-            &tv_token,
+            tv_token,
             &url_str,
             self.wassup.as_deref().unwrap_or(""),
         );

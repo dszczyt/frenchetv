@@ -12,11 +12,31 @@ android {
         // Android TV / FireTV minimum
         minSdk 21
         targetSdk 34
-        versionCode 1
-        versionName "0.1.0"
+        // Play/Amazon Appstore reject a non-incrementing versionCode, so a real
+        // release build must override this — see .github/workflows/release.yml,
+        // which sets it from the Actions run number (always increasing).
+        versionCode (System.getenv("FRENCHETV_VERSION_CODE") ?: "1").toInteger()
+        versionName System.getenv("FRENCHETV_VERSION_NAME") ?: "0.1.0"
 
         ndk {
             abiFilters 'arm64-v8a', 'armeabi-v7a', 'x86_64'
+        }
+    }
+
+    // Populated from GitHub Actions secrets at release build time (see
+    // .github/workflows/release.yml). Left empty for local/CI-PR builds, which
+    // then produce an unsigned release APK/AAB — fine for `assembleDebug` or
+    // manual signing, just not directly installable/uploadable as-is.
+    def releaseKeystorePath = System.getenv("FRENCHETV_KEYSTORE_PATH")
+
+    signingConfigs {
+        release {
+            if (releaseKeystorePath) {
+                storeFile file(releaseKeystorePath)
+                storePassword System.getenv("FRENCHETV_KEYSTORE_PASSWORD")
+                keyAlias System.getenv("FRENCHETV_KEY_ALIAS")
+                keyPassword System.getenv("FRENCHETV_KEY_PASSWORD")
+            }
         }
     }
 
@@ -24,6 +44,9 @@ android {
         release {
             minifyEnabled false
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
+            if (releaseKeystorePath) {
+                signingConfig signingConfigs.release
+            }
         }
         debug {
             jniDebuggable true

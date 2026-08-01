@@ -206,7 +206,7 @@ impl SetupScreen {
                         );
                         ui.add_space(8.0);
                         egui::Frame::none()
-                            .stroke(egui::Stroke::new(2.0, username_border))
+                            .stroke(egui::Stroke::new(2.0_f32, username_border))
                             .rounding(8.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {
@@ -234,7 +234,7 @@ impl SetupScreen {
                         );
                         ui.add_space(8.0);
                         egui::Frame::none()
-                            .stroke(egui::Stroke::new(2.0, password_border))
+                            .stroke(egui::Stroke::new(2.0_f32, password_border))
                             .rounding(8.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {

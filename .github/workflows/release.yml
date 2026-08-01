@@ -1,0 +1,199 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Tag to build a release for (e.g. v0.1.0-ci-test)"
+        required: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Linux ──────────────────────────────────────────────────────────────────
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-linux
+      - run: sudo apt-get update && sudo apt-get install -y libmpv-dev
+      - run: cargo build -p ui-desktop --release --locked
+      - name: Package
+        run: |
+          dir=frenchetv-linux-x86_64
+          mkdir "$dir"
+          cp target/release/ui-desktop "$dir/frenchetv"
+          cp README.md "$dir/" 2>/dev/null || true
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frenchetv-linux-x86_64
+          path: frenchetv-linux-x86_64.tar.gz
+
+  # ── Windows (cross-compiled from Linux; see release note below) ────────────
+  #
+  # libmpv2-sys links against a plain "mpv" import lib with no way to point it
+  # at a search path itself, so we need a prebuilt libmpv for whichever target
+  # we build. There is no MSVC-compatible .lib for that job without generating
+  # one; shinchiro/mpv-winbuild-cmake instead publishes MinGW-compatible
+  # libmpv.dll.a + libmpv-2.dll daily, which link cleanly against Rust's
+  # windows-gnu target — and that target's linker is a plain apt-installed
+  # mingw-w64 toolchain, so this runs on ubuntu-latest rather than needing
+  # MSYS2 set up on a real windows-latest runner.
+  #
+  # Widevine DRM is unavailable on this build (see crates/ui-desktop/src/drm/cdm.rs) —
+  # non-DRM channels and the M3U fallback still work.
+  windows:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-gnu
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-windows
+      - name: Install mingw-w64
+        run: sudo apt-get update && sudo apt-get install -y mingw-w64 p7zip-full
+      - name: Fetch libmpv dev archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          asset=$(gh api repos/shinchiro/mpv-winbuild-cmake/releases/latest \
+            --jq '.assets[] | select(.name | test("^mpv-dev-x86_64-[0-9].*\\.7z$")) | .browser_download_url' | head -n1)
+          echo "Fetching $asset"
+          curl -sL -o /tmp/mpv-dev.7z "$asset"
+          mkdir -p /tmp/mpv-dev
+          7z x -o/tmp/mpv-dev /tmp/mpv-dev.7z
+          mkdir -p ~/.cargo
+          {
+            echo "[target.x86_64-pc-windows-gnu]"
+            echo "rustflags = [\"-L\", \"/tmp/mpv-dev\"]"
+          } >> ~/.cargo/config.toml
+      - run: cargo build -p ui-desktop --release --locked --target x86_64-pc-windows-gnu
+      - name: Package
+        run: |
+          dir=frenchetv-windows-x86_64
+          mkdir "$dir"
+          cp target/x86_64-pc-windows-gnu/release/ui-desktop.exe "$dir/frenchetv.exe"
+          cp /tmp/mpv-dev/libmpv-2.dll "$dir/"
+          cp README.md "$dir/" 2>/dev/null || true
+          cd "$dir" && zip -r "../$dir.zip" . && cd ..
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frenchetv-windows-x86_64
+          path: frenchetv-windows-x86_64.zip
+
+  # ── macOS ──────────────────────────────────────────────────────────────────
+  # Native macos-latest runner — unlike Linux/Windows this hasn't been tested
+  # against a real Widevine CDM (libwidevinecdm.dylib) or exercised end-to-end;
+  # first real signal on this leg comes from this job actually running.
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-macos
+      - run: brew install mpv
+      - run: cargo build -p ui-desktop --release --locked
+      - name: Package
+        run: |
+          dir=frenchetv-macos-universal
+          mkdir "$dir"
+          cp target/release/ui-desktop "$dir/frenchetv"
+          cp README.md "$dir/" 2>/dev/null || true
+          tar czf "$dir.tar.gz" "$dir"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frenchetv-macos-universal
+          path: frenchetv-macos-universal.tar.gz
+
+  # ── Android (Android TV + FireTV; FireTV needs armeabi-v7a for older sticks) ─
+  android:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android, armv7-linux-androideabi
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-android
+      - uses: nttld/setup-ndk@v1
+        id: setup-ndk
+        with:
+          ndk-version: r26d
+      - run: cargo install cargo-ndk --locked
+      - name: Build Rust .so for both ABIs
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a \
+            -o crates/ui-android/android/app/src/main/jniLibs \
+            build -p ui-android --release
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Decode release keystore
+        env:
+          KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          if [ -n "$KEYSTORE_B64" ]; then
+            echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/release.keystore"
+            echo "FRENCHETV_KEYSTORE_PATH=$RUNNER_TEMP/release.keystore" >> "$GITHUB_ENV"
+          else
+            echo "::warning::ANDROID_KEYSTORE_B64 secret not set — building an UNSIGNED release APK/AAB"
+          fi
+      - name: Build APK + AAB
+        env:
+          FRENCHETV_KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          FRENCHETV_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          FRENCHETV_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          # versionCode must strictly increase across store uploads; the Actions
+          # run number does that for free. versionName is just the tag.
+          FRENCHETV_VERSION_CODE: ${{ github.run_number }}
+          FRENCHETV_VERSION_NAME: ${{ inputs.tag || github.ref_name }}
+        working-directory: crates/ui-android/android
+        run: |
+          chmod +x gradlew
+          ./gradlew assembleRelease bundleRelease
+      - uses: actions/upload-artifact@v4
+        with:
+          name: frenchetv-android
+          path: |
+            crates/ui-android/android/app/build/outputs/apk/release/*.apk
+            crates/ui-android/android/app/build/outputs/bundle/release/*.aab
+
+  # ── Publish ────────────────────────────────────────────────────────────────
+  publish:
+    needs: [linux, windows, macos, android]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Flatten artifact tree
+        run: |
+          mkdir dist
+          find artifacts -type f \( -name "*.tar.gz" -o -name "*.zip" -o -name "*.apk" -o -name "*.aab" \) \
+            -exec cp {} dist/ \;
+          ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          prerelease: ${{ contains(inputs.tag || github.ref_name, '-') }}
+          generate_release_notes: true
+          files: dist/*

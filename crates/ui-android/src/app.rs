@@ -255,37 +255,22 @@ impl App {
         self.rt.spawn(async move {
             let mut op = OperatorRegistry::build(&kind);
 
-            let auth_ok = if op.uses_phased_auth() {
+            // Drive the (possibly multi-step) auth flow to completion. Each phase
+            // method returns the next AuthPhase; loop until `Done`. Mirrors
+            // ui-desktop's start_auth; kept in sync manually since the two UIs
+            // don't share an app-layer crate.
+            let mut phase = if op.uses_phased_auth() {
                 match op.begin_auth(&username).await {
+                    Ok(p) => p,
                     Err(e) => {
                         let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
                         ctx.request_repaint();
                         return;
                     }
-                    Ok(AuthPhase::Password) => match op.complete_auth_password(&password).await {
-                        Ok(()) => true,
-                        Err(e) => {
-                            let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
-                            ctx.request_repaint();
-                            return;
-                        }
-                    },
-                    Ok(AuthPhase::Push) => {
-                        let _ = tx.send(AsyncMsg::PushAuthPending);
-                        ctx.request_repaint();
-                        match op.wait_for_push_auth(&password).await {
-                            Ok(()) => true,
-                            Err(e) => {
-                                let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
-                                ctx.request_repaint();
-                                return;
-                            }
-                        }
-                    }
                 }
             } else {
                 match op.authenticate(&username, &password).await {
-                    Ok(()) => true,
+                    Ok(()) => AuthPhase::Done,
                     Err(e) => {
                         let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
                         ctx.request_repaint();
@@ -294,8 +279,33 @@ impl App {
                 }
             };
 
-            if !auth_ok {
-                return;
+            loop {
+                let next = match phase {
+                    AuthPhase::Done => break,
+                    AuthPhase::Password => op.complete_auth_password(&password).await,
+                    AuthPhase::Push => {
+                        let _ = tx.send(AsyncMsg::PushAuthPending);
+                        ctx.request_repaint();
+                        op.wait_for_push_auth(&password).await
+                    }
+                    AuthPhase::Otp => {
+                        // TV remotes have no convenient one-time-code entry UI yet;
+                        // OTP-gated operators (e.g. Bouygues) are desktop-only for now.
+                        let _ = tx.send(AsyncMsg::AuthErr(
+                            "Ce compte nécessite un code de vérification : utilisez l'application de bureau pour vous connecter.".into(),
+                        ));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
+                phase = match next {
+                    Ok(p) => p,
+                    Err(e) => {
+                        let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
+                        ctx.request_repaint();
+                        return;
+                    }
+                };
             }
 
             match op.fetch_channels().await {

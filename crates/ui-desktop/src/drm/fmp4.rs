@@ -162,7 +162,7 @@ pub fn extract_widevine_pssh(data: &[u8]) -> Option<Vec<u8>> {
     let moov = find_box(data, b"moov")?;
     for pssh in boxes(moov.payload).filter(|b| &b.fourcc == b"pssh") {
         // pssh.payload = version(1)+flags(3)+SystemID(16)+...
-        if pssh.payload.len() >= 20 && &pssh.payload[4..20] == WV_SYSTEM_ID {
+        if pssh.payload.len() >= 20 && pssh.payload[4..20] == WV_SYSTEM_ID {
             let start = pssh.offset;
             let end = pssh.offset + pssh.total_size;
             if end <= moov.payload.len() {
@@ -189,7 +189,7 @@ fn extract_kid_from_widevine_pssh(payload: &[u8]) -> Option<[u8; 16]> {
         return None;
     }
     let version = payload[0];
-    if &payload[4..20] != WV_SYSTEM_ID {
+    if payload[4..20] != WV_SYSTEM_ID {
         return None;
     }
 
@@ -200,7 +200,7 @@ fn extract_kid_from_widevine_pssh(payload: &[u8]) -> Option<[u8; 16]> {
         }
         let kid_count = u32::from_be_bytes(payload[20..24].try_into().ok()?) as usize;
         if kid_count > 0 && payload.len() >= 40 {
-            return Some(payload[24..40].try_into().ok()?);
+            return payload[24..40].try_into().ok();
         }
     } else {
         // v0: data_size(4) + WidevineCencHeader protobuf.
@@ -237,7 +237,7 @@ fn extract_kid_from_widevine_pssh(payload: &[u8]) -> Option<[u8; 16]> {
                     let len = proto[pos] as usize;
                     pos += 1;
                     if field == 2 && len == 16 && pos + 16 <= proto.len() {
-                        return Some(proto[pos..pos + 16].try_into().ok()?);
+                        return proto[pos..pos + 16].try_into().ok();
                     }
                     pos += len;
                 }
@@ -587,8 +587,7 @@ fn parse_trun(payload: &[u8]) -> Result<(i32, Vec<usize>)> {
             c2 += 4;
         }
         let sz = if has_size {
-            let v = u32::from_be_bytes(payload[c2..c2 + 4].try_into().unwrap()) as usize;
-            v
+            u32::from_be_bytes(payload[c2..c2 + 4].try_into().unwrap()) as usize
         } else {
             0
         };

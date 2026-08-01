@@ -9,6 +9,7 @@ use anyhow::{bail, Context, Result};
 ///
 /// The MPD is rewritten so every `https://HOST/...` CDN URL becomes
 /// `/cdn/https/HOST/...` and `ContentProtection` elements are stripped.
+use std::collections::HashSet;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
@@ -71,11 +72,29 @@ pub async fn start(
     );
 
     // Build initial MPD as a fallback (used if the first CDN refresh fails).
-    let mpd_fallback = rewrite_mpd(&mpd_text, &mpd_base_url, port);
+    let (mpd_fallback, initial_hosts) = rewrite_mpd(&mpd_text, &mpd_base_url, port);
     tracing::info!(
         "DRM proxy initial MPD:\n{}",
         &mpd_fallback[..mpd_fallback.len().min(4000)]
     );
+
+    // The proxy forwards CDN auth headers (incl. the operator session cookie) on
+    // every /cdn/<scheme>/<host>/<path> request. Since scheme+host come straight
+    // from the request path, restrict them to CDN hosts the MPD itself actually
+    // references — otherwise a local process, or a page in the user's browser
+    // guessing this ephemeral port, could make the app leak the live session
+    // cookie to an arbitrary attacker-controlled host.
+    //
+    // This is a *set*, not a single host: Orange is fronted by Broadpeak, whose
+    // manifests carry multiple <BaseURL serviceLocation="..."> entries for
+    // multi-CDN failover (see resolve_relative_base_urls below) — a single-host
+    // allowlist would 502 every segment mpv pulls from the second CDN. It's
+    // rebuilt from scratch on every `fetch_live_mpd` refresh (not just seeded
+    // once here) so it tracks whatever the CDN's current manifest actually
+    // serves, redirects included. Scheme is part of the key too, so a request
+    // for a host the manifest only ever used over https can't be replayed as
+    // plain http to leak the cookie in cleartext.
+    let allowed_hosts = Mutex::new(initial_hosts);
 
     let state = Arc::new(ProxyState {
         cdm,
@@ -87,6 +106,7 @@ pub async fn start(
         client: cdn_client,
         mpd_scheme,
         mpd_cache: Mutex::new(None),
+        allowed_hosts,
     });
 
     let task = tokio::spawn(async move {
@@ -140,6 +160,12 @@ struct ProxyState {
     /// change, producing the audio jitter / backward-replay symptom.
     /// Serving the same rewritten MPD for 2 s stabilises the timeline.
     mpd_cache: Mutex<Option<(std::time::Instant, String)>>,
+    /// `"scheme://host"` entries the most recently (re)written manifest actually
+    /// referenced. Only requests matching one of these may receive `cdn_headers`
+    /// (session cookie, auth tokens) — see `start()`. Rebuilt on every
+    /// `fetch_live_mpd` refresh, since the manifest can list multiple CDN hosts
+    /// (multi-CDN failover) or redirect to a new one between refreshes.
+    allowed_hosts: Mutex<HashSet<String>>,
 }
 
 async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<()> {
@@ -242,7 +268,12 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
                         text.len(),
                         &final_url[..final_url.len().min(120)]
                     );
-                    rewrite_mpd(&text, &final_url, state.proxy_port)
+                    let (rewritten, hosts) = rewrite_mpd(&text, &final_url, state.proxy_port);
+                    // Rebuild (not merge) the allowlist from what this manifest actually
+                    // references — see `allowed_hosts` field doc for why this must be a
+                    // set, and why it's rebuilt rather than seeded once.
+                    *state.allowed_hosts.lock().unwrap() = hosts;
+                    rewritten
                 }
                 Err(e) => {
                     tracing::warn!("DRM proxy: MPD body read failed ({}), using fallback", e);
@@ -271,6 +302,7 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     let t0 = std::time::Instant::now();
     // cdn_path is "https/HOST/PATH?QUERY" or "http/HOST/PATH?QUERY"
     let real_url = cdn_path_to_url(cdn_path)?;
+    ensure_allowed_host(&real_url, &state.allowed_hosts.lock().unwrap())?;
     tracing::debug!("DRM proxy → {}", real_url);
     // Log URL after url-crate normalization so we can detect encoding changes.
     if let Ok(parsed) = url::Url::parse(&real_url) {
@@ -436,6 +468,98 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     Ok(result)
 }
 
+/// Refuse to dial hosts other than the CDN the MPD itself came from. Without
+/// this, `/cdn/<scheme>/<host>/<path>` would let any caller of this
+/// unauthenticated localhost listener redirect the proxy's outbound request
+/// (with `cdn_headers`, incl. the operator session cookie) to an arbitrary host.
+fn ensure_allowed_host(real_url: &str, allowed_hosts: &HashSet<String>) -> Result<()> {
+    match scheme_host_of(real_url) {
+        Some(h) if allowed_hosts.contains(&h) => Ok(()),
+        Some(h) => bail!(
+            "DRM proxy: refusing to proxy to disallowed host {} (expected one of {:?})",
+            h,
+            allowed_hosts
+        ),
+        None => bail!("DRM proxy: could not parse host from {}", real_url),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hosts(entries: &[&str]) -> HashSet<String> {
+        entries.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_matches() {
+        let real_url = "https://cdnfr.orange.fr/live/ch1/seg-1.dash";
+        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_case_insensitive() {
+        let real_url = "https://CDNfr.orange.fr/live/ch1/seg-1.dash";
+        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_rejects_disallowed_host() {
+        // This is the exploit path: a request-path-controlled host that
+        // doesn't match any CDN host the MPD referenced must be refused, not
+        // silently dialed with the session cookie attached.
+        let real_url = "https://evil.example/steal";
+        assert!(ensure_allowed_host(real_url, &hosts(&["https://cdnfr.orange.fr"])).is_err());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_rejects_unparseable_url() {
+        assert!(ensure_allowed_host("not a url", &hosts(&["https://cdnfr.orange.fr"])).is_err());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_supports_multi_cdn_failover() {
+        // Broadpeak-style multi-CDN manifests list more than one host; both
+        // must be dialable, not just whichever one the fetch URL used.
+        let allowed = hosts(&["https://cdnfr.orange.fr", "https://cdn2fr.orange.fr"]);
+        assert!(ensure_allowed_host("https://cdnfr.orange.fr/a.dash", &allowed).is_ok());
+        assert!(ensure_allowed_host("https://cdn2fr.orange.fr/b.dash", &allowed).is_ok());
+    }
+
+    #[test]
+    fn test_ensure_allowed_host_pins_scheme() {
+        // A host the manifest only ever referenced over https must not be
+        // dialable over plain http — that would replay cdn_headers (the
+        // session cookie) in cleartext.
+        let allowed = hosts(&["https://cdnfr.orange.fr"]);
+        assert!(ensure_allowed_host("http://cdnfr.orange.fr/a.dash", &allowed).is_err());
+    }
+
+    #[test]
+    fn test_extract_cdn_hosts_multiple_base_urls() {
+        let mpd = r#"<MPD>
+            <BaseURL serviceLocation="cdn1">https://cdnfr.orange.fr/live/ch1/</BaseURL>
+            <BaseURL serviceLocation="cdn2">https://cdn2fr.orange.fr/live/ch1/</BaseURL>
+        </MPD>"#;
+        let found = extract_cdn_hosts(mpd);
+        assert_eq!(
+            found,
+            hosts(&["https://cdnfr.orange.fr", "https://cdn2fr.orange.fr"])
+        );
+    }
+
+    #[test]
+    fn test_rewrite_mpd_allowlist_falls_back_to_fetch_host_when_no_absolute_urls() {
+        // A manifest with only relative SegmentTemplate paths has no
+        // scheme://host substrings at all — the fetch URL's own host must
+        // still end up in the allowlist, or every segment 403s.
+        let mpd = r#"<MPD><SegmentTemplate media="seg-$Number$.dash" /></MPD>"#;
+        let (_, found) = rewrite_mpd(mpd, "https://cdnfr.orange.fr/live/ch1/manifest.mpd", 12345);
+        assert!(found.contains("https://cdnfr.orange.fr"));
+    }
+}
+
 fn cdn_path_to_url(cdn_path: &str) -> Result<String> {
     // cdn_path: "https/HOST/PATH?QUERY" or "http/HOST/PATH?QUERY"
     if let Some(rest) = cdn_path.strip_prefix("https/") {
@@ -523,7 +647,12 @@ fn filter_high_bitrate_representations(mpd: &str, max_bps: u64) -> String {
 /// The `BaseURL` in the MPD (if present) is the primary CDN base; we rewrite it
 /// directly.  SegmentTemplate `initialization` / `media` attributes that are
 /// absolute URLs are also rewritten.
-fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> String {
+///
+/// Returns the rewritten text plus every `"scheme://host"` the manifest
+/// actually referenced (post `<BaseURL>` resolution, pre proxy-URL rewrite) —
+/// the caller uses this as the SSRF allowlist for `/cdn/<scheme>/<host>/...`
+/// requests, since a manifest can list more than one CDN host.
+fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> (String, HashSet<String>) {
     let proxy_base = format!("http://127.0.0.1:{}/cdn/", proxy_port);
 
     // Step 1: Remove ContentProtection blocks.
@@ -536,6 +665,16 @@ fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> String {
     // which the proxy can't map to the CDN.
     let mpd_abs = resolve_relative_base_urls(&mpd_no_drm, mpd_base_url);
 
+    // Collect the allowlist from the fully-resolved (but not yet proxy-rewritten)
+    // text, so it reflects every CDN host the manifest names — including
+    // multi-CDN <BaseURL serviceLocation="..."> failover entries — plus a
+    // guaranteed fallback of the fetch URL's own host in case the manifest has
+    // no absolute URLs at all (pure relative SegmentTemplate).
+    let mut hosts = extract_cdn_hosts(&mpd_abs);
+    if let Some(base_host) = scheme_host_of(mpd_base_url) {
+        hosts.insert(base_host);
+    }
+
     // Step 3: Rewrite all https://... and http://... CDN URLs through the proxy.
     let mpd_rewritten = rewrite_cdn_urls(&mpd_abs, &proxy_base, mpd_base_url);
 
@@ -546,7 +685,41 @@ fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> String {
     // ctv-video=2137600 and we can lower this threshold further.
     // 2137600 > 2_000_000 so the previous threshold accidentally kept filtering
     // the 2.1 Mbps track.  2_200_000 allows 2137600 through and only drops 3225200.
-    filter_high_bitrate_representations(&mpd_rewritten, 2_200_000)
+    let final_mpd = filter_high_bitrate_representations(&mpd_rewritten, 2_200_000);
+    (final_mpd, hosts)
+}
+
+/// Every `"scheme://host"` (lowercase) that `https://` or `http://` precedes in
+/// `mpd`, matching exactly the substrings `rewrite_cdn_urls` rewrites.
+fn extract_cdn_hosts(mpd: &str) -> HashSet<String> {
+    let mut hosts = HashSet::new();
+    for scheme in ["https://", "http://"] {
+        let mut rest = mpd;
+        while let Some(pos) = rest.find(scheme) {
+            let after = &rest[pos + scheme.len()..];
+            let end = after
+                .find(|c: char| {
+                    c == '/' || c == '"' || c == '\'' || c == '<' || c == '>' || c.is_whitespace()
+                })
+                .unwrap_or(after.len());
+            let host = &after[..end];
+            if !host.is_empty() {
+                hosts.insert(format!("{}{}", scheme, host.to_ascii_lowercase()));
+            }
+            rest = &after[end..];
+        }
+    }
+    hosts
+}
+
+/// `"scheme://host"` (lowercase) of `url`, or `None` if unparseable.
+fn scheme_host_of(url: &str) -> Option<String> {
+    let parsed = url::Url::parse(url).ok()?;
+    Some(format!(
+        "{}://{}",
+        parsed.scheme(),
+        parsed.host_str()?.to_ascii_lowercase()
+    ))
 }
 
 /// Resolve all relative `<BaseURL>` element contents against the MPD's own URL.

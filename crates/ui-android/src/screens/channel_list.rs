@@ -206,7 +206,7 @@ impl ChannelListScreen {
                             Color32::TRANSPARENT
                         };
                         egui::Frame::none()
-                            .stroke(egui::Stroke::new(2.0, border_color))
+                            .stroke(egui::Stroke::new(2.0_f32, border_color))
                             .rounding(6.0)
                             .inner_margin(egui::Margin::symmetric(12.0, 6.0))
                             .show(ui, |ui| {

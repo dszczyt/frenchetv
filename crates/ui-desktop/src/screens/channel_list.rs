@@ -21,7 +21,7 @@ enum CategoryFilter {
 #[derive(Debug)]
 pub enum ChannelListAction {
     None,
-    SelectChannel(Channel),
+    SelectChannel(Box<Channel>),
     /// User wants to switch operator — return to the Setup screen.
     ChangeProvider,
 }
@@ -147,7 +147,7 @@ impl ChannelListScreen {
                         let matches_search = search_lower.is_empty()
                             || c.name.to_lowercase().contains(&search_lower)
                             || c.number
-                                .map_or(false, |n| n.to_string().contains(&search_lower));
+                                .is_some_and(|n| n.to_string().contains(&search_lower));
                         let matches_locked = self.show_locked || !c.locked;
                         matches_filter && matches_search && matches_locked
                     })
@@ -185,7 +185,7 @@ impl ChannelListScreen {
                                     egui::Frame::none()
                                         .fill(bg_color)
                                         .stroke(egui::Stroke::new(
-                                            1.0,
+                                            1.0_f32,
                                             Color32::from_rgb(50, 50, 60),
                                         ))
                                         .rounding(8.0)
@@ -274,7 +274,9 @@ impl ChannelListScreen {
                                     .clicked();
 
                                 if !is_locked && clicked {
-                                    action = ChannelListAction::SelectChannel((*channel).clone());
+                                    action = ChannelListAction::SelectChannel(Box::new(
+                                        (*channel).clone(),
+                                    ));
                                 }
 
                                 if (i + 1) % COLS == 0 {

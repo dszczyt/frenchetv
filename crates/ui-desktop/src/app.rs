@@ -58,7 +58,7 @@ enum Screen {
     PushWait(PushWaitScreen),
     Otp(OtpScreen),
     ChannelList(ChannelListScreen),
-    Player(PlayerScreen),
+    Player(Box<PlayerScreen>),
 }
 
 pub struct App {
@@ -744,12 +744,12 @@ impl eframe::App for App {
             },
             Screen::ChannelList(list) => match list.show(ctx) {
                 ChannelListAction::SelectChannel(channel) => {
-                    self.start_resolve_stream(channel.clone());
-                    self.screen = Screen::Player(PlayerScreen::new(
-                        channel,
+                    self.start_resolve_stream((*channel).clone());
+                    self.screen = Screen::Player(Box::new(PlayerScreen::new(
+                        *channel,
                         self.egui_ctx.clone(),
                         self.force_software_renderer,
-                    ));
+                    )));
                 }
                 ChannelListAction::ChangeProvider => {
                     self.current_operator = None;

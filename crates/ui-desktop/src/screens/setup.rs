@@ -100,7 +100,7 @@ impl SetupScreen {
                                 let card = egui::Frame::none()
                                     .fill(bg_color)
                                     .stroke(egui::Stroke::new(
-                                        if selected { 3.0 } else { 1.5 },
+                                        if selected { 3.0_f32 } else { 1.5_f32 },
                                         border_color,
                                     ))
                                     .rounding(12.0)
