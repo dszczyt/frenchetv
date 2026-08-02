@@ -737,6 +737,42 @@ impl LibMpvPlayer {
         }
 
         let mpv = libmpv2::Mpv::new().expect("failed to create mpv instance");
+        // TEMP DIAGNOSTIC (audio-loop investigation): dump mpv's own internal log
+        // so demuxer/decoder behavior (packet emission vs. decoder starvation) is
+        // visible. libmpv does NOT load ~/.config/mpv/mpv.conf by default (unlike
+        // the mpv CLI), so this has to be set here rather than via mpv.conf.
+        // Opt-in only (RSTV_MPV_TRACE=1) so it never runs for a normal user, and
+        // the file is pre-created with 0600 perms under the user's home dir (not
+        // shared /tmp) — trace level can include signed CDN URLs in query strings
+        // (see 5186b9f). Remove once root cause of the "audio loops, video ok" bug
+        // is confirmed.
+        if std::env::var_os("RSTV_MPV_TRACE").is_some() {
+            if let Some(path) = dirs::home_dir().map(|h| h.join("mpv-audio-loop-debug.log")) {
+                let created = {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::OpenOptionsExt;
+                        std::fs::OpenOptions::new()
+                            .create(true)
+                            .truncate(true)
+                            .write(true)
+                            .mode(0o600)
+                            .open(&path)
+                    }
+                    #[cfg(not(unix))]
+                    {
+                        std::fs::File::create(&path)
+                    }
+                };
+                match created {
+                    Ok(_) => {
+                        let _ = mpv.set_property("msg-level", "all=trace");
+                        let _ = mpv.set_property("log-file", path.to_string_lossy().as_ref());
+                    }
+                    Err(e) => tracing::warn!("mpv trace: failed to create {:?}: {}", path, e),
+                }
+            }
+        }
         // Must set vo=libmpv before any loadfile so mpv uses the render context.
         mpv.set_property("vo", "libmpv")
             .expect("mpv: set vo=libmpv failed");

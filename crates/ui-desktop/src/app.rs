@@ -3,7 +3,9 @@ use crate::screens::channel_list::ChannelListAction;
 use crate::screens::otp::OtpAction;
 use crate::screens::player::PlayerAction;
 use crate::screens::setup::SetupAction;
-use crate::screens::{ChannelListScreen, OtpScreen, PlayerScreen, PushWaitScreen, SetupScreen};
+use crate::screens::{
+    ChannelListScreen, OtpScreen, PlayerScreen, PushWaitScreen, RestoringScreen, SetupScreen,
+};
 use frenchetv_core::session as keyring_session;
 use frenchetv_core::{
     AuthPhase, Channel, Config, Operator, OperatorError, OperatorKind, OperatorRegistry, StreamUrl,
@@ -54,6 +56,10 @@ enum AsyncMsg {
 }
 
 enum Screen {
+    /// A saved session is being validated + the channel list fetched. Only
+    /// entered when `Config` already names an operator — never shows the
+    /// operator picker while that restore is in flight (see `App::new`).
+    Restoring(RestoringScreen),
     Setup(SetupScreen),
     PushWait(PushWaitScreen),
     Otp(OtpScreen),
@@ -88,13 +94,33 @@ impl App {
         let config = Config::load().unwrap_or_default();
 
         egui_extras::install_image_loaders(&cc.egui_ctx);
+        crate::theme::install(&cc.egui_ctx);
 
         let force_software_renderer = std::env::args().any(|a| a == "--force-software-renderer");
         if force_software_renderer {
             tracing::info!("renderer: forced software mode via --force-software-renderer");
         }
+
+        // Resolve *before* picking the initial screen: an operator is already
+        // configured only if all three of these line up. When they do, start on
+        // `Restoring` instead of `Setup` — the operator picker must not flash up
+        // for a user who already has one configured (see `Screen::Restoring` doc).
+        let kind_str = config.operator.kind.clone();
+        let username = config.operator.username.clone();
+        let restore = (!kind_str.is_empty() && !username.is_empty())
+            .then(|| OperatorKind::from_config_str(&kind_str))
+            .flatten()
+            .and_then(|kind| {
+                keyring_session::load_session(&kind_str, &username)
+                    .map(|token| (kind, kind_str.clone(), username.clone(), token))
+            });
+
         let app = Self {
-            screen: Screen::Setup(SetupScreen::new()),
+            screen: if restore.is_some() {
+                Screen::Restoring(RestoringScreen::new())
+            } else {
+                Screen::Setup(SetupScreen::new())
+            },
             channels: Vec::new(),
             current_operator: None,
             current_session: None,
@@ -108,14 +134,8 @@ impl App {
             pending_otp: None,
         };
 
-        let kind_str = config.operator.kind.clone();
-        let username = config.operator.username.clone();
-        if !kind_str.is_empty() && !username.is_empty() {
-            if let Some(kind) = OperatorKind::from_config_str(&kind_str) {
-                if let Some(token) = keyring_session::load_session(&kind_str, &username) {
-                    app.start_restore_session(kind, kind_str, username, token);
-                }
-            }
+        if let Some((kind, kind_str, username, token)) = restore {
+            app.start_restore_session(kind, kind_str, username, token);
         }
 
         // Download Widevine CDM in the background if not already present.
@@ -215,6 +235,11 @@ impl App {
             if let Err(e) = op.restore_session(&token).await {
                 tracing::info!("Session restore failed ({}); showing setup screen", e);
                 keyring_session::clear_session(&kind_str, &username);
+                // Must send something here: the app started on `Screen::Restoring`
+                // (no operator picker) precisely because a saved session looked
+                // usable — if this branch returns silently, that screen has no
+                // other way to know the restore failed and is stuck forever.
+                let _ = tx.send(AsyncMsg::SessionExpired);
                 ctx.request_repaint();
                 return;
             }
@@ -648,11 +673,21 @@ impl App {
                     self.current_operator = Some(operator);
                     self.screen = Screen::ChannelList(self.make_channel_list(channels));
                 }
-                AsyncMsg::ChannelsErr(err) => {
-                    if let Screen::Setup(s) = &mut self.screen {
+                AsyncMsg::ChannelsErr(err) => match &mut self.screen {
+                    Screen::Setup(s) => {
                         s.set_error(format!("Erreur chargement chaînes : {}", err));
                     }
-                }
+                    Screen::Restoring(_) => {
+                        // Startup restore got a session but failed fetching
+                        // channels — fall back to Setup so the error is visible
+                        // instead of leaving the "Reconnexion en cours…" spinner
+                        // spinning forever with no way out.
+                        let mut s = SetupScreen::new();
+                        s.set_error(format!("Erreur chargement chaînes : {}", err));
+                        self.screen = Screen::Setup(s);
+                    }
+                    _ => {}
+                },
                 AsyncMsg::StreamOk { stream } => {
                     if stream.protection.is_some() {
                         // DRM stream — start the proxy pipeline before handing off to mpv.
@@ -715,6 +750,9 @@ impl eframe::App for App {
         self.drain_async_messages(ctx);
 
         match &mut self.screen {
+            Screen::Restoring(restoring) => {
+                restoring.show(ctx);
+            }
             Screen::Setup(setup) => {
                 if let SetupAction::StartAuth {
                     operator,
