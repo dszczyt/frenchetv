@@ -716,6 +716,16 @@ pub struct LibMpvPlayer {
     has_cdm_support: bool,
     /// Last observed time-pos, used to detect backward jumps in the audio stream.
     last_time_pos: f64,
+    /// DIAGNOSTIC (audio-loop investigation): when `render_frame` was last
+    /// called, to detect gaps in how often this process pumps mpv's render
+    /// API. A standalone `mpv`/`ffmpeg` process pointed at this app's own DRM
+    /// proxy never duplicates segment requests; only this embedded instance
+    /// does — so the next thing to rule in/out is whether the render loop
+    /// (running in the same process as the proxy's tokio runtime and its
+    /// CENC decrypt work) is falling behind often enough to matter. Compare
+    /// `render_frame gap` warnings against `segment repeat`/duplicate-fetch
+    /// timestamps in the same `debug.log`.
+    last_render_at: Option<std::time::Instant>,
 }
 
 impl LibMpvPlayer {
@@ -741,12 +751,12 @@ impl LibMpvPlayer {
         // so demuxer/decoder behavior (packet emission vs. decoder starvation) is
         // visible. libmpv does NOT load ~/.config/mpv/mpv.conf by default (unlike
         // the mpv CLI), so this has to be set here rather than via mpv.conf.
-        // Opt-in only (RSTV_MPV_TRACE=1) so it never runs for a normal user, and
+        // Opt-in only (FRENCHETV_MPV_TRACE=1) so it never runs for a normal user, and
         // the file is pre-created with 0600 perms under the user's home dir (not
         // shared /tmp) — trace level can include signed CDN URLs in query strings
         // (see 5186b9f). Remove once root cause of the "audio loops, video ok" bug
         // is confirmed.
-        if std::env::var_os("RSTV_MPV_TRACE").is_some() {
+        if std::env::var_os("FRENCHETV_MPV_TRACE").is_some() {
             if let Some(path) = dirs::home_dir().map(|h| h.join("mpv-audio-loop-debug.log")) {
                 let created = {
                     #[cfg(unix)]
@@ -795,6 +805,7 @@ impl LibMpvPlayer {
             mpv,
             has_cdm_support,
             last_time_pos: f64::NAN,
+            last_render_at: None,
         }
     }
 
@@ -848,6 +859,19 @@ impl LibMpvPlayer {
         // Live DASH: force software decode — hardware decoders (vaapi/vdpau)
         // refuse to init when pixel_format is "none" during DASH probing.
         let _ = self.mpv.set_property("hwdec", "no");
+
+        // ffmpeg's http protocol defaults `multiple_requests` to false — it
+        // opens a brand-new TCP connection for every segment request even
+        // though the DRM proxy advertises `Connection: keep-alive`. Near the
+        // live edge mpv polls the proxy hundreds of times/sec (see
+        // investigation history around the "audio loop" fix); paying for a
+        // fresh TCP handshake + teardown on every one of those, inside the
+        // same process as mpv's own demux/decode threads, is real CPU
+        // competing for the same cores. Opting in lets ffmpeg reuse one
+        // connection to the proxy across requests.
+        let _ = self
+            .mpv
+            .set_property("demuxer-lavf-o", "multiple_requests=1");
         // Do NOT set demuxer-lavf-analyzeduration: the default (0 for live streams)
         // is correct. Setting it to 1 caused lavf to read 1 s of live DASH audio
         // during codec probing then "rewind" — replaying that 1 s from its buffer,
@@ -914,6 +938,17 @@ impl LibMpvPlayer {
         width: u32,
         height: u32,
     ) -> Option<egui::load::SizedTexture> {
+        // DIAGNOSTIC (audio-loop investigation): how long since this was last
+        // called. See `last_render_at` field doc — correlate these against
+        // `debug.log`'s duplicate-segment-fetch timestamps.
+        let now = std::time::Instant::now();
+        if let Some(prev) = self.last_render_at.replace(now) {
+            let gap = now.duration_since(prev);
+            if gap.as_millis() > 100 {
+                tracing::warn!("render_frame gap {}ms", gap.as_millis());
+            }
+        }
+
         // Drain the mpv event queue non-blocking to catch seek / end-of-file events.
         // These log at WARN so they're visible without --verbose and help diagnose
         // the "audio jumps back 1 second" symptom.

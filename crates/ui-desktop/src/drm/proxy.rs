@@ -107,7 +107,7 @@ pub async fn start(
         mpd_scheme,
         mpd_cache: Mutex::new(None),
         allowed_hosts,
-        repeat_tracker: Mutex::new(HashMap::new()),
+        segment_cache: Mutex::new(HashMap::new()),
     });
 
     let task = tokio::spawn(async move {
@@ -167,332 +167,151 @@ struct ProxyState {
     /// `fetch_live_mpd` refresh, since the manifest can list multiple CDN hosts
     /// (multi-CDN failover) or redirect to a new one between refreshes.
     allowed_hosts: Mutex<HashSet<String>>,
-    /// FIX (audio-loop): `cdn_path -> (last_seen_at, confirmed_offset)` for
-    /// `/cdn/` segment requests.
+    /// Short-TTL cache of already-decrypted segment bytes, keyed by `cdn_path`
+    /// (the full `/cdn/...` request path, so distinct segments never collide).
     ///
-    /// Orange's live packager serves media segments before its own manifest
-    /// lists them (confirmed by tracing) — the DASH demuxer computes and
-    /// requests that not-yet-listed segment correctly, but has no dedup for
-    /// identical `tfdt`, so it re-appends the same ~2 s of audio to its decode
-    /// queue on every retry (confirmed via mpv's own trace log: same `pts`,
-    /// `append packet to audio` called on every repeat). Once the manifest
-    /// catches up, both would resolve, but that takes ~2 s per stall — this
-    /// tracker lets `dispatch` recognise a same-path retry and hand back the
-    /// next segment (extrapolated forward — see `extrapolated_cdn_path`)
-    /// instead of the byte-identical one, so the retry becomes progress
-    /// instead of a loop.
-    ///
-    /// `confirmed_offset` only advances when an extrapolated fetch actually
-    /// succeeds (via `commit_repeat_offset`) — a run of CDN 404s keeps retrying
-    /// the *same* next candidate rather than speculatively jumping further
-    /// out, so this can never overshoot further than the CDN has actually
-    /// published. Entries older than `REPEAT_WINDOW` are pruned on each call
-    /// so this stays bounded.
-    repeat_tracker: RepeatTracker,
+    /// Investigation (see git history around the "audio loop" fix) found that
+    /// only the app's own embedded mpv instance — never a standalone `ffmpeg`
+    /// or `mpv` process pointed at this same proxy — re-requests the identical
+    /// segment path many times in quick succession (confirmed up to 40+ times
+    /// for one segment). Without this cache, every one of those repeats re-hits
+    /// the CDN and re-runs a full CENC decrypt under `cdm`'s lock, which is the
+    /// dominant cost behind the CPU spike users see during a loop. This cache
+    /// doesn't address why mpv re-requests — see the `render_frame gap`
+    /// diagnostic in `libmpv.rs` for that — but it makes every repeat past
+    /// the first cheap regardless of the cause.
+    segment_cache: SegmentCache,
 }
 
+/// `cdn_path -> (cached_at, decrypted_bytes)`.
+type SegmentCache = Mutex<HashMap<String, (std::time::Instant, Arc<Vec<u8>>)>>;
+
+/// How long a decrypted segment stays cached. Deliberately short: live
+/// segments are only ever requested within a few seconds of "now" anyway, so
+/// this only needs to outlive the tight retry bursts it's meant to absorb,
+/// not become a general segment store. Also bounds memory — combined with the
+/// retention this implies (at most a handful of seconds of segments across
+/// all representations), this stays far under any concerning footprint
+/// without needing a separate byte-size cap.
+const SEGMENT_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Returns cached bytes for `cdn_path` if present and still fresh. Prunes
+/// expired entries on every call so the map can't grow unbounded.
+fn segment_cache_get(cache: &SegmentCache, cdn_path: &str) -> Option<Arc<Vec<u8>>> {
+    let mut cache = cache.lock().unwrap();
+    let now = std::time::Instant::now();
+    cache.retain(|_, (cached_at, _)| now.duration_since(*cached_at) < SEGMENT_CACHE_TTL);
+    cache.get(cdn_path).map(|(_, data)| Arc::clone(data))
+}
+
+fn segment_cache_put(cache: &SegmentCache, cdn_path: &str, data: Arc<Vec<u8>>) {
+    cache
+        .lock()
+        .unwrap()
+        .insert(cdn_path.to_string(), (std::time::Instant::now(), data));
+}
+
+/// Handles every request on one TCP connection, keeping it open (HTTP/1.1
+/// keep-alive) instead of closing after each response.
+///
+/// mpv's DASH demuxer polls this proxy at up to several hundred requests/sec
+/// near the live edge (see investigation history around the "audio loop"
+/// fix). The previous `Connection: close` meant every one of those polls
+/// paid for a fresh TCP handshake + teardown — real syscall/allocation
+/// overhead competing for CPU with mpv's own demux/decode threads in the
+/// same process. Reusing the connection removes that overhead entirely.
 async fn handle_connection(stream: TcpStream, state: Arc<ProxyState>) -> Result<()> {
     let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    reader
-        .read_line(&mut request_line)
-        .await
-        .context("read request line")?;
-
-    // Parse: "GET /path HTTP/1.1\r\n"
-    let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
-    if parts.len() < 2 {
-        bail!("malformed request");
-    }
-    let path = parts[1];
-
-    // Drain headers (we don't need them)
     loop {
-        let mut line = String::new();
-        reader.read_line(&mut line).await?;
-        if line == "\r\n" || line == "\n" || line.is_empty() {
-            break;
+        let mut request_line = String::new();
+        let n = reader
+            .read_line(&mut request_line)
+            .await
+            .context("read request line")?;
+        if n == 0 {
+            // Client closed the connection — not an error.
+            return Ok(());
         }
-    }
 
-    tracing::debug!("DRM proxy request: {}", &path[..path.len().min(200)]);
-    let (status, content_type, body) = dispatch(path, &state).await;
-    if status != "200 OK" {
-        tracing::warn!("DRM proxy {} → {}", path, status);
-    }
+        // Parse: "GET /path HTTP/1.1\r\n"
+        let parts: Vec<&str> = request_line.trim().splitn(3, ' ').collect();
+        if parts.len() < 2 {
+            bail!("malformed request");
+        }
+        let path = parts[1].to_string();
 
-    let stream = reader.into_inner();
-    let mut stream = tokio::io::BufWriter::new(stream);
-    let headers = format!(
-        "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-        status,
-        content_type,
-        body.len()
-    );
-    stream.write_all(headers.as_bytes()).await?;
-    stream.write_all(&body).await?;
-    stream.flush().await?;
-    Ok(())
+        // Drain headers (we don't need them)
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).await?;
+            if line == "\r\n" || line == "\n" || line.is_empty() {
+                break;
+            }
+        }
+
+        tracing::debug!("DRM proxy request: {}", &path[..path.len().min(200)]);
+        let (status, content_type, body) = dispatch(&path, &state).await;
+        if status != "200 OK" {
+            tracing::warn!("DRM proxy {} → {}", path, status);
+        }
+
+        // One write_all for headers+body instead of two — halves the syscalls
+        // per response on top of the connection reuse above.
+        let headers = format!(
+            "HTTP/1.1 {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: keep-alive\r\n\r\n",
+            status,
+            content_type,
+            body.len()
+        );
+        let mut response = Vec::with_capacity(headers.len() + body.len());
+        response.extend_from_slice(headers.as_bytes());
+        response.extend_from_slice(&body);
+        // `BufReader<TcpStream>` forwards `AsyncWrite` straight to the
+        // underlying socket, so this can write directly without splitting
+        // the stream or re-wrapping it in a `BufWriter` per request.
+        reader.write_all(&response).await?;
+        reader.flush().await?;
+    }
 }
 
-async fn dispatch(path: &str, state: &Arc<ProxyState>) -> (&'static str, &'static str, Vec<u8>) {
+async fn dispatch(
+    path: &str,
+    state: &Arc<ProxyState>,
+) -> (&'static str, &'static str, Arc<Vec<u8>>) {
     if path == "/manifest.mpd" || path.starts_with("/manifest.mpd?") {
         // Re-fetch from CDN every time so the SegmentTimeline stays current.
         // A live DASH stream has minimumUpdatePeriod="PT2S" and timeShiftBufferDepth="PT30S";
         // serving a stale MPD causes mpv to request already-expired segment timestamps → CDN 400.
         let mpd = fetch_live_mpd(state).await;
-        return ("200 OK", "application/dash+xml", mpd.into_bytes());
+        return ("200 OK", "application/dash+xml", Arc::new(mpd.into_bytes()));
     }
 
     if let Some(cdn_path) = path.strip_prefix("/cdn/") {
-        // FIX (audio-loop): on a same-path retry, try to hand back the next
-        // segment instead of re-serving identical bytes — see `repeat_tracker`
-        // field doc and `extrapolated_cdn_path`.
-        //
-        // Audio only. Video was never the broken track — every original
-        // trace showed it fetched exactly once per segment — and applying
-        // this to video too caused its own regression: video re-opens the
-        // same segment for reasons unrelated to the manifest stall (observed:
-        // most video segments now fetched 2-3x), and its fallback-to-earlier-
-        // offset path then visibly rewinds frames. Gating on mime keeps the
-        // fix scoped to the track that's actually stuck.
-        let is_audio = mime_hint_from_cdn_path(cdn_path) == Some("audio");
-        let (is_repeat, served_offset) = if is_audio {
-            record_repeat(&state.repeat_tracker, cdn_path)
-        } else {
-            (false, 0)
-        };
-        let candidate_offset = served_offset + 1;
-        let duration = is_repeat
-            .then(|| segment_duration_for(state, "audio"))
-            .flatten();
-        let extrapolated =
-            duration.and_then(|d| extrapolated_cdn_path(cdn_path, candidate_offset, d));
-        let effective_path = extrapolated.as_deref().unwrap_or(cdn_path);
-        if effective_path != cdn_path {
-            tracing::debug!(
-                "DRM proxy: segment repeat (confirmed +{}) — trying +{} instead of re-serving identical bytes",
-                served_offset,
-                candidate_offset
-            );
+        if let Some(cached) = segment_cache_get(&state.segment_cache, cdn_path) {
+            return ("200 OK", "video/mp4", cached);
         }
-
-        match fetch_and_decrypt(effective_path, state).await {
+        match fetch_and_decrypt(cdn_path, state).await {
             Ok(data) => {
-                if effective_path != cdn_path {
-                    // Confirmed available — the *next* repeat should try one
-                    // further, not retry this same offset again.
-                    commit_repeat_offset(&state.repeat_tracker, cdn_path, candidate_offset);
-                }
+                let data = Arc::new(data);
+                segment_cache_put(&state.segment_cache, cdn_path, Arc::clone(&data));
                 return ("200 OK", "video/mp4", data);
-            }
-            Err(mut e) if effective_path != cdn_path => {
-                // Not on the CDN yet. ffmpeg only issues its next request after
-                // this one's response arrives (confirmed via mpv trace — retry
-                // spacing tracks fetch latency, not a fixed timer), so holding
-                // this response a little longer directly throttles the retry
-                // storm instead of racing it: wait and retry the SAME candidate
-                // (not jump further) a few times before giving up — the
-                // manifest itself typically catches up within ~2s (see
-                // `MPD_TTL` history), so most stalls resolve inside this wait.
-                let deadline = std::time::Instant::now() + EXTRAPOLATE_MAX_WAIT;
-                let mut retried_ok = None;
-                while std::time::Instant::now() < deadline {
-                    tokio::time::sleep(EXTRAPOLATE_RETRY_DELAY).await;
-                    match fetch_and_decrypt(effective_path, state).await {
-                        Ok(data) => {
-                            retried_ok = Some(data);
-                            break;
-                        }
-                        Err(e2) => e = e2,
-                    }
-                }
-                if let Some(data) = retried_ok {
-                    commit_repeat_offset(&state.repeat_tracker, cdn_path, candidate_offset);
-                    return ("200 OK", "video/mp4", data);
-                }
-
-                // Still not available — fall back to the last segment we know
-                // is good: if a previous repeat already confirmed offset N,
-                // that's the segment ffmpeg most recently decoded, and it's the
-                // same content it would decode again if this response were
-                // simply dropped. Falling all the way back to the *original*
-                // (offset 0) instead would hand back content ffmpeg already
-                // played, moving dts backward and reproducing exactly the loop
-                // this exists to fix.
-                tracing::warn!(
-                    "DRM proxy: extrapolated segment still unavailable after waiting ({:#}), falling back to last confirmed offset (+{})",
-                    e,
-                    served_offset
-                );
-                let fallback = if served_offset > 0 {
-                    duration.and_then(|d| extrapolated_cdn_path(cdn_path, served_offset, d))
-                } else {
-                    None
-                };
-                let fallback_path = fallback.as_deref().unwrap_or(cdn_path);
-                return match fetch_and_decrypt(fallback_path, state).await {
-                    Ok(data) => ("200 OK", "video/mp4", data),
-                    Err(e) => {
-                        tracing::error!("DRM proxy segment error: {:#}", e);
-                        ("502 Bad Gateway", "text/plain", e.to_string().into_bytes())
-                    }
-                };
             }
             Err(e) => {
                 tracing::error!("DRM proxy segment error: {:#}", e);
-                return ("502 Bad Gateway", "text/plain", e.to_string().into_bytes());
+                return (
+                    "502 Bad Gateway",
+                    "text/plain",
+                    Arc::new(e.to_string().into_bytes()),
+                );
             }
         }
     }
 
-    ("404 Not Found", "text/plain", b"not found".to_vec())
-}
-
-/// FIX (audio-loop): repeats decay after `REPEAT_WINDOW` so only requests that
-/// arrive back-to-back for the same path (the retry-storm case, not a later
-/// legitimate re-request) accumulate a nonzero index.
-///
-/// Must stay comfortably larger than `EXTRAPOLATE_MAX_WAIT`: while a repeat is
-/// being held (see below), ffmpeg's *next* request for the same path can't
-/// arrive until this one returns — confirmed via mpv trace, it only issues
-/// its next read after the previous one completes. If this window were
-/// shorter than (or too close to) the hold time, the tracker entry could age
-/// out and get pruned right as the held response finally arrives, silently
-/// resetting confirmed progress back to offset 0.
-const REPEAT_WINDOW: std::time::Duration = std::time::Duration::from_millis(4_000);
-
-/// FIX (audio-loop): how long to wait between retries of a not-yet-available
-/// extrapolated segment, and the hard ceiling on total time spent waiting for
-/// one.
-///
-/// This is a direct tradeoff with no value that removes it: every fallback
-/// response (see `dispatch`) hands ffmpeg already-decoded content, which
-/// either replays as a stutter (frequent, small) or a rewind (rare, more
-/// noticeable) depending on how long `EXTRAPOLATE_MAX_WAIT` is — a longer
-/// wait resolves more stalls with genuinely new content instead of a
-/// fallback, but makes the fallback more jarring on the stalls it doesn't
-/// resolve, since fewer/rarer fallbacks are individually easier to notice
-/// than many small ones. 900ms is a middle point between the two extremes
-/// tried (500ms: frequent small stutters; 2200ms, close to mpv's own
-/// `audio-buffer=2.5s` in `libmpv.rs`: rare but distinct rewinds). This trades
-/// audible duplicate segments (the original bug) for the CDN's own publish
-/// latency: instead of giving up quickly and re-serving already-played
-/// content (which ffmpeg re-decodes — confirmed via mpv trace, no dedup),
-/// holding the response until genuinely new content exists means most stalls
-/// resolve with zero duplicates. The tradeoff is that a stall longer than the
-/// buffer can absorb becomes a brief audio stutter instead of a repeat — a
-/// different symptom, not a guarantee this eliminates all cases. Both
-/// constants are well under mpv's own 60 s read timeout.
-const EXTRAPOLATE_RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(150);
-const EXTRAPOLATE_MAX_WAIT: std::time::Duration = std::time::Duration::from_millis(900);
-
-/// Returns `(is_repeat, confirmed_offset)` for `cdn_path`: whether it's been
-/// seen within `REPEAT_WINDOW` before, and how many segment-durations beyond
-/// the originally requested time have been confirmed available so far (see
-/// `ProxyState::repeat_tracker`). Records this request's timestamp but does
-/// NOT itself advance `confirmed_offset` — only `commit_repeat_offset` does,
-/// after a fetch at that offset actually succeeds.
-type RepeatTracker = Mutex<HashMap<String, (std::time::Instant, u32)>>;
-
-fn record_repeat(tracker: &RepeatTracker, cdn_path: &str) -> (bool, u32) {
-    let mut tracker = tracker.lock().unwrap();
-    let now = std::time::Instant::now();
-    tracker.retain(|_, (seen, _)| now.duration_since(*seen) < REPEAT_WINDOW);
-    match tracker.get_mut(cdn_path) {
-        Some((seen, offset)) => {
-            *seen = now;
-            (true, *offset)
-        }
-        None => {
-            tracker.insert(cdn_path.to_string(), (now, 0));
-            (false, 0)
-        }
-    }
-}
-
-/// Records that segments up to `offset` segment-durations beyond `cdn_path`'s
-/// originally requested time are confirmed available (a fetch at `offset` just
-/// succeeded), so the next repeat tries one further instead of retrying the
-/// same offset again. No-op if the entry aged out between the fetch starting
-/// and completing — nothing to update.
-fn commit_repeat_offset(tracker: &RepeatTracker, cdn_path: &str, offset: u32) {
-    if let Some(entry) = tracker.lock().unwrap().get_mut(cdn_path) {
-        entry.1 = entry.1.max(offset);
-    }
-}
-
-/// `"audio"` or `"video"` inferred from a `/cdn/` segment path's own naming
-/// convention (e.g. `...-audio_104130_fra=...` / `...-video=...`), so the
-/// caller can look up that representation's segment duration. `None` for
-/// anything else (init segments, unrecognised naming) — extrapolation is
-/// skipped rather than guessed at.
-fn mime_hint_from_cdn_path(cdn_path: &str) -> Option<&'static str> {
-    if cdn_path.contains("-audio") {
-        Some("audio")
-    } else if cdn_path.contains("-video") {
-        Some("video")
-    } else {
-        None
-    }
-}
-
-/// The `d` (duration, in the representation's own timescale units — the same
-/// units as the `$Time$` value in segment URLs) of the most recent
-/// `SegmentTimeline` entry for `mime_prefix`, read from whatever manifest is
-/// currently cached. `None` if no manifest has been fetched yet or the
-/// timeline can't be parsed.
-fn segment_duration_for(state: &Arc<ProxyState>, mime_prefix: &str) -> Option<u64> {
-    let cache = state.mpd_cache.lock().unwrap();
-    let (_, mpd) = cache.as_ref()?;
-    let (first, _, _) = segment_timeline_summary(mpd, mime_prefix)?;
-    parse_attr_u64(&first, "d")
-}
-
-/// The integer value of `attr="..."` inside a raw `<S .../>` tag's text.
-fn parse_attr_u64(tag: &str, attr: &str) -> Option<u64> {
-    let needle = format!("{attr}=\"");
-    let start = tag.find(&needle)? + needle.len();
-    let rest = tag.get(start..)?;
-    let end = rest.find('"')?;
-    rest[..end].parse().ok()
-}
-
-/// FIX (audio-loop): `cdn_path` with its trailing `-<time>.dash` timestamp
-/// advanced by `offset * duration`, so a repeat asks for a genuinely later
-/// segment instead of reproducing the identical request.
-///
-/// `offset` is `confirmed_offset + 1` (see `ProxyState::repeat_tracker`), not
-/// a raw retry count — it only grows when a previous extrapolated fetch
-/// actually succeeded, so this never speculates further than one segment past
-/// what the CDN has already confirmed it has. `MAX_EXTRAPOLATE_SEGMENTS` is
-/// therefore just a generous backstop against a runaway, not the mechanism
-/// that keeps this from overshooting the live edge — evidence from the actual
-/// stalls (see commit history) shows the manifest catches up within 1-2
-/// confirmed segments. `None` if `cdn_path` doesn't end in the expected
-/// `-<digits>.dash` shape (e.g. an init segment) or the backstop is hit.
-const MAX_EXTRAPOLATE_SEGMENTS: u32 = 8;
-
-fn extrapolated_cdn_path(cdn_path: &str, offset: u32, duration: u64) -> Option<String> {
-    if offset == 0 || offset > MAX_EXTRAPOLATE_SEGMENTS || duration == 0 {
-        return None;
-    }
-    let (base, query) = match cdn_path.find('?') {
-        Some(pos) => (&cdn_path[..pos], &cdn_path[pos..]),
-        None => (cdn_path, ""),
-    };
-    if !base.ends_with(".dash") {
-        return None;
-    }
-    let stem = &base[..base.len() - 5];
-    let last_dash = stem.rfind('-')?;
-    let (prefix, digits) = (&stem[..=last_dash], &stem[last_dash + 1..]);
-    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
-    }
-    let time: u64 = digits.parse().ok()?;
-    let next_time = time.checked_add(duration.checked_mul(u64::from(offset))?)?;
-    Some(format!("{prefix}{next_time}.dash{query}"))
+    (
+        "404 Not Found",
+        "text/plain",
+        Arc::new(b"not found".to_vec()),
+    )
 }
 
 /// Serve the live MPD, re-fetching from CDN at most once per `MPD_TTL`.
@@ -509,13 +328,6 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
         let cache = state.mpd_cache.lock().unwrap();
         if let Some((fetched_at, ref cached)) = *cache {
             if fetched_at.elapsed() < MPD_TTL {
-                // DIAGNOSTIC (audio-loop investigation) — see `segment_timeline_summary`.
-                tracing::debug!(
-                    "DRM proxy: manifest cache-hit (age={:.3}s) audio={:?} video={:?}",
-                    fetched_at.elapsed().as_secs_f64(),
-                    segment_timeline_summary(cached, "audio"),
-                    segment_timeline_summary(cached, "video"),
-                );
                 return cached.clone();
             }
         }
@@ -541,12 +353,6 @@ async fn fetch_live_mpd(state: &Arc<ProxyState>) -> String {
                     // references — see `allowed_hosts` field doc for why this must be a
                     // set, and why it's rebuilt rather than seeded once.
                     *state.allowed_hosts.lock().unwrap() = hosts;
-                    // DIAGNOSTIC (audio-loop investigation) — see `segment_timeline_summary`.
-                    tracing::debug!(
-                        "DRM proxy: manifest fresh-fetch audio={:?} video={:?}",
-                        segment_timeline_summary(&rewritten, "audio"),
-                        segment_timeline_summary(&rewritten, "video"),
-                    );
                     rewritten
                 }
                 Err(e) => {
@@ -617,6 +423,24 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
 
     // Detect whether this is an init segment or media segment by checking for moof.
     let is_media = fmp4::find_box(&data, b"moof").is_some();
+
+    // DIAGNOSTIC (audio-loop investigation): `rebuild_segment` assumes exactly
+    // one moof+mdat pair per segment. If a segment actually carries more than
+    // one (multi-fragment/chunked CMAF), everything past the first mdat is
+    // currently passed through untouched — still encrypted — by `rebuild_segment`.
+    // Count top-level moof boxes to check whether that assumption holds here.
+    if is_media {
+        let moof_count = fmp4::boxes(&data).filter(|b| &b.fourcc == b"moof").count();
+        let mdat_count = fmp4::boxes(&data).filter(|b| &b.fourcc == b"mdat").count();
+        if moof_count != 1 || mdat_count != 1 {
+            tracing::warn!(
+                "DRM proxy: segment has {} moof / {} mdat boxes (expected 1/1) {}",
+                moof_count,
+                mdat_count,
+                cdn_path.rsplit('/').next().unwrap_or(cdn_path)
+            );
+        }
+    }
 
     if !is_media {
         // Init segment — extract CENC info, rewrite encv→avc1, return.
@@ -727,17 +551,47 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
     }
 
     let result = fmp4::rebuild_segment(&data, &decrypted_samples, &parsed);
+
+    // DIAGNOSTIC (audio-loop investigation): one-shot raw dump of an audio
+    // segment (both CDN-encrypted and rebuilt-decrypted forms) for offline
+    // `ffprobe` inspection. Opt-in only, private path, written at most once
+    // per process — media bytes carry no auth tokens, but keep the same
+    // discipline as the other temp diagnostics in this file.
+    if std::env::var_os("FRENCHETV_DUMP_SEGMENT").is_some() && cdn_path.contains("-audio") {
+        static DUMPED: std::sync::Once = std::sync::Once::new();
+        DUMPED.call_once(|| {
+            if let Some(home) = dirs::home_dir() {
+                let _ = std::fs::write(home.join("frenchetv-audio-raw.mp4"), &data[..]);
+                let _ = std::fs::write(home.join("frenchetv-audio-rebuilt.mp4"), &result);
+                tracing::warn!(
+                    "DRM proxy: dumped audio segment to ~/frenchetv-audio-raw.mp4 / ~/frenchetv-audio-rebuilt.mp4"
+                );
+            }
+        });
+    }
     let elapsed = t0.elapsed();
     // Log every segment fetch; WARN if it took > 1 s (likely stall cause).
+    // DIAGNOSTIC (audio-loop investigation): raw CDN body size + rebuilt output
+    // size, to check whether repeated fetches of the same cdn_path are getting
+    // progressively larger (growing/chunked CMAF segment) or byte-identical
+    // (something else re-triggering ffmpeg's request).
     let seg_name = cdn_path.rsplit('/').next().unwrap_or(cdn_path);
     if elapsed.as_millis() > 1000 {
         tracing::warn!(
-            "DRM proxy: slow segment {}ms {}",
+            "DRM proxy: slow segment {}ms cdn_bytes={} out_bytes={} {}",
             elapsed.as_millis(),
+            data.len(),
+            result.len(),
             seg_name
         );
     } else {
-        tracing::debug!("DRM proxy: segment {}ms {}", elapsed.as_millis(), seg_name);
+        tracing::debug!(
+            "DRM proxy: segment {}ms cdn_bytes={} out_bytes={} {}",
+            elapsed.as_millis(),
+            data.len(),
+            result.len(),
+            seg_name
+        );
     }
     Ok(result)
 }
@@ -885,66 +739,6 @@ fn rewrite_mpd(mpd: &str, mpd_base_url: &str, proxy_port: u16) -> (String, HashS
     // the 2.1 Mbps track.  2_200_000 allows 2137600 through and only drops 3225200.
     let final_mpd = filter_high_bitrate_representations(&mpd_rewritten, 2_200_000);
     (final_mpd, hosts)
-}
-
-/// DIAGNOSTIC (audio-loop investigation): the inner text of the `SegmentTimeline`
-/// belonging to the `AdaptationSet` whose `mimeType` starts with `mime_prefix`
-/// (e.g. `"audio"` or `"video"`).
-fn find_segment_timeline<'a>(mpd: &'a str, mime_prefix: &str) -> Option<&'a str> {
-    let mut rest = mpd;
-    loop {
-        let pos = rest.find("<AdaptationSet")?;
-        let after = &rest[pos..];
-        let next_offset = after[1..].find("<AdaptationSet").map(|p| p + 1);
-        let chunk = match next_offset {
-            Some(p) => &after[..p],
-            None => after,
-        };
-
-        let tag_end = chunk.find('>').unwrap_or(chunk.len());
-        let opening_tag = &chunk[..tag_end];
-        let matches_mime = opening_tag
-            .find("mimeType=\"")
-            .and_then(|mp| opening_tag.get(mp + "mimeType=\"".len()..))
-            .map(|s| s.starts_with(mime_prefix))
-            .unwrap_or(false);
-
-        if matches_mime {
-            if let Some(tl_start) = chunk.find("<SegmentTimeline") {
-                if let Some(tl_end) = chunk[tl_start..].find("</SegmentTimeline>") {
-                    return Some(&chunk[tl_start..tl_start + tl_end]);
-                }
-            }
-            return None;
-        }
-
-        rest = &after[next_offset?..];
-    }
-}
-
-/// DIAGNOSTIC (audio-loop investigation): `(first <S> tag text, last <S> tag
-/// text, total <S> element count)` for the `SegmentTimeline` of the
-/// `AdaptationSet` whose `mimeType` starts with `mime_prefix`.
-///
-/// The first `<S>` carries the explicit `t=` (later entries only have
-/// implicit start times derived by accumulating `d`/`r`); the count lets a
-/// caller tell "timeline genuinely unchanged" (tail *and* count identical
-/// across polls) apart from "tail text coincidentally repeats while new
-/// entries were appended earlier" (count grows). Only `t`/`d`/`r` timing
-/// attributes are returned — never a CDN URL or token — so this is safe to
-/// log at debug level. Remove once root cause of the "audio loops, video ok"
-/// bug is confirmed.
-fn segment_timeline_summary(mpd: &str, mime_prefix: &str) -> Option<(String, String, usize)> {
-    let timeline = find_segment_timeline(mpd, mime_prefix)?;
-    let s_tag_at = |start: usize| -> String {
-        let s_tag = &timeline[start..];
-        let end = s_tag.find('>').map(|p| p + 1).unwrap_or(s_tag.len());
-        s_tag[..end].trim().to_string()
-    };
-    let first = s_tag_at(timeline.find("<S ")?);
-    let last = s_tag_at(timeline.rfind("<S ")?);
-    let count = timeline.matches("<S ").count();
-    Some((first, last, count))
 }
 
 /// Every `"scheme://host"` (lowercase) that `https://` or `http://` precedes in
@@ -1202,124 +996,37 @@ mod tests {
     }
 
     #[test]
-    fn test_record_repeat_first_request_is_not_a_repeat() {
-        let tracker: RepeatTracker = Mutex::new(HashMap::new());
-        assert_eq!(record_repeat(&tracker, "p"), (false, 0));
-    }
-
-    #[test]
-    fn test_record_repeat_offset_only_advances_on_commit() {
-        let tracker: RepeatTracker = Mutex::new(HashMap::new());
-        record_repeat(&tracker, "p");
-        // A repeat with no commit in between must keep reporting offset 0 —
-        // this is the exact bug: a bare repeat count (not a confirmed
-        // advance) would report 1, 2, 3... regardless of whether any of
-        // those candidate segments actually existed on the CDN, so once the
-        // raw count passed a small cap every subsequent retry fell straight
-        // back to re-serving the original (identical) segment again.
-        assert_eq!(record_repeat(&tracker, "p"), (true, 0));
-        assert_eq!(record_repeat(&tracker, "p"), (true, 0));
-
-        commit_repeat_offset(&tracker, "p", 1);
-        assert_eq!(record_repeat(&tracker, "p"), (true, 1));
-
-        // A run of failed extrapolation attempts (no commit calls) must not
-        // move the offset — the next repeat retries the same +1 candidate,
-        // not jump further out on every single retry the way the old
-        // `repeat_index`-scaled version did.
-        assert_eq!(record_repeat(&tracker, "p"), (true, 1));
-        assert_eq!(record_repeat(&tracker, "p"), (true, 1));
-    }
-
-    #[test]
-    fn test_record_repeat_survives_many_retries_without_a_commit() {
-        // Regression: a stall of 40+ raw retries (observed in production
-        // traces) must not exhaust anything — the offset simply stays at
-        // whatever was last confirmed, indefinitely.
-        let tracker: RepeatTracker = Mutex::new(HashMap::new());
-        record_repeat(&tracker, "p");
-        for _ in 0..50 {
-            assert_eq!(record_repeat(&tracker, "p"), (true, 0));
-        }
-    }
-
-    #[test]
-    fn test_commit_repeat_offset_never_goes_backward() {
-        let tracker: RepeatTracker = Mutex::new(HashMap::new());
-        record_repeat(&tracker, "p");
-        commit_repeat_offset(&tracker, "p", 3);
-        // A late-arriving commit for an already-superseded lower offset must
-        // not regress progress already made.
-        commit_repeat_offset(&tracker, "p", 1);
-        assert_eq!(record_repeat(&tracker, "p"), (true, 3));
-    }
-
-    #[test]
-    fn test_extrapolated_cdn_path_advances_by_repeat_index_times_duration() {
-        let path = "https/cdn.example/live/ch1-audio_104130_fra=104000-1000.dash?a=1";
+    fn test_segment_cache_miss_then_hit() {
+        let cache: SegmentCache = Mutex::new(HashMap::new());
+        assert!(segment_cache_get(&cache, "p").is_none());
+        segment_cache_put(&cache, "p", Arc::new(vec![1, 2, 3]));
         assert_eq!(
-            extrapolated_cdn_path(path, 1, 92160).as_deref(),
-            Some("https/cdn.example/live/ch1-audio_104130_fra=104000-93160.dash?a=1")
-        );
-        assert_eq!(
-            extrapolated_cdn_path(path, 2, 92160).as_deref(),
-            Some("https/cdn.example/live/ch1-audio_104130_fra=104000-185320.dash?a=1")
+            segment_cache_get(&cache, "p").as_deref(),
+            Some(&vec![1, 2, 3])
         );
     }
 
     #[test]
-    fn test_extrapolated_cdn_path_none_for_repeat_index_zero() {
-        let path = "https/cdn.example/live/ch1-audio_104130_fra=104000-1000.dash";
-        assert_eq!(extrapolated_cdn_path(path, 0, 92160), None);
+    fn test_segment_cache_distinct_paths_dont_collide() {
+        let cache: SegmentCache = Mutex::new(HashMap::new());
+        segment_cache_put(&cache, "a", Arc::new(vec![1]));
+        segment_cache_put(&cache, "b", Arc::new(vec![2]));
+        assert_eq!(segment_cache_get(&cache, "a").as_deref(), Some(&vec![1]));
+        assert_eq!(segment_cache_get(&cache, "b").as_deref(), Some(&vec![2]));
     }
 
     #[test]
-    fn test_extrapolated_cdn_path_none_past_cap() {
-        let path = "https/cdn.example/live/ch1-audio_104130_fra=104000-1000.dash";
-        assert_eq!(
-            extrapolated_cdn_path(path, MAX_EXTRAPOLATE_SEGMENTS + 1, 92160),
-            None
+    fn test_segment_cache_expires_after_ttl() {
+        let cache: SegmentCache = Mutex::new(HashMap::new());
+        // Insert with a synthetic already-expired timestamp instead of sleeping.
+        cache.lock().unwrap().insert(
+            "p".to_string(),
+            (
+                std::time::Instant::now() - SEGMENT_CACHE_TTL - std::time::Duration::from_secs(1),
+                Arc::new(vec![1]),
+            ),
         );
-    }
-
-    #[test]
-    fn test_extrapolated_cdn_path_none_for_non_timestamped_path() {
-        // Init segments (no trailing `-<digits>.dash`) must not be extrapolated.
-        let path = "https/cdn.example/live/ch1-audio_104130_fra=104000.dash";
-        assert_eq!(extrapolated_cdn_path(path, 1, 92160), None);
-    }
-
-    #[test]
-    fn test_mime_hint_from_cdn_path() {
-        assert_eq!(
-            mime_hint_from_cdn_path("https/cdn.example/ch1-audio_104130_fra=104000-1000.dash"),
-            Some("audio")
-        );
-        assert_eq!(
-            mime_hint_from_cdn_path("https/cdn.example/ch1-video=930000-1000.dash"),
-            Some("video")
-        );
-        assert_eq!(
-            mime_hint_from_cdn_path("https/cdn.example/ch1-video=930000.dash"),
-            Some("video")
-        );
-        assert_eq!(
-            mime_hint_from_cdn_path("https/cdn.example/manifest.mpd"),
-            None
-        );
-    }
-
-    #[test]
-    fn test_parse_attr_u64() {
-        assert_eq!(
-            parse_attr_u64("<S t=\"85711577105083\" d=\"92160\" r=\"15\"/>", "d"),
-            Some(92160)
-        );
-        assert_eq!(
-            parse_attr_u64("<S t=\"85711577105083\" d=\"92160\" r=\"15\"/>", "r"),
-            Some(15)
-        );
-        assert_eq!(parse_attr_u64("<S d=\"92160\"/>", "t"), None);
+        assert!(segment_cache_get(&cache, "p").is_none());
     }
 
     #[test]
