@@ -10,12 +10,54 @@ use anyhow::{bail, Context, Result};
 /// The MPD is rewritten so every `https://HOST/...` CDN URL becomes
 /// `/cdn/https/HOST/...` and `ContentProtection` elements are stripped.
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
 use super::cdm::CdmHandle;
 use super::fmp4::{self, InitInfo};
+
+/// DIAGNOSTIC (audio-loop investigation): dumps every audio init/media segment
+/// (both CDN-encrypted and decrypted forms) to a private per-run directory, so
+/// they can be concatenated and decoded offline with `ffmpeg`/`ffprobe` —
+/// isolating whether corruption is baked into the decrypted bytes themselves,
+/// independent of mpv, the network, or playback timing entirely. Opt-in only
+/// (`FRENCHETV_DUMP_SEGMENT=1`); files carry no auth tokens (media bytes only)
+/// but still go under the user's home dir, created 0700, not `/tmp`.
+fn dump_segment_diagnostic(kind: &str, cdn_path: &str, raw: &[u8], rebuilt: &[u8]) {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    static DIR_READY: std::sync::Once = std::sync::Once::new();
+
+    let Some(dir) = dirs::home_dir().map(|h| h.join("frenchetv-audio-dump")) else {
+        return;
+    };
+    DIR_READY.call_once(|| {
+        if std::fs::create_dir_all(&dir).is_ok() {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700));
+            }
+        }
+    });
+
+    let seq = SEQ.fetch_add(1, Ordering::Relaxed);
+    let stem = cdn_path.rsplit('/').next().unwrap_or(cdn_path);
+    let stem: String = stem
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let base = dir.join(format!("{seq:05}_{kind}_{stem}"));
+    let _ = std::fs::write(base.with_extension("raw.mp4"), raw);
+    let _ = std::fs::write(base.with_extension("dec.mp4"), rebuilt);
+}
 
 // ─── Public API ───────────────────────────────────────────────────────────────
 
@@ -479,6 +521,9 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
             has_avc1,
             has_avcc
         );
+        if std::env::var_os("FRENCHETV_DUMP_SEGMENT").is_some() && cdn_path.contains("-audio") {
+            dump_segment_diagnostic("init", cdn_path, &data, &plain_init);
+        }
         return Ok(plain_init);
     }
 
@@ -552,22 +597,8 @@ async fn fetch_and_decrypt(cdn_path: &str, state: &Arc<ProxyState>) -> Result<Ve
 
     let result = fmp4::rebuild_segment(&data, &decrypted_samples, &parsed);
 
-    // DIAGNOSTIC (audio-loop investigation): one-shot raw dump of an audio
-    // segment (both CDN-encrypted and rebuilt-decrypted forms) for offline
-    // `ffprobe` inspection. Opt-in only, private path, written at most once
-    // per process — media bytes carry no auth tokens, but keep the same
-    // discipline as the other temp diagnostics in this file.
     if std::env::var_os("FRENCHETV_DUMP_SEGMENT").is_some() && cdn_path.contains("-audio") {
-        static DUMPED: std::sync::Once = std::sync::Once::new();
-        DUMPED.call_once(|| {
-            if let Some(home) = dirs::home_dir() {
-                let _ = std::fs::write(home.join("frenchetv-audio-raw.mp4"), &data[..]);
-                let _ = std::fs::write(home.join("frenchetv-audio-rebuilt.mp4"), &result);
-                tracing::warn!(
-                    "DRM proxy: dumped audio segment to ~/frenchetv-audio-raw.mp4 / ~/frenchetv-audio-rebuilt.mp4"
-                );
-            }
-        });
+        dump_segment_diagnostic("media", cdn_path, &data, &result);
     }
     let elapsed = t0.elapsed();
     // Log every segment fetch; WARN if it took > 1 s (likely stall cause).
