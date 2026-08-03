@@ -1,4 +1,6 @@
 use crate::player::libmpv::LibMpvPlayer;
+#[cfg(unix)]
+use crate::player::mpv_ipc::MpvIpcPlayer;
 use egui::{Color32, FontId, Key, RichText, Vec2};
 use frenchetv_core::Channel;
 use frenchetv_core::StreamUrl;
@@ -8,9 +10,48 @@ enum PlayerState {
     Playing,
 }
 
+/// Either backend. See `player::mpv_ipc` for why the second one exists —
+/// diagnostic-only, toggled with `FRENCHETV_MPV_SUBPROCESS=1`.
+enum Player {
+    Embedded(LibMpvPlayer),
+    #[cfg(unix)]
+    Subprocess(MpvIpcPlayer),
+}
+
+impl Player {
+    fn play(&mut self, url: &str, auth_header: Option<&str>, extra_headers: &[(String, String)]) {
+        match self {
+            Self::Embedded(p) => p.play(url, auth_header, extra_headers),
+            #[cfg(unix)]
+            Self::Subprocess(p) => p.play(url, auth_header, extra_headers),
+        }
+    }
+
+    fn stop(&mut self) {
+        match self {
+            Self::Embedded(p) => p.stop(),
+            #[cfg(unix)]
+            Self::Subprocess(p) => p.stop(),
+        }
+    }
+
+    fn render_frame(
+        &mut self,
+        ctx: &egui::Context,
+        width: u32,
+        height: u32,
+    ) -> Option<egui::load::SizedTexture> {
+        match self {
+            Self::Embedded(p) => p.render_frame(ctx, width, height),
+            #[cfg(unix)]
+            Self::Subprocess(p) => p.render_frame(ctx, width, height),
+        }
+    }
+}
+
 pub struct PlayerScreen {
     pub channel: Channel,
-    player: LibMpvPlayer,
+    player: Player,
     state: PlayerState,
     info_visible: bool,
     info_hide_timer: f32,
@@ -32,9 +73,19 @@ impl PlayerScreen {
     /// wake the egui frame loop when a new frame is ready.
     /// `force_software` skips GL renderer probe and always uses software path.
     pub fn new(channel: Channel, egui_ctx: egui::Context, force_software: bool) -> Self {
+        #[cfg(unix)]
+        let player = if std::env::var_os("FRENCHETV_MPV_SUBPROCESS").is_some() {
+            tracing::info!("player: using subprocess-mpv diagnostic backend");
+            Player::Subprocess(MpvIpcPlayer::new())
+        } else {
+            Player::Embedded(LibMpvPlayer::new(egui_ctx, force_software))
+        };
+        #[cfg(not(unix))]
+        let player = Player::Embedded(LibMpvPlayer::new(egui_ctx, force_software));
+
         Self {
             channel,
-            player: LibMpvPlayer::new(egui_ctx, force_software),
+            player,
             state: PlayerState::Loading,
             info_visible: false,
             info_hide_timer: 0.0,
