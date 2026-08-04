@@ -363,7 +363,12 @@ async fn dispatch(
                 return ("200 OK", "video/mp4", data);
             }
             Err(e) => {
-                tracing::error!("DRM proxy segment error for {} ({}): {:#}", path, cdn_path, e);
+                tracing::error!(
+                    "DRM proxy segment error for {} ({}): {:#}",
+                    path,
+                    cdn_path,
+                    e
+                );
                 return (
                     "502 Bad Gateway",
                     "text/plain",
@@ -829,39 +834,94 @@ fn rewrite_mpd(
 
 type NumberMappings = Mutex<HashMap<String, NumberMapping>>;
 
+/// How far (in real seconds) a `/cdnnum/` request's implied `$Time$` may
+/// drift from the latest known live edge before the current anchor is
+/// treated as wrong and re-derived. Wide on purpose — see `resolve_url`.
+const REANCHOR_TOLERANCE_SECONDS: u64 = 600;
+
 /// Per-audio-representation `$Number$` → `$Time$` translation, keyed by
 /// representation id in `ProxyState::number_mappings`.
+///
+/// ffmpeg's dash demuxer does not use this template's advertised
+/// `startNumber` for `$Number$`+`duration` (no-`SegmentTimeline`) live
+/// addressing — confirmed live: we advertised `startNumber="1"` and it
+/// requested number ~930 million, derived independently (empirically, from
+/// `availabilityStartTime` + wall clock, offset by something on the order
+/// of this representation's own `duration` value). So the anchor can't be
+/// predicted from the manifest; it's established lazily from whatever
+/// number ffmpeg actually requests first, assumed to be near the live edge.
 #[derive(Debug, Clone, PartialEq)]
 struct NumberMapping {
     /// Segment duration in this representation's own `timescale` units.
     /// Established once from the first manifest that lists this
     /// representation, then held fixed — see `derive_and_rewrite_audio_number_mappings`.
     duration: u64,
-    /// The `$Time$` value that corresponds to segment number 1.
-    epoch_t: u64,
+    /// This representation's `SegmentTemplate@timescale` — needed to convert
+    /// `REANCHOR_TOLERANCE_SECONDS` into ticks.
+    timescale: u64,
     /// Absolute media URL pattern (`<BaseURL>` + the CDN's original `media`
     /// attribute), still containing the literal `$RepresentationID$` and
-    /// `$Time$` placeholders — substituted per-request in `number_to_cdn_path`.
+    /// `$Time$` placeholders — substituted per-request in `resolve_url`.
     media_pattern: String,
+    /// Most recent live-edge `$Time$` value from the manifest, refreshed on
+    /// every poll (see `build_number_template`) — the reference point used
+    /// to (re-)anchor `epoch_t`.
+    latest_live_t: u64,
+    /// `$Time$` value that corresponds to `$Number$` = 1, for the anchor
+    /// currently in use. `None` until the first `/cdnnum/` request for this
+    /// repid arrives.
+    epoch_t: Option<u64>,
 }
 
 impl NumberMapping {
-    /// `$Time$` value for 1-based segment `number`.
-    fn time_for_number(&self, number: u64) -> u64 {
-        self.epoch_t + (number.saturating_sub(1)) * self.duration
+    /// `$Time$` value for 1-based segment `number`, given an anchor.
+    fn time_for_number(epoch_t: u64, duration: u64, number: u64) -> u64 {
+        epoch_t + number.saturating_sub(1) * duration
     }
 
-    /// 1-based segment number for a given `$Time$` value, rounding down to
-    /// the segment that contains it — used to compute the advertised
-    /// `startNumber` for the current live window from the CDN's own `t`.
-    fn number_for_time(&self, t: u64) -> u64 {
-        1 + t.saturating_sub(self.epoch_t) / self.duration
-    }
-
-    /// Builds the real (still `$RepresentationID$`/`$Time$`-templated
-    /// nowhere — both substituted here) absolute CDN URL for `number`.
-    fn resolve_url(&self, repid: &str, number: u64) -> String {
-        let t = self.time_for_number(number);
+    /// Resolves `number` to a real CDN URL, lazily (re-)anchoring this
+    /// representation's `epoch_t` first if there is none yet, or if the
+    /// existing anchor now implies a `$Time$` implausibly far from the
+    /// latest known live edge — e.g. ffmpeg restarting its own number
+    /// derivation after a seek/reconnect. The tolerance is wide so normal
+    /// buffering-ahead requests are never mistaken for drift: a tight
+    /// window would re-anchor mid-stream and itself produce a PTS
+    /// discontinuity, the original symptom this rewrite exists to avoid.
+    fn resolve_url(&mut self, repid: &str, number: u64) -> String {
+        let tolerance_ticks = REANCHOR_TOLERANCE_SECONDS * self.timescale;
+        let needs_anchor = match self.epoch_t {
+            None => true,
+            Some(epoch_t) => {
+                let implied = Self::time_for_number(epoch_t, self.duration, number);
+                implied.abs_diff(self.latest_live_t) > tolerance_ticks
+            }
+        };
+        if needs_anchor {
+            let new_epoch_t = self
+                .latest_live_t
+                .saturating_sub(number.saturating_sub(1) * self.duration);
+            if self.epoch_t.is_some() {
+                tracing::warn!(
+                    "DRM proxy: re-anchoring $Number$ mapping for {} at number={} \
+                     (latest_live_t={}) -> epoch_t={}",
+                    repid,
+                    number,
+                    self.latest_live_t,
+                    new_epoch_t
+                );
+            } else {
+                tracing::info!(
+                    "DRM proxy: anchored $Number$ mapping for {} at number={} \
+                     (latest_live_t={}) -> epoch_t={}",
+                    repid,
+                    number,
+                    self.latest_live_t,
+                    new_epoch_t
+                );
+            }
+            self.epoch_t = Some(new_epoch_t);
+        }
+        let t = Self::time_for_number(self.epoch_t.unwrap(), self.duration, number);
         self.media_pattern
             .replace("$RepresentationID$", repid)
             .replace("$Time$", &t.to_string())
@@ -1041,7 +1101,7 @@ fn build_number_template(
 
     let mut mappings = mappings.lock().unwrap();
     for repid in &set.rep_ids {
-        match mappings.get(repid) {
+        match mappings.get_mut(repid) {
             Some(existing) if existing.duration != d || existing.media_pattern != media_pattern => {
                 // Segment duration (or the underlying URL pattern) changed
                 // since this representation's mapping was established —
@@ -1056,36 +1116,36 @@ fn build_number_template(
                 );
                 return None;
             }
-            Some(_) => {} // matches what's stored — fine
+            Some(existing) => {
+                // Keep the live edge fresh every refresh — this is what
+                // `resolve_url` anchors/re-anchors against, independent of
+                // whatever `startNumber` we advertise below (ffmpeg ignores
+                // it — see the `NumberMapping` doc comment).
+                existing.latest_live_t = t;
+            }
             None => {
                 mappings.insert(
                     repid.clone(),
                     NumberMapping {
                         duration: d,
-                        epoch_t: t,
+                        timescale,
                         media_pattern: media_pattern.clone(),
+                        latest_live_t: t,
+                        epoch_t: None,
                     },
                 );
             }
         }
     }
 
-    // All representations in this set share one mapping (by construction —
-    // segmentAlignment="true" means one SegmentTimeline for the whole set),
-    // so any of them gives the same start_number for the current window.
-    let start_number = mappings[&set.rep_ids[0]].number_for_time(t);
-    tracing::info!(
-        "DRM proxy: audio $Number$ mapping for {}: t={} duration={} startNumber={}",
-        set.rep_ids[0],
-        t,
-        d,
-        start_number
-    );
-
+    // Cosmetic only — ffmpeg's dash demuxer doesn't consult this value for
+    // $Number$+duration live addressing (see `NumberMapping` doc comment);
+    // the real anchor is established lazily in `resolve_url`. Kept `"1"`
+    // for spec-plausibility in case another client does read it.
     Some(format!(
         "<SegmentTemplate timescale=\"{timescale}\" initialization=\"{init_raw}\" \
          media=\"/cdnnum/$RepresentationID$/$Number$\" duration=\"{d}\" \
-         startNumber=\"{start_number}\"/>"
+         startNumber=\"1\"/>"
     ))
 }
 
@@ -1098,7 +1158,8 @@ fn build_number_template(
 fn number_route_to_cdn_path(rest: &str, mappings: &NumberMappings) -> Option<String> {
     let (repid, number_str) = rest.split_once('/')?;
     let number: u64 = number_str.parse().ok()?;
-    let mapping = mappings.lock().unwrap().get(repid)?.clone();
+    let mut guard = mappings.lock().unwrap();
+    let mapping = guard.get_mut(repid)?;
     let real_url = mapping.resolve_url(repid, number);
     Some(real_url.replacen("://", "/", 1))
 }
@@ -1525,6 +1586,7 @@ mod tests {
         let epoch_t = 85_000_000_000_000u64;
 
         let first = derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+        // Cosmetic constant — ffmpeg doesn't consult it (see NumberMapping doc).
         assert!(
             first.contains(r#"startNumber="1""#),
             "first window: {first}"
@@ -1534,14 +1596,22 @@ mod tests {
         let second =
             derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t + 2 * 92160), &mappings);
         assert!(
-            second.contains(r#"startNumber="3""#),
+            second.contains(r#"startNumber="1""#),
             "second window: {second}"
         );
 
         let stored = mappings.lock().unwrap();
         let m = stored.get("audio_fra=104000").expect("mapping established");
-        assert_eq!(m.epoch_t, epoch_t, "epoch must stay fixed once established");
         assert_eq!(m.duration, 92160);
+        assert_eq!(
+            m.latest_live_t,
+            epoch_t + 2 * 92160,
+            "latest_live_t must track every refresh"
+        );
+        assert_eq!(
+            m.epoch_t, None,
+            "no anchor until a real /cdnnum/ request arrives"
+        );
     }
 
     #[test]
@@ -1581,20 +1651,97 @@ mod tests {
     }
 
     #[test]
-    fn test_number_mapping_round_trips_through_dispatch_route() {
+    fn test_number_mapping_lazily_anchors_on_first_dispatch_request() {
         let mappings = Mutex::new(HashMap::new());
         let epoch_t = 85_000_000_000_000u64;
         derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
 
-        // Segment number 3 → t = epoch_t + 2*duration.
+        // ffmpeg's first request can be any number (it doesn't read our
+        // advertised startNumber — see NumberMapping doc). Whatever it asks
+        // for first is anchored to the current live edge (latest_live_t).
         let cdn_path = number_route_to_cdn_path("audio_fra=104000/3", &mappings)
             .expect("mapping exists for this repid");
         assert_eq!(
             cdn_path,
             format!(
                 "https/cdn.example.fr/live/ch1/dash/ch1-audio_fra=104000-{}.dash?tok=abc",
-                epoch_t + 2 * 92160
+                epoch_t
+            ),
+            "first-ever request is treated as the live edge, whatever number it names"
+        );
+
+        // The next sequential number continues from that anchor.
+        let cdn_path2 = number_route_to_cdn_path("audio_fra=104000/4", &mappings)
+            .expect("mapping exists for this repid");
+        assert_eq!(
+            cdn_path2,
+            format!(
+                "https/cdn.example.fr/live/ch1/dash/ch1-audio_fra=104000-{}.dash?tok=abc",
+                epoch_t + 92160
             )
+        );
+    }
+
+    #[test]
+    fn test_number_mapping_reanchors_on_gross_drift() {
+        let mappings = Mutex::new(HashMap::new());
+        let epoch_t = 85_000_000_000_000u64;
+        derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+
+        // Anchor at number=1 -> epoch_t == the manifest's live t.
+        number_route_to_cdn_path("audio_fra=104000/1", &mappings).unwrap();
+        assert_eq!(
+            mappings
+                .lock()
+                .unwrap()
+                .get("audio_fra=104000")
+                .unwrap()
+                .epoch_t,
+            Some(epoch_t)
+        );
+
+        // Live edge jumps far ahead of the established anchor — beyond
+        // REANCHOR_TOLERANCE_SECONDS worth of ticks (600s * 48000 = 28.8M
+        // ticks) — simulating ffmpeg reconnecting/reseeking with a fresh
+        // independent number derivation.
+        let tolerance_ticks = REANCHOR_TOLERANCE_SECONDS * 48000;
+        let jumped_t = epoch_t + tolerance_ticks * 3;
+        derive_and_rewrite_audio_number_mappings(&sample_mpd(jumped_t), &mappings);
+
+        // Same number as before (1) now implies a `t` far from the new live
+        // edge -> must re-anchor rather than keep serving the stale value.
+        let cdn_path = number_route_to_cdn_path("audio_fra=104000/1", &mappings).unwrap();
+        assert_eq!(
+            cdn_path,
+            format!(
+                "https/cdn.example.fr/live/ch1/dash/ch1-audio_fra=104000-{}.dash?tok=abc",
+                jumped_t
+            ),
+            "must re-anchor to the new live edge on gross drift"
+        );
+    }
+
+    #[test]
+    fn test_number_mapping_does_not_reanchor_within_tolerance() {
+        let mappings = Mutex::new(HashMap::new());
+        let epoch_t = 85_000_000_000_000u64;
+        derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+        number_route_to_cdn_path("audio_fra=104000/1", &mappings).unwrap();
+
+        // Live edge advances normally (a few segments, well inside
+        // tolerance) — the anchor must NOT move.
+        derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t + 5 * 92160), &mappings);
+        number_route_to_cdn_path("audio_fra=104000/6", &mappings).unwrap();
+
+        assert_eq!(
+            mappings
+                .lock()
+                .unwrap()
+                .get("audio_fra=104000")
+                .unwrap()
+                .epoch_t,
+            Some(epoch_t),
+            "normal sequential playback must not trigger a re-anchor"
         );
     }
 
@@ -1605,20 +1752,31 @@ mod tests {
     }
 
     #[test]
-    fn test_number_mapping_time_and_number_round_trip() {
-        let m = NumberMapping {
+    fn test_number_mapping_time_for_number() {
+        assert_eq!(NumberMapping::time_for_number(1000, 92160, 1), 1000);
+        assert_eq!(NumberMapping::time_for_number(1000, 92160, 2), 1000 + 92160);
+    }
+
+    #[test]
+    fn test_number_mapping_resolve_url_anchors_then_reuses() {
+        let live_t = 85_000_000_000_000u64;
+        let mut m = NumberMapping {
             duration: 92160,
-            epoch_t: 1000,
+            timescale: 48000,
             media_pattern: "https://x/$RepresentationID$-$Time$".to_string(),
+            latest_live_t: live_t,
+            epoch_t: None,
         };
-        assert_eq!(m.time_for_number(1), 1000);
-        assert_eq!(m.time_for_number(2), 1000 + 92160);
-        assert_eq!(m.number_for_time(1000), 1);
-        assert_eq!(m.number_for_time(1000 + 92160), 2);
-        assert_eq!(m.number_for_time(1000 + 92160 + 1), 2); // rounds down
+        // First call anchors: number=3 is treated as "now" (latest_live_t).
         assert_eq!(
             m.resolve_url("audio_fra=104000", 3),
-            format!("https://x/audio_fra=104000-{}", 1000 + 2 * 92160)
+            format!("https://x/audio_fra=104000-{live_t}")
+        );
+        assert_eq!(m.epoch_t, Some(live_t - 2 * 92160));
+        // Subsequent calls reuse the anchor.
+        assert_eq!(
+            m.resolve_url("audio_fra=104000", 4),
+            format!("https://x/audio_fra=104000-{}", live_t + 92160)
         );
     }
 }
