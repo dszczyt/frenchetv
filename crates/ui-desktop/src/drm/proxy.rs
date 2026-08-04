@@ -869,14 +869,20 @@ struct NumberMapping {
     latest_live_t: u64,
     /// `$Time$` value that corresponds to `$Number$` = 1, for the anchor
     /// currently in use. `None` until the first `/cdnnum/` request for this
-    /// repid arrives.
-    epoch_t: Option<u64>,
+    /// repid arrives. Signed (`i128`, not `u64`): ffmpeg's own number
+    /// derivation has been observed running ~25.6h *ahead* of the real live
+    /// edge (see the struct doc above), so making the number it actually
+    /// requests map onto `latest_live_t` requires a "segment 1" that
+    /// predates real `$Time$` 0 — that's just internal bookkeeping, never
+    /// sent anywhere; the `$Time$` this produces for the numbers ffmpeg
+    /// really requests always comes out positive (checked in `resolve_url`).
+    epoch_t: Option<i128>,
 }
 
 impl NumberMapping {
     /// `$Time$` value for 1-based segment `number`, given an anchor.
-    fn time_for_number(epoch_t: u64, duration: u64, number: u64) -> u64 {
-        epoch_t + number.saturating_sub(1) * duration
+    fn time_for_number(epoch_t: i128, duration: u64, number: u64) -> i128 {
+        epoch_t + (number.saturating_sub(1) as i128) * (duration as i128)
     }
 
     /// Resolves `number` to a real CDN URL, lazily (re-)anchoring this
@@ -887,19 +893,20 @@ impl NumberMapping {
     /// buffering-ahead requests are never mistaken for drift: a tight
     /// window would re-anchor mid-stream and itself produce a PTS
     /// discontinuity, the original symptom this rewrite exists to avoid.
-    fn resolve_url(&mut self, repid: &str, number: u64) -> String {
-        let tolerance_ticks = REANCHOR_TOLERANCE_SECONDS * self.timescale;
+    /// Returns `None` only if the resolved `$Time$` doesn't fit in a `u64`
+    /// (shouldn't happen for any number ffmpeg actually anchors against).
+    fn resolve_url(&mut self, repid: &str, number: u64) -> Option<String> {
+        let tolerance_ticks = (REANCHOR_TOLERANCE_SECONDS * self.timescale) as i128;
+        let live = self.latest_live_t as i128;
         let needs_anchor = match self.epoch_t {
             None => true,
             Some(epoch_t) => {
                 let implied = Self::time_for_number(epoch_t, self.duration, number);
-                implied.abs_diff(self.latest_live_t) > tolerance_ticks
+                (implied - live).abs() > tolerance_ticks
             }
         };
         if needs_anchor {
-            let new_epoch_t = self
-                .latest_live_t
-                .saturating_sub(number.saturating_sub(1) * self.duration);
+            let new_epoch_t = live - (number.saturating_sub(1) as i128) * (self.duration as i128);
             if self.epoch_t.is_some() {
                 tracing::warn!(
                     "DRM proxy: re-anchoring $Number$ mapping for {} at number={} \
@@ -921,10 +928,14 @@ impl NumberMapping {
             }
             self.epoch_t = Some(new_epoch_t);
         }
-        let t = Self::time_for_number(self.epoch_t.unwrap(), self.duration, number);
-        self.media_pattern
-            .replace("$RepresentationID$", repid)
-            .replace("$Time$", &t.to_string())
+        let t: u64 = Self::time_for_number(self.epoch_t.unwrap(), self.duration, number)
+            .try_into()
+            .ok()?;
+        Some(
+            self.media_pattern
+                .replace("$RepresentationID$", repid)
+                .replace("$Time$", &t.to_string()),
+        )
     }
 }
 
@@ -1160,7 +1171,7 @@ fn number_route_to_cdn_path(rest: &str, mappings: &NumberMappings) -> Option<Str
     let number: u64 = number_str.parse().ok()?;
     let mut guard = mappings.lock().unwrap();
     let mapping = guard.get_mut(repid)?;
-    let real_url = mapping.resolve_url(repid, number);
+    let real_url = mapping.resolve_url(repid, number)?;
     Some(real_url.replacen("://", "/", 1))
 }
 
@@ -1697,7 +1708,7 @@ mod tests {
                 .get("audio_fra=104000")
                 .unwrap()
                 .epoch_t,
-            Some(epoch_t)
+            Some(epoch_t as i128)
         );
 
         // Live edge jumps far ahead of the established anchor — beyond
@@ -1740,8 +1751,53 @@ mod tests {
                 .get("audio_fra=104000")
                 .unwrap()
                 .epoch_t,
-            Some(epoch_t),
+            Some(epoch_t as i128),
             "normal sequential playback must not trigger a re-anchor"
+        );
+    }
+
+    // Regression test for a live-reproduced bug: ffmpeg's dash demuxer does
+    // not just pick a small/near-1 number for its first $Number$ request —
+    // observed live, it independently derives a number whose implied
+    // `$Time$` (number * duration) is *larger* than the real live edge (by
+    // ~25.6h worth of ticks, consistently, across sessions — see the
+    // NumberMapping doc comment). The original `u64`-based anchor formula
+    // (`latest_live_t.saturating_sub((number-1)*duration)`) silently
+    // clamped to 0 in that case instead of the true negative value,
+    // producing a wrong anchor that made every request 404 and re-anchor
+    // every single time (visible live as a WARN spam of
+    // "re-anchoring ... -> epoch_t=0"). This locks in the fix (i128 anchor).
+    #[test]
+    fn test_number_mapping_anchors_correctly_when_first_number_implies_time_past_live_edge() {
+        let mappings = Mutex::new(HashMap::new());
+        let live_t = 85_722_323_698_363u64;
+        derive_and_rewrite_audio_number_mappings(&sample_mpd(live_t), &mappings);
+
+        // Mirrors the real ffmpeg request: number * duration is ~4.4e9
+        // ticks (~25.6h) past `live_t`.
+        let huge_number = 930_194_760u64;
+        let cdn_path =
+            number_route_to_cdn_path(&format!("audio_fra=104000/{huge_number}"), &mappings)
+                .expect("must anchor and resolve, not silently clamp to $Time$=0");
+        assert_eq!(
+            cdn_path,
+            format!(
+                "https/cdn.example.fr/live/ch1/dash/ch1-audio_fra=104000-{live_t}.dash?tok=abc",
+            ),
+            "the very first request must resolve to the live edge, not epoch_t=0"
+        );
+
+        // The next sequential number must NOT trigger a spurious re-anchor —
+        // this is exactly what looped forever in the live bug.
+        let cdn_path2 =
+            number_route_to_cdn_path(&format!("audio_fra=104000/{}", huge_number + 1), &mappings)
+                .unwrap();
+        assert_eq!(
+            cdn_path2,
+            format!(
+                "https/cdn.example.fr/live/ch1/dash/ch1-audio_fra=104000-{}.dash?tok=abc",
+                live_t + 92160
+            )
         );
     }
 
@@ -1769,13 +1825,13 @@ mod tests {
         };
         // First call anchors: number=3 is treated as "now" (latest_live_t).
         assert_eq!(
-            m.resolve_url("audio_fra=104000", 3),
+            m.resolve_url("audio_fra=104000", 3).unwrap(),
             format!("https://x/audio_fra=104000-{live_t}")
         );
-        assert_eq!(m.epoch_t, Some(live_t - 2 * 92160));
+        assert_eq!(m.epoch_t, Some(live_t as i128 - 2 * 92160));
         // Subsequent calls reuse the anchor.
         assert_eq!(
-            m.resolve_url("audio_fra=104000", 4),
+            m.resolve_url("audio_fra=104000", 4).unwrap(),
             format!("https://x/audio_fra=104000-{}", live_t + 92160)
         );
     }
