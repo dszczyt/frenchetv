@@ -363,7 +363,7 @@ async fn dispatch(
                 return ("200 OK", "video/mp4", data);
             }
             Err(e) => {
-                tracing::error!("DRM proxy segment error: {:#}", e);
+                tracing::error!("DRM proxy segment error for {} ({}): {:#}", path, cdn_path, e);
                 return (
                     "502 Bad Gateway",
                     "text/plain",
