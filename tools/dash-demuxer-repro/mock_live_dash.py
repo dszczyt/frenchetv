@@ -84,10 +84,16 @@ def build_mpd():
         # $Number$-based addressing, no SegmentTimeline element at all — a
         # different, simpler ffmpeg dash-demuxer code path than the
         # SegmentTimeline-refresh-reconciliation logic tested above.
+        # startNumber MOVES with the live window on every refresh (matching
+        # what the real proxy needs to do — mirroring the sliding <S t=X>
+        # value, just expressed as a number instead of a time) rather than
+        # staying fixed at 1 for the whole session, which the first version
+        # of this test did and didn't actually exercise.
         _, segs_elapsed = current_window()
+        start_number = START_NUMBER + segs_elapsed
         template = (
             f'<SegmentTemplate timescale="{TIMESCALE}" duration="{SEG_DUR}" '
-            f'startNumber="{START_NUMBER}" '
+            f'startNumber="{start_number}" '
             f'initialization="/init.mp4" media="/media/num-$Number$.mp4"/>'
         )
         mpd_type = "dynamic"
