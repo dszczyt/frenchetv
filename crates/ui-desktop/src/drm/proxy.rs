@@ -113,9 +113,9 @@ pub async fn start(
         }
     );
 
-    // Established once per audio representation from the first manifest that
-    // lists it, then reused (and validated) on every subsequent refresh — see
-    // `number_mappings` field doc. Created here, before `ProxyState` exists,
+    // Established once per representation (audio and video) from the first
+    // manifest that lists it, then reused (and validated) on every subsequent
+    // refresh — see `number_mappings` field doc. Created here, before `ProxyState` exists,
     // so the very first `rewrite_mpd` call (below) can populate it and later
     // refreshes in `fetch_live_mpd` keep extending the same store.
     let number_mappings: NumberMappings = Mutex::new(HashMap::new());
@@ -228,13 +228,16 @@ struct ProxyState {
     /// requests for the same path are still real (mpv's dash demuxer retries
     /// while it's stuck) and this keeps every repeat past the first cheap.
     segment_cache: SegmentCache,
-    /// Per-audio-representation `$Number$`→`$Time$` mapping, keyed by
-    /// representation id. See `derive_and_rewrite_audio_number_mappings` for
-    /// why this exists: ffmpeg's dash demuxer reliably desyncs on a live
+    /// Per-representation (audio and video) `$Number$`→`$Time$` mapping,
+    /// keyed by representation id. See `derive_and_rewrite_number_mappings`
+    /// for why this exists: ffmpeg's dash demuxer reliably desyncs on a live
     /// manifest's refreshed `<SegmentTimeline>`, reproduced independent of
     /// this proxy in `tools/dash-demuxer-repro/`. Persists across
-    /// `fetch_live_mpd` refreshes — established once per representation from
-    /// the first manifest that lists it, then held fixed.
+    /// `fetch_live_mpd` refreshes — `duration`/`media_pattern` are
+    /// established once per representation from the first manifest that
+    /// lists it, then held fixed; the `$Number$`→`$Time$` anchor itself is
+    /// established lazily from whatever number ffmpeg's dash demuxer
+    /// actually requests (see `NumberMapping::resolve_url`).
     number_mappings: NumberMappings,
 }
 
@@ -342,7 +345,7 @@ async fn dispatch(
     }
 
     // `/cdnnum/<repid>/<number>` — the $Number$-based audio addressing
-    // (see `derive_and_rewrite_audio_number_mappings`) translates back to a
+    // (see `derive_and_rewrite_number_mappings`) translates back to a
     // real `/cdn/...`-shaped path here, then joins the exact same
     // cache/fetch/decrypt path below as any other segment request.
     let cdnnum_path = path
@@ -794,12 +797,12 @@ fn rewrite_mpd(
     }
 
     // Step 2.5: Replace audio <SegmentTemplate>s with $Number$-based
-    // addressing — see `derive_and_rewrite_audio_number_mappings` doc.
+    // addressing — see `derive_and_rewrite_number_mappings` doc.
     // Operates on `mpd_abs` (media/initialization patterns are still the
     // CDN's original relative strings here; BaseURL is already absolute)
     // before URL rewriting, since the replacement contains no `https://`/
     // `http://` substrings for step 3 to touch either way.
-    let mpd_numbered = derive_and_rewrite_audio_number_mappings(&mpd_abs, number_mappings);
+    let mpd_numbered = derive_and_rewrite_number_mappings(&mpd_abs, number_mappings);
 
     // Step 3: Rewrite all https://... and http://... CDN URLs through the proxy.
     let mpd_rewritten = rewrite_cdn_urls(&mpd_numbered, &proxy_base, mpd_base_url);
@@ -815,7 +818,7 @@ fn rewrite_mpd(
     (final_mpd, hosts)
 }
 
-// ─── $Number$-based audio addressing ───────────────────────────────────────────
+// ─── $Number$-based addressing ──────────────────────────────────────────────
 //
 // ffmpeg's dash demuxer reliably desyncs its fragment-index tracking when a
 // live (`type="dynamic"`) manifest's `<SegmentTimeline>` is refreshed
@@ -829,8 +832,12 @@ fn rewrite_mpd(
 // normally for a genuinely live stream. See `tools/dash-demuxer-repro/README.md`
 // for the full test matrix.
 //
-// Only applied to audio `<AdaptationSet>`s: video has never shown this bug in
-// any test, and there's no reason to add risk to what already works.
+// Applied to both audio and video `<AdaptationSet>`s — the mechanism isn't
+// content-type-specific. It initially shipped audio-only on the (wrong)
+// assumption that video was unaffected; that "evidence" was collected while
+// audio's copy of this same bug was starving the demuxer first and loudest.
+// Once audio stopped triggering it, video's untouched SegmentTimeline path
+// started looping instead — same bug, same fix.
 
 type NumberMappings = Mutex<HashMap<String, NumberMapping>>;
 
@@ -839,7 +846,7 @@ type NumberMappings = Mutex<HashMap<String, NumberMapping>>;
 /// treated as wrong and re-derived. Wide on purpose — see `resolve_url`.
 const REANCHOR_TOLERANCE_SECONDS: u64 = 600;
 
-/// Per-audio-representation `$Number$` → `$Time$` translation, keyed by
+/// Per-representation `$Number$` → `$Time$` translation, keyed by
 /// representation id in `ProxyState::number_mappings`.
 ///
 /// ffmpeg's dash demuxer does not use this template's advertised
@@ -854,7 +861,7 @@ const REANCHOR_TOLERANCE_SECONDS: u64 = 600;
 struct NumberMapping {
     /// Segment duration in this representation's own `timescale` units.
     /// Established once from the first manifest that lists this
-    /// representation, then held fixed — see `derive_and_rewrite_audio_number_mappings`.
+    /// representation, then held fixed — see `derive_and_rewrite_number_mappings`.
     duration: u64,
     /// This representation's `SegmentTemplate@timescale` — needed to convert
     /// `REANCHOR_TOLERANCE_SECONDS` into ticks.
@@ -942,7 +949,7 @@ impl NumberMapping {
 /// Scratch state accumulated while scanning one `<AdaptationSet>`.
 #[derive(Default)]
 struct SetScratch {
-    is_audio: bool,
+    in_scope: bool,
     /// Byte span of the `<SegmentTemplate>...</SegmentTemplate>` element in
     /// the original text, once both ends have been seen.
     template_span: Option<(u64, u64)>,
@@ -959,14 +966,15 @@ struct SetScratch {
     rep_ids: Vec<String>,
 }
 
-/// Rewrites every audio `<AdaptationSet>`'s `<SegmentTemplate>` from the CDN's
-/// original `$Time$` + `<SegmentTimeline>` addressing to `$Number$` + fixed
-/// `duration`, routed through `/cdnnum/<repid>/<number>` (translated back to
-/// a real CDN fetch in `dispatch`). See the module doc above for why.
+/// Rewrites every audio and video `<AdaptationSet>`'s `<SegmentTemplate>`
+/// from the CDN's original `$Time$` + `<SegmentTimeline>` addressing to
+/// `$Number$` + fixed `duration`, routed through `/cdnnum/<repid>/<number>`
+/// (translated back to a real CDN fetch in `dispatch`). See the module doc
+/// above for why.
 ///
-/// `mappings` persists across refreshes: a representation's `(epoch_t,
-/// duration)` is established once, from the first manifest that lists it,
-/// then held fixed. A later refresh reporting a different `duration` for an
+/// `mappings` persists across refreshes: a representation's `duration` is
+/// established once, from the first manifest that lists it, then held
+/// fixed. A later refresh reporting a different `duration` for an
 /// already-known representation — which would happen if a segment's real
 /// duration ever changes mid-stream, e.g. an SCTE-35 ad-break splice — means
 /// the fixed mapping would silently produce the wrong `$Time$` from that
@@ -977,7 +985,7 @@ struct SetScratch {
 /// entries, missing attributes) — this function only ever *replaces* text it
 /// has fully understood; anything it can't confidently parse is left
 /// untouched.
-fn derive_and_rewrite_audio_number_mappings(mpd_abs: &str, mappings: &NumberMappings) -> String {
+fn derive_and_rewrite_number_mappings(mpd_abs: &str, mappings: &NumberMappings) -> String {
     use quick_xml::events::{BytesStart, Event};
     use quick_xml::Reader;
 
@@ -1030,35 +1038,39 @@ fn derive_and_rewrite_audio_number_mappings(mpd_abs: &str, mappings: &NumberMapp
                 let content_type = attr_raw(e, b"contentType").unwrap_or_default();
                 let mime_type = attr_raw(e, b"mimeType").unwrap_or_default();
                 set = SetScratch::default();
-                set.is_audio =
-                    content_type.eq_ignore_ascii_case("audio") || mime_type.starts_with("audio/");
+                set.in_scope = ["audio", "video"]
+                    .iter()
+                    .any(|t| content_type.eq_ignore_ascii_case(t))
+                    || ["audio/", "video/"]
+                        .iter()
+                        .any(|t| mime_type.starts_with(t));
             }
-            Event::Start(e) if set.is_audio && e.name().as_ref() == b"SegmentTemplate" => {
+            Event::Start(e) if set.in_scope && e.name().as_ref() == b"SegmentTemplate" => {
                 set.template_span = Some((pos_before, 0));
                 set.timescale = attr_raw(e, b"timescale").and_then(|s| s.parse().ok());
                 set.media_raw = attr_unescaped(e, b"media");
                 set.init_raw = attr_raw(e, b"initialization");
             }
-            Event::End(e) if set.is_audio && e.name().as_ref() == b"SegmentTemplate" => {
+            Event::End(e) if set.in_scope && e.name().as_ref() == b"SegmentTemplate" => {
                 if let Some((start, _)) = set.template_span {
                     set.template_span = Some((start, reader.buffer_position()));
                 }
             }
-            Event::Start(e) | Event::Empty(e) if set.is_audio && e.name().as_ref() == b"S" => {
+            Event::Start(e) | Event::Empty(e) if set.in_scope && e.name().as_ref() == b"S" => {
                 let t = attr_raw(e, b"t").and_then(|s| s.parse().ok());
                 if let Some(d) = attr_raw(e, b"d").and_then(|s| s.parse().ok()) {
                     set.s_entries.push((t, d));
                 }
             }
             Event::Start(e) | Event::Empty(e)
-                if set.is_audio && e.name().as_ref() == b"Representation" =>
+                if set.in_scope && e.name().as_ref() == b"Representation" =>
             {
                 if let Some(id) = attr_raw(e, b"id") {
                     set.rep_ids.push(id);
                 }
             }
             Event::End(e) if e.name().as_ref() == b"AdaptationSet" => {
-                if set.is_audio {
+                if set.in_scope {
                     if let Some(replacement) =
                         build_number_template(&set, base_url.as_deref(), mappings)
                     {
@@ -1083,7 +1095,7 @@ fn derive_and_rewrite_audio_number_mappings(mpd_abs: &str, mappings: &NumberMapp
 /// qualifies, establishes/validates its `NumberMapping`s and returns the
 /// replacement `<SegmentTemplate>` XML. Returns `None` (leave the original
 /// untouched) for anything not fully understood — see the fallback rules on
-/// `derive_and_rewrite_audio_number_mappings`.
+/// `derive_and_rewrite_number_mappings`.
 fn build_number_template(
     set: &SetScratch,
     base_url: Option<&str>,
@@ -1119,7 +1131,7 @@ fn build_number_template(
                 // don't risk translating $Number$ to the wrong $Time$ for
                 // the rest of the session.
                 tracing::warn!(
-                    "DRM proxy: audio representation {} changed duration/pattern \
+                    "DRM proxy: representation {} changed duration/pattern \
                      (mapped duration={} now={}) — falling back to passthrough",
                     repid,
                     existing.duration,
@@ -1161,7 +1173,7 @@ fn build_number_template(
 }
 
 /// Translates a `/cdnnum/<repid>/<number>` route (see
-/// `derive_and_rewrite_audio_number_mappings`) back into the
+/// `derive_and_rewrite_number_mappings`) back into the
 /// `"<scheme>/<host>/<path>?<query>"` shape `fetch_and_decrypt` expects —
 /// same as what's already behind `/cdn/`, so the rest of the pipeline
 /// (host allowlisting, decrypt, caching) is unchanged. `None` if the path
@@ -1564,28 +1576,40 @@ mod tests {
       </SegmentTemplate>
       <Representation id="video=457600" bandwidth="457600"></Representation>
     </AdaptationSet>
+    <AdaptationSet contentType="text" mimeType="application/mp4">
+      <SegmentTemplate timescale="1000"
+                        initialization="ch1-$RepresentationID$.dash?tok=abc"
+                        media="ch1-$RepresentationID$-$Time$.dash?tok=abc">
+        <SegmentTimeline>
+          <S t="2000000" d="1920" r="15"/>
+        </SegmentTimeline>
+      </SegmentTemplate>
+      <Representation id="textstream=8000" bandwidth="8000"></Representation>
+    </AdaptationSet>
   </Period>
 </MPD>"#
         )
     }
 
     #[test]
-    fn test_number_mapping_replaces_audio_segment_template_only() {
+    fn test_number_mapping_rewrites_audio_and_video_but_not_text() {
         let mappings = Mutex::new(HashMap::new());
-        let out =
-            derive_and_rewrite_audio_number_mappings(&sample_mpd(85_000_000_000_000), &mappings);
+        let out = derive_and_rewrite_number_mappings(&sample_mpd(85_000_000_000_000), &mappings);
 
         assert!(out.contains("media=\"/cdnnum/$RepresentationID$/$Number$\""));
-        // The audio <S> entry is gone (video's, checked below, legitimately
-        // still has one — "SegmentTimeline" alone isn't a safe substring to
-        // assert absent, since video keeps its own untouched).
+        // Both audio's and video's <S> entries are gone — the mechanism
+        // isn't content-type-specific (see module doc).
         assert!(
             !out.contains(r#"<S t="85000000000000""#),
             "audio timeline entry should be gone: {out}"
         );
-        // Video's SegmentTemplate/SegmentTimeline must be untouched.
+        assert!(
+            !out.contains(r#"<S t="1000000" d="1152" r="15"/>"#),
+            "video timeline entry should be gone: {out}"
+        );
+        // Text/subtitle tracks are out of scope entirely — untouched.
         assert!(out.contains(r#"media="ch1-$RepresentationID$-$Time$.dash?tok=abc""#));
-        assert!(out.contains(r#"<S t="1000000" d="1152" r="15"/>"#));
+        assert!(out.contains(r#"<S t="2000000" d="1920" r="15"/>"#));
         // initialization stays as the original CDN pattern (unchanged, still
         // routed through the existing /cdn/ passthrough).
         assert!(out.contains(r#"initialization="ch1-$RepresentationID$.dash?tok=abc""#));
@@ -1596,7 +1620,7 @@ mod tests {
         let mappings = Mutex::new(HashMap::new());
         let epoch_t = 85_000_000_000_000u64;
 
-        let first = derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+        let first = derive_and_rewrite_number_mappings(&sample_mpd(epoch_t), &mappings);
         // Cosmetic constant — ffmpeg doesn't consult it (see NumberMapping doc).
         assert!(
             first.contains(r#"startNumber="1""#),
@@ -1605,7 +1629,7 @@ mod tests {
 
         // 2 segments later (t advances by 2 * 92160).
         let second =
-            derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t + 2 * 92160), &mappings);
+            derive_and_rewrite_number_mappings(&sample_mpd(epoch_t + 2 * 92160), &mappings);
         assert!(
             second.contains(r#"startNumber="1""#),
             "second window: {second}"
@@ -1629,19 +1653,28 @@ mod tests {
     fn test_number_mapping_falls_back_when_duration_changes() {
         let mappings = Mutex::new(HashMap::new());
         let epoch_t = 85_000_000_000_000u64;
-        let _ = derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+        let _ = derive_and_rewrite_number_mappings(&sample_mpd(epoch_t), &mappings);
 
         // Simulate a duration change (e.g. an SCTE ad-break splice) on the
-        // next refresh — same shape, different `d`.
+        // next refresh — same shape, different `d`. Only audio's `d="92160"`
+        // matches, so video (`d="1152"`) is unaffected by this replace and
+        // should keep rewriting normally — the fallback is per-representation.
         let changed = sample_mpd(epoch_t + 92160).replace(r#"d="92160""#, r#"d="48000""#);
-        let out = derive_and_rewrite_audio_number_mappings(&changed, &mappings);
+        let out = derive_and_rewrite_number_mappings(&changed, &mappings);
 
-        // Falls back to passthrough: original SegmentTimeline preserved,
-        // no /cdnnum/ rewrite for this refresh.
-        assert!(!out.contains("/cdnnum/"), "should not rewrite: {out}");
+        // Audio falls back to passthrough: original SegmentTimeline preserved.
+        assert!(
+            out.contains(r#"media="ch1-$RepresentationID$-$Time$.dash?tok=abc""#),
+            "audio should fall back to passthrough: {out}"
+        );
         assert!(out.contains("SegmentTimeline"));
+        // Video is untouched by the audio-only duration change and still rewrites.
+        assert!(
+            out.contains("media=\"/cdnnum/$RepresentationID$/$Number$\""),
+            "video should still be rewritten independently: {out}"
+        );
 
-        // The stored mapping is untouched by the failed attempt.
+        // The stored audio mapping is untouched by the failed attempt.
         let stored = mappings.lock().unwrap();
         assert_eq!(stored.get("audio_fra=104000").unwrap().duration, 92160);
     }
@@ -1649,23 +1682,30 @@ mod tests {
     #[test]
     fn test_number_mapping_falls_back_on_multiple_s_entries() {
         let mappings = Mutex::new(HashMap::new());
+        // Only audio's timeline gets the extra <S> entry — video's stays
+        // single-entry and should still qualify/rewrite independently.
         let mpd = sample_mpd(85_000_000_000_000).replace(
             r#"<S t="85000000000000" d="92160" r="15"/>"#,
             r#"<S t="85000000000000" d="92160" r="7"/><S t="85000000737280" d="92160" r="7"/>"#,
         );
-        let out = derive_and_rewrite_audio_number_mappings(&mpd, &mappings);
+        let out = derive_and_rewrite_number_mappings(&mpd, &mappings);
         assert!(
-            !out.contains("/cdnnum/"),
-            "multi-run timeline should pass through: {out}"
+            out.contains(r#"media="ch1-$RepresentationID$-$Time$.dash?tok=abc""#),
+            "audio's multi-run timeline should pass through: {out}"
         );
-        assert!(mappings.lock().unwrap().is_empty());
+        assert!(
+            out.contains("media=\"/cdnnum/$RepresentationID$/$Number$\""),
+            "video should still be rewritten: {out}"
+        );
+        assert!(mappings.lock().unwrap().get("audio_fra=104000").is_none());
+        assert!(mappings.lock().unwrap().contains_key("video=457600"));
     }
 
     #[test]
     fn test_number_mapping_lazily_anchors_on_first_dispatch_request() {
         let mappings = Mutex::new(HashMap::new());
         let epoch_t = 85_000_000_000_000u64;
-        derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+        derive_and_rewrite_number_mappings(&sample_mpd(epoch_t), &mappings);
 
         // ffmpeg's first request can be any number (it doesn't read our
         // advertised startNumber — see NumberMapping doc). Whatever it asks
@@ -1697,7 +1737,7 @@ mod tests {
     fn test_number_mapping_reanchors_on_gross_drift() {
         let mappings = Mutex::new(HashMap::new());
         let epoch_t = 85_000_000_000_000u64;
-        derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+        derive_and_rewrite_number_mappings(&sample_mpd(epoch_t), &mappings);
 
         // Anchor at number=1 -> epoch_t == the manifest's live t.
         number_route_to_cdn_path("audio_fra=104000/1", &mappings).unwrap();
@@ -1717,7 +1757,7 @@ mod tests {
         // independent number derivation.
         let tolerance_ticks = REANCHOR_TOLERANCE_SECONDS * 48000;
         let jumped_t = epoch_t + tolerance_ticks * 3;
-        derive_and_rewrite_audio_number_mappings(&sample_mpd(jumped_t), &mappings);
+        derive_and_rewrite_number_mappings(&sample_mpd(jumped_t), &mappings);
 
         // Same number as before (1) now implies a `t` far from the new live
         // edge -> must re-anchor rather than keep serving the stale value.
@@ -1736,12 +1776,12 @@ mod tests {
     fn test_number_mapping_does_not_reanchor_within_tolerance() {
         let mappings = Mutex::new(HashMap::new());
         let epoch_t = 85_000_000_000_000u64;
-        derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t), &mappings);
+        derive_and_rewrite_number_mappings(&sample_mpd(epoch_t), &mappings);
         number_route_to_cdn_path("audio_fra=104000/1", &mappings).unwrap();
 
         // Live edge advances normally (a few segments, well inside
         // tolerance) — the anchor must NOT move.
-        derive_and_rewrite_audio_number_mappings(&sample_mpd(epoch_t + 5 * 92160), &mappings);
+        derive_and_rewrite_number_mappings(&sample_mpd(epoch_t + 5 * 92160), &mappings);
         number_route_to_cdn_path("audio_fra=104000/6", &mappings).unwrap();
 
         assert_eq!(
@@ -1771,7 +1811,7 @@ mod tests {
     fn test_number_mapping_anchors_correctly_when_first_number_implies_time_past_live_edge() {
         let mappings = Mutex::new(HashMap::new());
         let live_t = 85_722_323_698_363u64;
-        derive_and_rewrite_audio_number_mappings(&sample_mpd(live_t), &mappings);
+        derive_and_rewrite_number_mappings(&sample_mpd(live_t), &mappings);
 
         // Mirrors the real ffmpeg request: number * duration is ~4.4e9
         // ticks (~25.6h) past `live_t`.
