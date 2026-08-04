@@ -1074,6 +1074,13 @@ fn build_number_template(
     // segmentAlignment="true" means one SegmentTimeline for the whole set),
     // so any of them gives the same start_number for the current window.
     let start_number = mappings[&set.rep_ids[0]].number_for_time(t);
+    tracing::info!(
+        "DRM proxy: audio $Number$ mapping for {}: t={} duration={} startNumber={}",
+        set.rep_ids[0],
+        t,
+        d,
+        start_number
+    );
 
     Some(format!(
         "<SegmentTemplate timescale=\"{timescale}\" initialization=\"{init_raw}\" \
