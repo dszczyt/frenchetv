@@ -1,6 +1,9 @@
-use egui::{Align, Color32, FontId, Layout, RichText, Vec2};
+use egui::{Align, FontId, Layout, RichText, Vec2};
 
 const LOGO_BYTES: &[u8] = include_bytes!("../../../../assets/logo.png");
+use crate::theme::{color, space, text};
+use crate::widgets::{accent_button, field_label, hover_card};
+use egui_phosphor::regular as icon;
 use frenchetv_core::{OperatorKind, OperatorRegistry};
 
 pub struct SetupScreen {
@@ -55,10 +58,10 @@ impl SetupScreen {
         let mut action = SetupAction::None;
 
         egui::CentralPanel::default()
-            .frame(egui::Frame::none().fill(Color32::from_rgb(13, 15, 20)))
+            .frame(egui::Frame::none().fill(color::BG))
             .show(ctx, |ui| {
                 ui.vertical_centered(|ui| {
-                    ui.add_space(40.0);
+                    ui.add_space(space::XL + space::SM);
 
                     // Logo
                     ui.add(
@@ -66,13 +69,13 @@ impl SetupScreen {
                             .max_size(egui::vec2(270.0, 67.0))
                             .maintain_aspect_ratio(true),
                     );
-                    ui.add_space(8.0);
+                    ui.add_space(space::SM);
                     ui.label(
                         RichText::new("Choisissez votre opérateur")
-                            .font(FontId::proportional(16.0))
-                            .color(Color32::from_rgb(180, 180, 180)),
+                            .font(FontId::proportional(text::SUBTITLE))
+                            .color(color::TEXT_MUTED),
                     );
-                    ui.add_space(32.0);
+                    ui.add_space(space::XL);
 
                     // Operator cards — allocate a row of the exact total width and
                     // let the surrounding `vertical_centered` center it (same idiom
@@ -86,48 +89,40 @@ impl SetupScreen {
                         Vec2::new(row_w, 130.0),
                         Layout::left_to_right(Align::Center),
                         |ui| {
-                            for (i, kind) in OperatorRegistry::all().iter().enumerate() {
+                            // `row_w` budgets exactly `CARD_GAP` between cards via
+                            // the manual `add_space` below — zero out the theme's
+                            // global item_spacing here, or `left_to_right` would
+                            // add its own gap on top and the row would overflow
+                            // its allocated (and therefore centered) width.
+                            ui.spacing_mut().item_spacing.x = 0.0;
+                            for kind in OperatorRegistry::all().iter() {
                                 let selected = self.selected_operator.as_ref() == Some(kind);
-                                let (border_color, bg_color) = if selected {
-                                    (
-                                        Color32::from_rgb(10, 132, 255),
-                                        Color32::from_rgb(20, 40, 70),
-                                    )
-                                } else {
-                                    (Color32::from_rgb(60, 60, 60), Color32::from_rgb(25, 27, 34))
-                                };
+                                let id =
+                                    ui.make_persistent_id(("operator_card", kind.config_str()));
 
-                                let card = egui::Frame::none()
-                                    .fill(bg_color)
-                                    .stroke(egui::Stroke::new(
-                                        if selected { 3.0_f32 } else { 1.5_f32 },
-                                        border_color,
-                                    ))
-                                    .rounding(12.0)
-                                    .inner_margin(20.0);
-
-                                // push_id gives each card a unique interaction ID;
-                                // without it both Frames share an auto-ID and only the
-                                // first card registers clicks (see channel_list grid).
-                                let resp = ui.push_id(i, |ui| {
-                                    card.show(ui, |ui| {
-                                        ui.set_min_size(Vec2::new(160.0, 80.0));
-                                        ui.vertical_centered(|ui| {
+                                let resp = hover_card(
+                                    ui,
+                                    id,
+                                    Vec2::new(CARD_W, 130.0),
+                                    selected,
+                                    true,
+                                    |ui| {
+                                        ui.centered_and_justified(|ui| {
                                             ui.label(
                                                 RichText::new(kind.display_name())
                                                     .font(FontId::proportional(18.0))
-                                                    .color(Color32::WHITE),
+                                                    .color(color::TEXT),
                                             );
                                         });
-                                    })
-                                });
+                                    },
+                                );
 
-                                if resp.inner.response.interact(egui::Sense::click()).clicked() {
+                                if resp.clicked() {
                                     self.selected_operator = Some(kind.clone());
                                     self.error_message = None;
                                 }
 
-                                ui.add_space(16.0);
+                                ui.add_space(CARD_GAP);
                             }
                         },
                     );
@@ -144,72 +139,70 @@ impl SetupScreen {
                                 |ui| {
                                     // Operator-specific extra field (e.g. Bouygues last name).
                                     if let Some(label) = op.extra_credential_label() {
-                                        ui.label(
-                                            RichText::new(label)
-                                                .color(Color32::from_rgb(180, 180, 180)),
-                                        );
+                                        field_label(ui, label);
                                         ui.add(
                                             egui::TextEdit::singleline(&mut self.extra)
                                                 .desired_width(f32::INFINITY)
-                                                .font(FontId::proportional(16.0)),
+                                                .font(FontId::proportional(text::BODY)),
                                         );
-                                        ui.add_space(8.0);
+                                        ui.add_space(space::SM);
                                     }
-                                    ui.label(
-                                        RichText::new("Identifiant")
-                                            .color(Color32::from_rgb(180, 180, 180)),
-                                    );
+                                    field_label(ui, "Identifiant");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.username)
                                             .hint_text("email@example.com")
                                             .desired_width(f32::INFINITY)
-                                            .font(FontId::proportional(16.0)),
+                                            .font(FontId::proportional(text::BODY)),
                                     );
-                                    ui.add_space(8.0);
-                                    ui.label(
-                                        RichText::new("Mot de passe")
-                                            .color(Color32::from_rgb(180, 180, 180)),
-                                    );
+                                    ui.add_space(space::SM);
+                                    field_label(ui, "Mot de passe");
                                     ui.add(
                                         egui::TextEdit::singleline(&mut self.password)
                                             .password(true)
                                             .hint_text("••••••••")
                                             .desired_width(f32::INFINITY)
-                                            .font(FontId::proportional(16.0)),
+                                            .font(FontId::proportional(text::BODY)),
                                     );
                                 },
                             );
 
-                            ui.add_space(24.0);
+                            ui.add_space(space::LG);
 
                             // Error message
                             if let Some(err) = &self.error_message {
                                 ui.label(
-                                    RichText::new(err)
-                                        .color(Color32::from_rgb(255, 80, 80))
-                                        .font(FontId::proportional(14.0)),
+                                    RichText::new(format!("{}  {}", icon::WARNING_CIRCLE, err))
+                                        .color(color::ERROR)
+                                        .font(FontId::proportional(text::LABEL)),
                                 );
-                                ui.add_space(8.0);
+                                ui.add_space(space::SM);
                             }
 
-                            // Watch TV button
+                            // Watch TV button, with an inline spinner while loading.
                             let btn_label = if self.loading {
                                 "Connexion…"
                             } else {
                                 "Regarder la TV"
                             };
-                            let btn = egui::Button::new(
-                                RichText::new(btn_label)
-                                    .font(FontId::proportional(18.0))
-                                    .color(Color32::WHITE),
-                            )
-                            .fill(Color32::from_rgb(10, 132, 255))
-                            .rounding(8.0)
-                            .min_size(Vec2::new(200.0, 48.0));
+                            let clicked = ui
+                                .horizontal(|ui| {
+                                    let resp = accent_button(
+                                        ui,
+                                        btn_label,
+                                        !self.loading,
+                                        Vec2::new(200.0, 48.0),
+                                    );
+                                    if self.loading {
+                                        ui.add_space(space::SM);
+                                        ui.add(egui::Spinner::new().size(20.0).color(color::TEXT));
+                                    }
+                                    resp.clicked()
+                                })
+                                .inner;
 
                             let extra_ok =
                                 op.extra_credential_label().is_none() || !self.extra.is_empty();
-                            if ui.add_enabled(!self.loading, btn).clicked()
+                            if clicked
                                 && !self.username.is_empty()
                                 && !self.password.is_empty()
                                 && extra_ok

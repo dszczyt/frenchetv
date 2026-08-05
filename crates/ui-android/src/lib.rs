@@ -16,7 +16,7 @@ fn android_main(app: AndroidApp) {
     // eframe's `IntegrationInfo` no longer carries `android_app` (as of 0.30) —
     // capture it from here instead, where `android_main` already has it.
     eframe::run_native(
-        "FrenchTV",
+        "frenchetv",
         native_options,
         Box::new(move |cc| Ok(Box::new(crate::app::App::new(cc, app)))),
     )

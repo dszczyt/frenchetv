@@ -1,9 +1,16 @@
 use crate::player::libmpv::LibMpvPlayer;
 #[cfg(unix)]
 use crate::player::mpv_ipc::MpvIpcPlayer;
+use crate::theme::{color, fade, motion, space, text};
 use egui::{Color32, FontId, Key, RichText, Vec2};
+use egui_phosphor::regular as icon;
 use frenchetv_core::Channel;
 use frenchetv_core::StreamUrl;
+
+/// Stable id for animating the info-overlay fade in/out.
+fn overlay_anim_id() -> egui::Id {
+    egui::Id::new("player_info_overlay")
+}
 
 enum PlayerState {
     Loading,
@@ -140,6 +147,18 @@ impl PlayerScreen {
             ctx.request_repaint();
         }
 
+        // Fade the overlay in/out instead of snapping it, and keep repainting
+        // while the fade itself is still in flight (the block above only
+        // repaints while `info_visible` is true, which stops as soon as it
+        // flips to false — mid fade-out).
+        let overlay_t =
+            ctx.animate_bool_with_time(overlay_anim_id(), self.info_visible, motion::NORMAL);
+        if (overlay_t - if self.info_visible { 1.0 } else { 0.0 }).abs() > 0.001 {
+            ctx.request_repaint();
+        }
+
+        let mut action = action;
+
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::BLACK))
             .show(ctx, |ui| {
@@ -152,12 +171,12 @@ impl PlayerScreen {
                         ui.centered_and_justified(|ui| {
                             ui.vertical_centered(|ui| {
                                 ui.add_space(available.y / 2.0 - 32.0);
-                                ui.add(egui::Spinner::new().size(40.0).color(Color32::WHITE));
-                                ui.add_space(16.0);
+                                ui.add(egui::Spinner::new().size(40.0).color(color::TEXT));
+                                ui.add_space(space::MD);
                                 ui.label(
                                     RichText::new(format!("Chargement de {}…", self.channel.name))
-                                        .font(FontId::proportional(16.0))
-                                        .color(Color32::from_rgb(160, 160, 160)),
+                                        .font(FontId::proportional(text::BODY))
+                                        .color(color::TEXT_MUTED),
                                 );
                             });
                         });
@@ -175,44 +194,63 @@ impl PlayerScreen {
                         }
                         None => {
                             ui.centered_and_justified(|ui| {
-                                ui.add(egui::Spinner::new().size(40.0).color(Color32::WHITE));
+                                ui.add(egui::Spinner::new().size(40.0).color(color::TEXT));
                             });
                             ctx.request_repaint();
                         }
                     },
                 }
 
-                // Info overlay (channel name + key hints).
-                if self.info_visible {
-                    let rect = ui.max_rect();
+                let rect = ui.max_rect();
+
+                // Info overlay (channel name + key hints), faded by `overlay_t`.
+                if overlay_t > 0.004 {
                     let overlay_height = 80.0;
                     let overlay_rect = egui::Rect::from_min_size(
                         egui::pos2(rect.min.x, rect.max.y - overlay_height),
                         Vec2::new(rect.width(), overlay_height),
                     );
-                    ui.painter().rect_filled(
-                        overlay_rect,
-                        0.0,
-                        Color32::from_rgba_unmultiplied(0, 0, 0, 180),
-                    );
+                    ui.painter()
+                        .rect_filled(overlay_rect, 0.0, fade(color::SCRIM, overlay_t));
                     ui.allocate_new_ui(egui::UiBuilder::new().max_rect(overlay_rect), |ui| {
-                        ui.add_space(12.0);
+                        ui.add_space(space::SM + space::XS);
                         ui.horizontal(|ui| {
-                            ui.add_space(16.0);
+                            ui.add_space(space::MD);
                             ui.vertical(|ui| {
                                 ui.label(
                                     RichText::new(&self.channel.name)
-                                        .font(FontId::proportional(22.0))
-                                        .color(Color32::WHITE),
+                                        .font(FontId::proportional(text::TITLE))
+                                        .color(fade(color::TEXT, overlay_t)),
                                 );
                                 ui.label(
                                     RichText::new("← → Changer  ↵ Info  F Plein écran  Esc Retour")
-                                        .font(FontId::proportional(12.0))
-                                        .color(Color32::from_rgb(160, 160, 160)),
+                                        .font(FontId::proportional(text::LABEL - 2.0))
+                                        .color(fade(color::TEXT_MUTED, overlay_t)),
                                 );
                             });
                         });
                     });
+                }
+
+                // Visible escape route, always reachable — not just while the
+                // info overlay happens to be up. Keyboard Esc/Backspace already
+                // work, but a critical action like leaving playback shouldn't be
+                // keyboard-only-discoverable, and this is exactly what's needed
+                // when a stream hangs on `PlayerState::Loading`.
+                let back_rect =
+                    egui::Rect::from_min_size(rect.min + Vec2::splat(space::MD), Vec2::splat(40.0));
+                let back_resp = ui.put(
+                    back_rect,
+                    egui::Button::new(
+                        RichText::new(icon::ARROW_LEFT)
+                            .size(18.0)
+                            .color(color::TEXT),
+                    )
+                    .fill(color::SCRIM)
+                    .rounding(20.0),
+                );
+                if back_resp.clicked() {
+                    action = PlayerAction::Back;
                 }
             });
 
