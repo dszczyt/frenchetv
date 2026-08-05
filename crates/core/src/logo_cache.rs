@@ -44,7 +44,7 @@ async fn download(client: &reqwest::Client, url: &str) -> Result<Bytes, LogoCach
 
 fn write_cache_file(dir: &Path, path: &Path, bytes: &Bytes) -> Result<(), LogoCacheError> {
     std::fs::create_dir_all(dir)?;
-    let tmp_path = path.with_extension("tmp");
+    let tmp_path = path.with_extension(format!("tmp.{}", std::process::id()));
     std::fs::write(&tmp_path, bytes)?;
     std::fs::rename(&tmp_path, path)?;
     Ok(())
@@ -83,15 +83,24 @@ async fn fetch_logo_in(
 
 /// Fetches logo bytes for `url`, using a TTL-based disk cache under the OS
 /// cache directory. Falls back to a stale cached copy if the network fetch
-/// fails and no fresh copy is available; errors only when there is no
-/// cached copy at all.
+/// fails and no fresh copy is available; errors only when the network fetch
+/// fails and no cached copy exists.
+///
+/// If no cache directory can be resolved for the current platform (e.g. on
+/// Android, where `dirs::cache_dir()` returns `None`), this falls back to a
+/// direct network fetch with no caching at all, rather than failing outright.
 pub async fn fetch_logo(
     client: &reqwest::Client,
     url: &str,
     ttl_hours: u32,
 ) -> Result<Bytes, LogoCacheError> {
-    let dir = logo_cache_dir()?;
-    fetch_logo_in(&dir, client, url, ttl_hours).await
+    match logo_cache_dir() {
+        Ok(dir) => fetch_logo_in(&dir, client, url, ttl_hours).await,
+        Err(_) => {
+            tracing::debug!("no logo cache dir available; fetching without cache");
+            download(client, url).await
+        }
+    }
 }
 
 #[cfg(test)]
