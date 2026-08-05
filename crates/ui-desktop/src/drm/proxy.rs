@@ -912,6 +912,18 @@ struct NumberMapping {
     /// sent anywhere; the `$Time$` this produces for the numbers ffmpeg
     /// really requests always comes out positive (checked in `resolve_url`).
     epoch_t: Option<i128>,
+    /// Wall-clock instant `epoch_t` was last (re-)established, paired with
+    /// `anchor_live_t` — used to extrapolate what the live edge should be
+    /// *right now* for throttling (see `resolve_url`), without depending on
+    /// `latest_live_t` staying fresh. It deliberately doesn't: live-tested,
+    /// throttling a request blocks that HTTP response, which can itself
+    /// delay the client's next manifest poll (the only thing that updates
+    /// `latest_live_t`) — using the polled value there created a feedback
+    /// loop where the delay kept growing every request (1.7s, 3.6s, 5.5s,
+    /// 7.4s, ... — each one made the next one's input staler).
+    anchor_wall_clock: Option<std::time::Instant>,
+    /// `latest_live_t` at the moment `anchor_wall_clock` was recorded.
+    anchor_live_t: Option<u64>,
 }
 
 impl NumberMapping {
@@ -965,12 +977,25 @@ impl NumberMapping {
                 );
             }
             self.epoch_t = Some(new_epoch_t);
+            self.anchor_wall_clock = Some(std::time::Instant::now());
+            self.anchor_live_t = Some(self.latest_live_t);
         }
         let t: u64 = Self::time_for_number(self.epoch_t.unwrap(), self.duration, number)
             .try_into()
             .ok()?;
 
-        let ahead_seconds = t.saturating_sub(self.latest_live_t) as f64 / self.timescale as f64;
+        // What the live edge should be *right now*, extrapolated from wall
+        // clock since the anchor — not `self.latest_live_t` directly (see
+        // the field doc for why that would create a feedback loop).
+        let now_live_t = match (self.anchor_wall_clock, self.anchor_live_t) {
+            (Some(instant), Some(anchor_live_t)) => {
+                let elapsed_ticks =
+                    (instant.elapsed().as_secs_f64() * self.timescale as f64) as u64;
+                anchor_live_t.saturating_add(elapsed_ticks)
+            }
+            _ => self.latest_live_t,
+        };
+        let ahead_seconds = t.saturating_sub(now_live_t) as f64 / self.timescale as f64;
         let delay_seconds =
             (ahead_seconds - MAX_PREFETCH_AHEAD_SECONDS).clamp(0.0, MAX_THROTTLE_DELAY_SECONDS);
         if delay_seconds > 0.0 {
@@ -1200,6 +1225,8 @@ fn build_number_template(
                         media_pattern: media_pattern.clone(),
                         latest_live_t: t,
                         epoch_t: None,
+                        anchor_wall_clock: None,
+                        anchor_live_t: None,
                     },
                 );
             }
@@ -1917,6 +1944,8 @@ mod tests {
             media_pattern: "https://x/$RepresentationID$-$Time$".to_string(),
             latest_live_t: live_t,
             epoch_t: None,
+            anchor_wall_clock: None,
+            anchor_live_t: None,
         };
         // First call anchors: number=3 is treated as "now" (latest_live_t).
         assert_eq!(
@@ -1949,6 +1978,8 @@ mod tests {
             media_pattern: "https://x/$RepresentationID$-$Time$".to_string(),
             latest_live_t: live_t,
             epoch_t: None,
+            anchor_wall_clock: None,
+            anchor_live_t: None,
         };
         // Anchor at number=1 -> 0s ahead, no delay.
         let (_, delay1) = m.resolve_url("r", 1).unwrap();
@@ -1974,5 +2005,61 @@ mod tests {
         // uncapped delay would be ~28.6s, so this must hit the hard cap.
         let (_, delay19) = m.resolve_url("r", 19).unwrap();
         assert_eq!(delay19.as_secs_f64(), MAX_THROTTLE_DELAY_SECONDS);
+    }
+
+    // Regression test for the feedback-loop bug in the first version of the
+    // throttle fix: it computed "ahead" against `latest_live_t`, which only
+    // updates when the client polls /manifest.mpd — but throttling a
+    // segment response can itself delay that poll, so `latest_live_t` falls
+    // further behind real time on every throttled request, making the next
+    // delay longer than the last (1.7s, 3.6s, 5.5s, 7.4s, ... observed
+    // live). This locks in the fix: the throttle must use a wall-clock
+    // extrapolation from the anchor, not the polled value, so a stale
+    // `latest_live_t` (simulated here via a backdated anchor instant, with
+    // `latest_live_t` deliberately left untouched) doesn't inflate the delay.
+    #[test]
+    fn test_number_mapping_throttle_does_not_grow_from_stale_latest_live_t() {
+        let live_t = 85_000_000_000_000u64;
+        let mut m = NumberMapping {
+            duration: 92160,
+            timescale: 48000,
+            media_pattern: "https://x/$RepresentationID$-$Time$".to_string(),
+            latest_live_t: live_t,
+            epoch_t: None,
+            anchor_wall_clock: None,
+            anchor_live_t: None,
+        };
+        // Anchor at number=1: by construction this resolves to exactly
+        // live_t (0s ahead) — anchoring always makes the anchoring request
+        // itself land on the live edge, whatever number it names.
+        let (_, anchor_delay) = m.resolve_url("r", 1).unwrap();
+        assert!(anchor_delay.is_zero());
+
+        // number=10, 9 segments past the anchor (~17.3s ahead) -> throttled.
+        let ahead_for_10 = 9.0 * 92160.0 / 48000.0;
+        let (_, first_delay) = m.resolve_url("r", 10).unwrap();
+        let expected_first_delay =
+            (ahead_for_10 - MAX_PREFETCH_AHEAD_SECONDS).clamp(0.0, MAX_THROTTLE_DELAY_SECONDS);
+        assert!(
+            (first_delay.as_secs_f64() - expected_first_delay).abs() < 0.01,
+            "expected ~{expected_first_delay:.2}s, got {:.2}s",
+            first_delay.as_secs_f64()
+        );
+
+        // Simulate that ~17.3s of real elapsed time actually passed (as if
+        // request #10's delay was really slept out) by backdating the anchor
+        // instant — WITHOUT updating latest_live_t, exactly like a client
+        // whose manifest poll got delayed behind the throttled response.
+        // number=11 (one more segment, ~1.9s past number=10) should now be
+        // current, not ahead — the extrapolated estimate must reflect that
+        // even though latest_live_t is still the original stale value.
+        m.anchor_wall_clock =
+            Some(std::time::Instant::now() - std::time::Duration::from_secs_f64(ahead_for_10));
+        let (_, second_delay) = m.resolve_url("r", 11).unwrap();
+        assert!(
+            second_delay.is_zero(),
+            "must not throttle based on a stale latest_live_t: got {:.2}s",
+            second_delay.as_secs_f64()
+        );
     }
 }
