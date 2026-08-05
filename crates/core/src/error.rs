@@ -45,3 +45,13 @@ pub enum ConfigError {
     #[error("toml serialize error: {0}")]
     Serialize(#[from] toml::ser::Error),
 }
+
+#[derive(Debug, Error)]
+pub enum LogoCacheError {
+    #[error("cache directory not found")]
+    NoDirFound,
+    #[error("io error: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("network error: {0}")]
+    Network(#[from] reqwest::Error),
+}
