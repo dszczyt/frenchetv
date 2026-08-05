@@ -180,9 +180,10 @@ impl App {
                     let sem = Arc::clone(&sem);
                     set.spawn(async move {
                         let _permit = sem.acquire().await.ok()?;
-                        let bytes = frenchetv_core::logo_cache::fetch_logo(&client, &url, logo_ttl_hours)
-                            .await
-                            .ok()?;
+                        let bytes =
+                            frenchetv_core::logo_cache::fetch_logo(&client, &url, logo_ttl_hours)
+                                .await
+                                .ok()?;
                         let img = image::load_from_memory(&bytes).ok()?;
                         let rgba = img.to_rgba8();
                         let (w, h) = rgba.dimensions();
