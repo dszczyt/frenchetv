@@ -94,6 +94,23 @@ pub fn accent_button(ui: &mut Ui, label: &str, enabled: bool, min_size: Vec2) ->
     .inner
 }
 
+/// Thin accent outline drawn around `add_contents` when `focused` — the
+/// same visual language `hover_card`'s `selected` state uses, layered on
+/// top of widgets (labels, buttons, text fields) that don't go through
+/// `hover_card` and need a keyboard-focus indicator of their own.
+pub fn focus_ring<R>(ui: &mut Ui, focused: bool, add_contents: impl FnOnce(&mut Ui) -> R) -> R {
+    let ring_color = if focused {
+        color::ACCENT
+    } else {
+        Color32::TRANSPARENT
+    };
+    egui::Frame::none()
+        .stroke(Stroke::new(2.0_f32, ring_color))
+        .rounding(radius::SM)
+        .show(ui, add_contents)
+        .inner
+}
+
 /// A muted section label used above form fields.
 pub fn field_label(ui: &mut Ui, text_str: &str) {
     ui.label(
