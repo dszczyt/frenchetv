@@ -66,7 +66,9 @@ async fn fetch_logo_in(
 
     match download(client, url).await {
         Ok(bytes) => {
-            let _ = write_cache_file(dir, &path, &bytes);
+            if let Err(e) = write_cache_file(dir, &path, &bytes) {
+                tracing::warn!(error = %e, "failed to write logo cache");
+            }
             Ok(bytes)
         }
         Err(e) => {
