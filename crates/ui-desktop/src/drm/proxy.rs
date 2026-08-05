@@ -344,15 +344,23 @@ async fn dispatch(
         return ("200 OK", "application/dash+xml", Arc::new(mpd.into_bytes()));
     }
 
-    // `/cdnnum/<repid>/<number>` — the $Number$-based audio addressing
-    // (see `derive_and_rewrite_number_mappings`) translates back to a
-    // real `/cdn/...`-shaped path here, then joins the exact same
-    // cache/fetch/decrypt path below as any other segment request.
-    let cdnnum_path = path
+    // `/cdnnum/<repid>/<number>` — the $Number$-based addressing (see
+    // `derive_and_rewrite_number_mappings`) translates back to a real
+    // `/cdn/...`-shaped path here, then joins the exact same cache/fetch/
+    // decrypt path below as any other segment request. `delay` throttles
+    // requests that run ahead of the live edge — see
+    // `NumberMapping::resolve_url`.
+    let cdnnum_result = path
         .strip_prefix("/cdnnum/")
         .and_then(|rest| number_route_to_cdn_path(rest, &state.number_mappings));
-    let cdn_path = cdnnum_path
-        .as_deref()
+    if let Some((_, delay)) = &cdnnum_result {
+        if !delay.is_zero() {
+            tokio::time::sleep(*delay).await;
+        }
+    }
+    let cdn_path = cdnnum_result
+        .as_ref()
+        .map(|(p, _)| p.as_str())
         .or_else(|| path.strip_prefix("/cdn/"));
 
     if let Some(cdn_path) = cdn_path {
@@ -841,6 +849,26 @@ fn rewrite_mpd(
 
 type NumberMappings = Mutex<HashMap<String, NumberMapping>>;
 
+/// How far ahead of the latest known live edge a `/cdnnum/` request may
+/// resolve without being throttled — normal DASH client prefetch/buffering.
+/// Beyond this, `resolve_url` reports a delay for `dispatch` to sleep before
+/// fetching. Needed because removing `<SegmentTimeline>` (the whole point of
+/// this rewrite) also removes the one thing that told ffmpeg's dash demuxer
+/// which segment numbers actually exist yet — live-tested, it doesn't
+/// self-limit: an initial buffering burst requested 19 segments (36s of
+/// content) in the first 4 real seconds, ran past the CDN's 30s
+/// `timeShiftBufferDepth`, and then kept hammering forward at ~8.5 req/s
+/// into a permanent 404 wall instead of backing off. Sleeping out the exact
+/// gap before fetching makes the proxy provide the pacing the removed
+/// SegmentTimeline used to.
+const MAX_PREFETCH_AHEAD_SECONDS: f64 = 6.0;
+
+/// Hard cap on any single throttling sleep — if a request is ahead by more
+/// than this, something else is wrong (stalled manifest polling, a client
+/// bug) and hanging the connection indefinitely would be worse than just
+/// attempting the fetch and letting the existing error path handle it.
+const MAX_THROTTLE_DELAY_SECONDS: f64 = 20.0;
+
 /// How far (in real seconds) a `/cdnnum/` request's implied `$Time$` may
 /// drift from the latest known live edge before the current anchor is
 /// treated as wrong and re-derived. Wide on purpose — see `resolve_url`.
@@ -902,7 +930,10 @@ impl NumberMapping {
     /// discontinuity, the original symptom this rewrite exists to avoid.
     /// Returns `None` only if the resolved `$Time$` doesn't fit in a `u64`
     /// (shouldn't happen for any number ffmpeg actually anchors against).
-    fn resolve_url(&mut self, repid: &str, number: u64) -> Option<String> {
+    /// The `Duration` is how long `dispatch` should sleep before fetching —
+    /// zero unless this request runs ahead of the live edge by more than
+    /// `MAX_PREFETCH_AHEAD_SECONDS` (see that constant's doc for why).
+    fn resolve_url(&mut self, repid: &str, number: u64) -> Option<(String, std::time::Duration)> {
         let tolerance_ticks = (REANCHOR_TOLERANCE_SECONDS * self.timescale) as i128;
         let live = self.latest_live_t as i128;
         let needs_anchor = match self.epoch_t {
@@ -938,11 +969,25 @@ impl NumberMapping {
         let t: u64 = Self::time_for_number(self.epoch_t.unwrap(), self.duration, number)
             .try_into()
             .ok()?;
-        Some(
-            self.media_pattern
-                .replace("$RepresentationID$", repid)
-                .replace("$Time$", &t.to_string()),
-        )
+
+        let ahead_seconds = t.saturating_sub(self.latest_live_t) as f64 / self.timescale as f64;
+        let delay_seconds =
+            (ahead_seconds - MAX_PREFETCH_AHEAD_SECONDS).clamp(0.0, MAX_THROTTLE_DELAY_SECONDS);
+        if delay_seconds > 0.0 {
+            tracing::info!(
+                "DRM proxy: throttling {} number={} — {:.1}s ahead of live edge, sleeping {:.1}s",
+                repid,
+                number,
+                ahead_seconds,
+                delay_seconds
+            );
+        }
+
+        let url = self
+            .media_pattern
+            .replace("$RepresentationID$", repid)
+            .replace("$Time$", &t.to_string());
+        Some((url, std::time::Duration::from_secs_f64(delay_seconds)))
     }
 }
 
@@ -1177,14 +1222,19 @@ fn build_number_template(
 /// `"<scheme>/<host>/<path>?<query>"` shape `fetch_and_decrypt` expects —
 /// same as what's already behind `/cdn/`, so the rest of the pipeline
 /// (host allowlisting, decrypt, caching) is unchanged. `None` if the path
-/// doesn't parse or `repid` has no established mapping.
-fn number_route_to_cdn_path(rest: &str, mappings: &NumberMappings) -> Option<String> {
+/// doesn't parse or `repid` has no established mapping. The `Duration` is
+/// how long the caller should sleep before fetching — see
+/// `NumberMapping::resolve_url`.
+fn number_route_to_cdn_path(
+    rest: &str,
+    mappings: &NumberMappings,
+) -> Option<(String, std::time::Duration)> {
     let (repid, number_str) = rest.split_once('/')?;
     let number: u64 = number_str.parse().ok()?;
     let mut guard = mappings.lock().unwrap();
     let mapping = guard.get_mut(repid)?;
-    let real_url = mapping.resolve_url(repid, number)?;
-    Some(real_url.replacen("://", "/", 1))
+    let (real_url, delay) = mapping.resolve_url(repid, number)?;
+    Some((real_url.replacen("://", "/", 1), delay))
 }
 
 /// Every `"scheme://host"` (lowercase) that `https://` or `http://` precedes in
@@ -1710,7 +1760,7 @@ mod tests {
         // ffmpeg's first request can be any number (it doesn't read our
         // advertised startNumber — see NumberMapping doc). Whatever it asks
         // for first is anchored to the current live edge (latest_live_t).
-        let cdn_path = number_route_to_cdn_path("audio_fra=104000/3", &mappings)
+        let (cdn_path, delay) = number_route_to_cdn_path("audio_fra=104000/3", &mappings)
             .expect("mapping exists for this repid");
         assert_eq!(
             cdn_path,
@@ -1720,9 +1770,10 @@ mod tests {
             ),
             "first-ever request is treated as the live edge, whatever number it names"
         );
+        assert!(delay.is_zero(), "anchoring request must not be throttled");
 
         // The next sequential number continues from that anchor.
-        let cdn_path2 = number_route_to_cdn_path("audio_fra=104000/4", &mappings)
+        let (cdn_path2, delay2) = number_route_to_cdn_path("audio_fra=104000/4", &mappings)
             .expect("mapping exists for this repid");
         assert_eq!(
             cdn_path2,
@@ -1730,6 +1781,10 @@ mod tests {
                 "https/cdn.example.fr/live/ch1/dash/ch1-audio_fra=104000-{}.dash?tok=abc",
                 epoch_t + 92160
             )
+        );
+        assert!(
+            delay2.is_zero(),
+            "one segment ahead is within the prefetch margin"
         );
     }
 
@@ -1761,7 +1816,7 @@ mod tests {
 
         // Same number as before (1) now implies a `t` far from the new live
         // edge -> must re-anchor rather than keep serving the stale value.
-        let cdn_path = number_route_to_cdn_path("audio_fra=104000/1", &mappings).unwrap();
+        let (cdn_path, _delay) = number_route_to_cdn_path("audio_fra=104000/1", &mappings).unwrap();
         assert_eq!(
             cdn_path,
             format!(
@@ -1816,7 +1871,7 @@ mod tests {
         // Mirrors the real ffmpeg request: number * duration is ~4.4e9
         // ticks (~25.6h) past `live_t`.
         let huge_number = 930_194_760u64;
-        let cdn_path =
+        let (cdn_path, _delay) =
             number_route_to_cdn_path(&format!("audio_fra=104000/{huge_number}"), &mappings)
                 .expect("must anchor and resolve, not silently clamp to $Time$=0");
         assert_eq!(
@@ -1829,7 +1884,7 @@ mod tests {
 
         // The next sequential number must NOT trigger a spurious re-anchor —
         // this is exactly what looped forever in the live bug.
-        let cdn_path2 =
+        let (cdn_path2, _delay2) =
             number_route_to_cdn_path(&format!("audio_fra=104000/{}", huge_number + 1), &mappings)
                 .unwrap();
         assert_eq!(
@@ -1865,14 +1920,59 @@ mod tests {
         };
         // First call anchors: number=3 is treated as "now" (latest_live_t).
         assert_eq!(
-            m.resolve_url("audio_fra=104000", 3).unwrap(),
+            m.resolve_url("audio_fra=104000", 3).unwrap().0,
             format!("https://x/audio_fra=104000-{live_t}")
         );
         assert_eq!(m.epoch_t, Some(live_t as i128 - 2 * 92160));
         // Subsequent calls reuse the anchor.
         assert_eq!(
-            m.resolve_url("audio_fra=104000", 4).unwrap(),
+            m.resolve_url("audio_fra=104000", 4).unwrap().0,
             format!("https://x/audio_fra=104000-{}", live_t + 92160)
         );
+    }
+
+    // Regression test for a live-reproduced bug: with $Number$+duration
+    // addressing (no <SegmentTimeline>), ffmpeg's dash demuxer doesn't
+    // self-limit its buffering against the live edge. Live-tested: an
+    // initial burst requested 19 segments (36s of content) in the first 4
+    // real seconds, ran past the CDN's 30s timeShiftBufferDepth, then
+    // hammered forward at ~8.5 req/s into a permanent 404 wall. This locks
+    // in the fix: resolve_url must report an increasing delay for requests
+    // that run ahead of the live edge, so dispatch sleeps them back onto a
+    // real-time pace instead of forwarding them straight into a 404.
+    #[test]
+    fn test_number_mapping_throttles_requests_ahead_of_live_edge() {
+        let live_t = 85_000_000_000_000u64;
+        let mut m = NumberMapping {
+            duration: 92160, // 1.92s at timescale 48000
+            timescale: 48000,
+            media_pattern: "https://x/$RepresentationID$-$Time$".to_string(),
+            latest_live_t: live_t,
+            epoch_t: None,
+        };
+        // Anchor at number=1 -> 0s ahead, no delay.
+        let (_, delay1) = m.resolve_url("r", 1).unwrap();
+        assert!(delay1.is_zero());
+
+        // Within MAX_PREFETCH_AHEAD_SECONDS (6s ~= 3 segments) -> no delay.
+        let (_, delay3) = m.resolve_url("r", 3).unwrap();
+        assert!(
+            delay3.is_zero(),
+            "2 segments (3.84s) ahead should not throttle"
+        );
+
+        // 6 segments ahead (9.6s) -> throttled by (ahead - margin), not capped.
+        let (_, delay6) = m.resolve_url("r", 6).unwrap();
+        let expected6 = 5.0 * 92160.0 / 48000.0 - MAX_PREFETCH_AHEAD_SECONDS; // 3.6s
+        assert!(
+            (delay6.as_secs_f64() - expected6).abs() < 0.01,
+            "expected ~{expected6:.2}s, got {:.2}s",
+            delay6.as_secs_f64()
+        );
+
+        // 19 segments ahead (36.48s), mirroring the live burst -> the
+        // uncapped delay would be ~28.6s, so this must hit the hard cap.
+        let (_, delay19) = m.resolve_url("r", 19).unwrap();
+        assert_eq!(delay19.as_secs_f64(), MAX_THROTTLE_DELAY_SECONDS);
     }
 }
