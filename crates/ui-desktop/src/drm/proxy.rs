@@ -869,6 +869,17 @@ const MAX_PREFETCH_AHEAD_SECONDS: f64 = 6.0;
 /// attempting the fetch and letting the existing error path handle it.
 const MAX_THROTTLE_DELAY_SECONDS: f64 = 20.0;
 
+/// Extra padding added to every throttled sleep, past the computed live-edge
+/// estimate. The wall-clock extrapolation in `resolve_url` is exact math
+/// against an idealized 1:1 real-time publish schedule, but real encoders
+/// and CDN edges publish with some jitter around that schedule — live-
+/// tested, isolated single-segment 404s (audio and video, independently,
+/// roughly every few minutes) still occurred without this, immediately past
+/// where a throttled sleep woke up and fetched. Each one exposed to mpv as
+/// an actual 404 costs a multi-second stall while mpv does its own (much
+/// heavier) recovery — cheaper to just not ask quite that precisely.
+const PUBLISH_JITTER_MARGIN_SECONDS: f64 = 0.5;
+
 /// How far (in real seconds) a `/cdnnum/` request's implied `$Time$` may
 /// drift from the latest known live edge before the current anchor is
 /// treated as wrong and re-derived. Wide on purpose — see `resolve_url`.
@@ -996,8 +1007,9 @@ impl NumberMapping {
             _ => self.latest_live_t,
         };
         let ahead_seconds = t.saturating_sub(now_live_t) as f64 / self.timescale as f64;
-        let delay_seconds =
-            (ahead_seconds - MAX_PREFETCH_AHEAD_SECONDS).clamp(0.0, MAX_THROTTLE_DELAY_SECONDS);
+        let delay_seconds = (ahead_seconds - MAX_PREFETCH_AHEAD_SECONDS
+            + PUBLISH_JITTER_MARGIN_SECONDS)
+            .clamp(0.0, MAX_THROTTLE_DELAY_SECONDS);
         if delay_seconds > 0.0 {
             tracing::info!(
                 "DRM proxy: throttling {} number={} — {:.1}s ahead of live edge, sleeping {:.1}s",
@@ -1994,7 +2006,8 @@ mod tests {
 
         // 6 segments ahead (9.6s) -> throttled by (ahead - margin), not capped.
         let (_, delay6) = m.resolve_url("r", 6).unwrap();
-        let expected6 = 5.0 * 92160.0 / 48000.0 - MAX_PREFETCH_AHEAD_SECONDS; // 3.6s
+        let expected6 =
+            5.0 * 92160.0 / 48000.0 - MAX_PREFETCH_AHEAD_SECONDS + PUBLISH_JITTER_MARGIN_SECONDS; // 4.1s
         assert!(
             (delay6.as_secs_f64() - expected6).abs() < 0.01,
             "expected ~{expected6:.2}s, got {:.2}s",
@@ -2038,8 +2051,9 @@ mod tests {
         // number=10, 9 segments past the anchor (~17.3s ahead) -> throttled.
         let ahead_for_10 = 9.0 * 92160.0 / 48000.0;
         let (_, first_delay) = m.resolve_url("r", 10).unwrap();
-        let expected_first_delay =
-            (ahead_for_10 - MAX_PREFETCH_AHEAD_SECONDS).clamp(0.0, MAX_THROTTLE_DELAY_SECONDS);
+        let expected_first_delay = (ahead_for_10 - MAX_PREFETCH_AHEAD_SECONDS
+            + PUBLISH_JITTER_MARGIN_SECONDS)
+            .clamp(0.0, MAX_THROTTLE_DELAY_SECONDS);
         assert!(
             (first_delay.as_secs_f64() - expected_first_delay).abs() < 0.01,
             "expected ~{expected_first_delay:.2}s, got {:.2}s",
