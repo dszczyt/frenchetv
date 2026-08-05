@@ -76,6 +76,8 @@ pub struct App {
     current_session: Option<(String, String)>,
     /// Decoded channel logos, populated asynchronously after channel list loads.
     logos: LogoCache,
+    /// TTL (hours) for the on-disk logo cache — from `Config.cache.logo_ttl_hours`.
+    logo_ttl_hours: u32,
     tx: mpsc::SyncSender<AsyncMsg>,
     rx: mpsc::Receiver<AsyncMsg>,
     rt: tokio::runtime::Runtime,
@@ -92,6 +94,7 @@ impl App {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let logos: LogoCache = Arc::new(Mutex::new(HashMap::new()));
         let config = Config::load().unwrap_or_default();
+        let logo_ttl_hours = config.cache.logo_ttl_hours;
 
         egui_extras::install_image_loaders(&cc.egui_ctx);
         crate::theme::install(&cc.egui_ctx);
@@ -125,6 +128,7 @@ impl App {
             current_operator: None,
             current_session: None,
             logos,
+            logo_ttl_hours,
             tx,
             rx,
             rt,
@@ -157,6 +161,7 @@ impl App {
     fn start_fetch_logos(&self, channels: Vec<Channel>) {
         let logos = Arc::clone(&self.logos);
         let ctx = self.egui_ctx.clone();
+        let logo_ttl_hours = self.logo_ttl_hours;
         self.rt.spawn(async move {
             let client = reqwest::Client::builder()
                 .timeout(std::time::Duration::from_secs(10))
@@ -176,7 +181,10 @@ impl App {
                     let sem = Arc::clone(&sem);
                     set.spawn(async move {
                         let _permit = sem.acquire().await.ok()?;
-                        let bytes = client.get(&url).send().await.ok()?.bytes().await.ok()?;
+                        let bytes =
+                            frenchetv_core::logo_cache::fetch_logo(&client, &url, logo_ttl_hours)
+                                .await
+                                .ok()?;
                         let img = image::load_from_memory(&bytes).ok()?;
                         let rgba = img.to_rgba8();
                         let (w, h) = rgba.dimensions();
