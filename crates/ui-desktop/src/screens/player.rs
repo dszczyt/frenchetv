@@ -232,25 +232,26 @@ impl PlayerScreen {
                     });
                 }
 
-                // Visible escape route, always reachable — not just while the
-                // info overlay happens to be up. Keyboard Esc/Backspace already
-                // work, but a critical action like leaving playback shouldn't be
-                // keyboard-only-discoverable, and this is exactly what's needed
-                // when a stream hangs on `PlayerState::Loading`.
-                let back_rect =
-                    egui::Rect::from_min_size(rect.min + Vec2::splat(space::MD), Vec2::splat(40.0));
-                let back_resp = ui.put(
-                    back_rect,
-                    egui::Button::new(
-                        RichText::new(icon::ARROW_LEFT)
-                            .size(18.0)
-                            .color(color::TEXT),
-                    )
-                    .fill(color::SCRIM)
-                    .rounding(20.0),
-                );
-                if back_resp.clicked() {
-                    action = PlayerAction::Back;
+                // Escape route, shown/hidden in lockstep with the info overlay
+                // below. Keyboard Esc/Backspace still work when it's hidden.
+                if overlay_t > 0.004 {
+                    let back_rect = egui::Rect::from_min_size(
+                        rect.min + Vec2::splat(space::MD),
+                        Vec2::splat(40.0),
+                    );
+                    let back_resp = ui.put(
+                        back_rect,
+                        egui::Button::new(
+                            RichText::new(icon::ARROW_LEFT)
+                                .size(18.0)
+                                .color(fade(color::TEXT, overlay_t)),
+                        )
+                        .fill(fade(color::SCRIM, overlay_t))
+                        .rounding(20.0),
+                    );
+                    if back_resp.clicked() {
+                        action = PlayerAction::Back;
+                    }
                 }
             });
 
