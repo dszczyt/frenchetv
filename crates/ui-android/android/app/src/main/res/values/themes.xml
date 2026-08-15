@@ -1,7 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <!-- Base theme: Leanback (Android TV) -->
-    <style name="Theme.Frenchetv" parent="@style/Theme.Leanback">
+    <!-- Base theme: GameActivity (MainActivity) extends AppCompatActivity and
+         requires a Theme.AppCompat descendant, or setContentView throws
+         IllegalStateException at runtime. Theme.Leanback is not AppCompat-based. -->
+    <style name="Theme.Frenchetv" parent="Theme.AppCompat.NoActionBar">
         <item name="android:windowBackground">@android:color/black</item>
     </style>
 
