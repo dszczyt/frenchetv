@@ -123,6 +123,9 @@ impl SetupScreen {
         egui::CentralPanel::default()
             .frame(egui::Frame::none().fill(Color32::from_rgb(13, 15, 20)))
             .show(ctx, |ui| {
+                egui::ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
                 ui.vertical_centered(|ui| {
                     ui.add_space(60.0);
 
@@ -210,12 +213,18 @@ impl SetupScreen {
                             .rounding(8.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {
-                                ui.add(
+                                let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.username)
                                         .hint_text("email@example.com")
                                         .desired_width(width)
                                         .font(FontId::proportional(24.0)),
                                 );
+                                if username_focused {
+                                    if !resp.has_focus() {
+                                        resp.request_focus();
+                                    }
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
                             });
 
                         ui.add_space(16.0);
@@ -238,13 +247,19 @@ impl SetupScreen {
                             .rounding(8.0)
                             .inner_margin(8.0)
                             .show(ui, |ui| {
-                                ui.add(
+                                let resp = ui.add(
                                     egui::TextEdit::singleline(&mut self.password)
                                         .password(true)
                                         .hint_text("••••••••")
                                         .desired_width(width)
                                         .font(FontId::proportional(24.0)),
                                 );
+                                if password_focused {
+                                    if !resp.has_focus() {
+                                        resp.request_focus();
+                                    }
+                                    resp.scroll_to_me(Some(egui::Align::Center));
+                                }
                             });
 
                         ui.add_space(32.0);
@@ -290,7 +305,10 @@ impl SetupScreen {
                         .rounding(12.0)
                         .min_size(Vec2::new(280.0, 64.0));
 
-                        ui.add_enabled(!self.loading, btn);
+                        let btn_resp = ui.add_enabled(!self.loading, btn);
+                        if submit_focused {
+                            btn_resp.scroll_to_me(Some(egui::Align::Center));
+                        }
 
                         ui.add_space(32.0);
                         ui.label(
@@ -300,6 +318,7 @@ impl SetupScreen {
                         );
                     }
                 });
+                    });
             });
 
         action
