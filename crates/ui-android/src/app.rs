@@ -1,5 +1,5 @@
 use crate::screens::player::PlayerAction;
-use crate::screens::setup::SetupAction;
+use crate::screens::setup::{AuthMethod, SetupAction};
 use crate::screens::{PlayerScreen, SetupScreen};
 use android_activity::AndroidApp;
 use frenchetv_core::session as session_store;
@@ -274,6 +274,13 @@ impl App {
             match op.fetch_channels().await {
                 Ok(channels) => {
                     let session_token = op.session_token().map(str::to_string);
+                    // App auth never asks for a login, so the operator's own
+                    // account name is the only thing a saved session can be
+                    // keyed on. Prefer it whenever the user typed nothing.
+                    let username = match op.account_name() {
+                        Some(detected) if username.is_empty() => detected.to_string(),
+                        _ => username,
+                    };
                     let shared = Arc::new(TokioMutex::new(op));
                     let _ = tx.send(AsyncMsg::ChannelsOk {
                         channels,
@@ -294,7 +301,13 @@ impl App {
         });
     }
 
-    fn start_auth(&self, kind: OperatorKind, username: String, password: String) {
+    fn start_auth(
+        &self,
+        kind: OperatorKind,
+        username: String,
+        password: String,
+        method: AuthMethod,
+    ) {
         let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         let kind_str = kind.config_str().to_string();
@@ -307,6 +320,20 @@ impl App {
             // don't share an app-layer crate.
             let mut phase = if op.uses_phased_auth() {
                 match op.begin_auth(&username).await {
+                    // The user asked for app approval but this account is not
+                    // routed to it. Orange decides that server-side — there is
+                    // no parameter to request app auth — so say so plainly
+                    // rather than silently asking for a password that was
+                    // never typed.
+                    Ok(AuthPhase::Password) if method == AuthMethod::App => {
+                        let _ = tx.send(AsyncMsg::AuthErr(
+                            "Ce compte n'utilise pas l'app Orange et Moi : \
+                             choisissez « Mot de passe »."
+                                .to_string(),
+                        ));
+                        ctx.request_repaint();
+                        return;
+                    }
                     Ok(p) => p,
                     Err(e) => {
                         let _ = tx.send(AsyncMsg::AuthErr(e.to_string()));
@@ -357,6 +384,13 @@ impl App {
             match op.fetch_channels().await {
                 Ok(channels) => {
                     let session_token = op.session_token().map(str::to_string);
+                    // App auth never asks for a login, so the operator's own
+                    // account name is the only thing a saved session can be
+                    // keyed on. Prefer it whenever the user typed nothing.
+                    let username = match op.account_name() {
+                        Some(detected) if username.is_empty() => detected.to_string(),
+                        _ => username,
+                    };
                     let shared = Arc::new(TokioMutex::new(op));
                     let _ = tx.send(AsyncMsg::ChannelsOk {
                         channels,
@@ -522,6 +556,7 @@ impl eframe::App for App {
                     operator,
                     username,
                     password,
+                    method,
                 } = setup.show(ctx)
                 {
                     self.pending_credentials = if remember {
@@ -530,7 +565,7 @@ impl eframe::App for App {
                         crate::credentials::clear(&self.android_app);
                         None
                     };
-                    self.start_auth(operator, username, password);
+                    self.start_auth(operator, username, password, method);
                 }
             }
             Screen::PushWait(pw) => {

@@ -8,10 +8,22 @@ use frenchetv_core::{OperatorKind, OperatorRegistry};
 #[derive(Debug, Clone, PartialEq)]
 enum FieldFocus {
     OperatorCards,
+    Method,
     Username,
     Password,
     Remember,
     SubmitButton,
+}
+
+/// How to authenticate. Orange routes app-capable accounts to "Orange et Moi"
+/// itself — `/api/access` takes no parameter to request it — so this does not
+/// force a method. It decides whether the screen demands a password up front:
+/// in app mode there is nothing to type, and requiring one made that flow
+/// impossible to even submit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthMethod {
+    Password,
+    App,
 }
 
 #[derive(Clone, Copy)]
@@ -101,6 +113,7 @@ pub struct SetupScreen {
     /// Hidden entirely when the device cannot store credentials (API < 23).
     remember_available: bool,
     remember: bool,
+    method: AuthMethod,
 }
 
 #[derive(Debug)]
@@ -110,6 +123,7 @@ pub enum SetupAction {
         operator: OperatorKind,
         username: String,
         password: String,
+        method: AuthMethod,
     },
 }
 
@@ -125,6 +139,7 @@ impl SetupScreen {
             keyboard: OnScreenKeyboard::new(),
             remember_available: false,
             remember: false,
+            method: AuthMethod::Password,
         }
     }
 
@@ -139,6 +154,17 @@ impl SetupScreen {
             s.remember = true;
         }
         s
+    }
+
+    /// Whether the selected operator offers app-based auth at all.
+    fn method_available(&self) -> bool {
+        OperatorRegistry::all()[self.selected_op_idx].supports_app_auth()
+    }
+
+    /// App auth identifies the line itself, so there is nothing to type and
+    /// nothing to validate.
+    fn needs_password(&self) -> bool {
+        !(self.method_available() && self.method == AuthMethod::App)
     }
 
     /// Whether the user asked for these credentials to be kept.
@@ -186,18 +212,46 @@ impl SetupScreen {
                         self.selected_op_idx -= 1;
                     }
                     if down {
-                        self.field_focus = FieldFocus::Username;
+                        self.field_focus = if self.method_available() {
+                            FieldFocus::Method
+                        } else {
+                            FieldFocus::Username
+                        };
                     }
                     if enter {
                         self.error_message = None;
                     }
                 }
-                FieldFocus::Username => {
+                FieldFocus::Method => {
                     if up {
                         self.field_focus = FieldFocus::OperatorCards;
                     }
                     if down {
-                        self.field_focus = FieldFocus::Password;
+                        self.field_focus = FieldFocus::Username;
+                    }
+                    if left || right || enter {
+                        self.method = match self.method {
+                            AuthMethod::Password => AuthMethod::App,
+                            AuthMethod::App => AuthMethod::Password,
+                        };
+                    }
+                }
+                FieldFocus::Username => {
+                    if up {
+                        self.field_focus = if self.method_available() {
+                            FieldFocus::Method
+                        } else {
+                            FieldFocus::OperatorCards
+                        };
+                    }
+                    if down {
+                        self.field_focus = if self.needs_password() {
+                            FieldFocus::Password
+                        } else if self.remember_available {
+                            FieldFocus::Remember
+                        } else {
+                            FieldFocus::SubmitButton
+                        };
                     }
                     if enter {
                         self.keyboard.open();
@@ -220,7 +274,11 @@ impl SetupScreen {
                 }
                 FieldFocus::Remember => {
                     if up {
-                        self.field_focus = FieldFocus::Password;
+                        self.field_focus = if self.needs_password() {
+                            FieldFocus::Password
+                        } else {
+                            FieldFocus::Username
+                        };
                     }
                     if down {
                         self.field_focus = FieldFocus::SubmitButton;
@@ -233,17 +291,29 @@ impl SetupScreen {
                     if up {
                         self.field_focus = if self.remember_available {
                             FieldFocus::Remember
-                        } else {
+                        } else if self.needs_password() {
                             FieldFocus::Password
+                        } else {
+                            FieldFocus::Username
                         };
                     }
                     if enter && !self.loading {
                         let op = &operators[self.selected_op_idx];
-                        if !self.username.is_empty() && !self.password.is_empty() {
+                        // App auth needs no credentials at all: Orange
+                        // identifies the line and returns the account after
+                        // approval. Demanding a password here made that flow
+                        // impossible to submit.
+                        let ready = if self.needs_password() {
+                            !self.username.is_empty() && !self.password.is_empty()
+                        } else {
+                            true
+                        };
+                        if ready {
                             action = SetupAction::StartAuth {
                                 operator: op.clone(),
                                 username: self.username.clone(),
                                 password: self.password.clone(),
+                                method: self.method,
                             };
                             self.set_loading(true);
                         }
@@ -351,6 +421,63 @@ impl SetupScreen {
                         if current_op.requires_auth() {
                             let width = 400.0_f32.min(ui.available_width() - 80.0);
 
+                            if self.method_available() {
+                                let focused = self.field_focus == FieldFocus::Method;
+                                let label = match self.method {
+                                    AuthMethod::Password => "Mot de passe",
+                                    AuthMethod::App => "App Orange et Moi",
+                                };
+                                ui.label(
+                                    RichText::new("Méthode de connexion")
+                                        .font(FontId::proportional(m.label))
+                                        .color(Color32::from_rgb(180, 180, 180)),
+                                );
+                                ui.add_space(m.gap_sm);
+                                let h = m.field_font + 16.0;
+                                let (rect, _) =
+                                    ui.allocate_exact_size(Vec2::new(width, h), egui::Sense::hover());
+                                ui.painter().rect(
+                                    rect,
+                                    8.0,
+                                    Color32::from_rgb(8, 9, 12),
+                                    egui::Stroke::new(
+                                        2.0_f32,
+                                        if focused {
+                                            Color32::from_rgb(10, 132, 255)
+                                        } else {
+                                            Color32::from_rgb(60, 60, 70)
+                                        },
+                                    ),
+                                );
+                                // Arrows both sides: a two-value cycle, and a TV user needs to
+                                // see that it is changeable at all.
+                                for (align, glyph) in [
+                                    (egui::Align2::LEFT_CENTER, "<"),
+                                    (egui::Align2::RIGHT_CENTER, ">"),
+                                ] {
+                                    let at = if glyph == "<" {
+                                        rect.left_center() + egui::vec2(12.0, 0.0)
+                                    } else {
+                                        rect.right_center() - egui::vec2(12.0, 0.0)
+                                    };
+                                    ui.painter().text(
+                                        at,
+                                        align,
+                                        glyph,
+                                        FontId::proportional(m.field_font),
+                                        Color32::from_rgb(120, 120, 130),
+                                    );
+                                }
+                                ui.painter().text(
+                                    rect.center(),
+                                    egui::Align2::CENTER_CENTER,
+                                    label,
+                                    FontId::proportional(m.field_font),
+                                    Color32::WHITE,
+                                );
+                                ui.add_space(m.gap_md);
+                            }
+
                             let user_focused = self.field_focus == FieldFocus::Username;
                             let pass_focused = self.field_focus == FieldFocus::Password;
                             Self::field(
@@ -362,16 +489,27 @@ impl SetupScreen {
                                 FieldKind::Username,
                                 &self.username,
                             );
-                            ui.add_space(m.gap_md);
-                            Self::field(
-                                ui,
-                                &m,
-                                "Mot de passe",
-                                pass_focused,
-                                width,
-                                FieldKind::Password,
-                                &self.password,
-                            );
+                            if self.needs_password() {
+                                ui.add_space(m.gap_md);
+                                Self::field(
+                                    ui,
+                                    &m,
+                                    "Mot de passe",
+                                    pass_focused,
+                                    width,
+                                    FieldKind::Password,
+                                    &self.password,
+                                );
+                            } else {
+                                ui.add_space(m.gap_sm);
+                                ui.label(
+                                    RichText::new(
+                                        "Validez la connexion dans l'app Orange et Moi sur votre téléphone.",
+                                    )
+                                    .font(FontId::proportional(m.hint))
+                                    .color(Color32::from_rgb(140, 140, 150)),
+                                );
+                            }
 
                             ui.add_space(m.gap_md);
 
@@ -592,5 +730,69 @@ impl SetupScreen {
 impl Default for SetupScreen {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Index of Orange in the registry — the only operator offering app auth.
+    fn orange_idx() -> usize {
+        OperatorRegistry::all()
+            .iter()
+            .position(|k| k.supports_app_auth())
+            .expect("an operator with app auth")
+    }
+
+    fn other_idx() -> usize {
+        OperatorRegistry::all()
+            .iter()
+            .position(|k| !k.supports_app_auth())
+            .expect("an operator without app auth")
+    }
+
+    #[test]
+    fn app_auth_needs_no_password_but_password_mode_does() {
+        let mut s = SetupScreen::new();
+        s.selected_op_idx = orange_idx();
+
+        assert!(s.method_available());
+        assert!(s.needs_password(), "password mode still demands one");
+
+        s.method = AuthMethod::App;
+        assert!(
+            !s.needs_password(),
+            "app auth identifies the line; demanding a password made this \
+             flow impossible to submit"
+        );
+    }
+
+    #[test]
+    fn an_operator_without_app_auth_always_needs_a_password() {
+        let mut s = SetupScreen::new();
+        s.selected_op_idx = other_idx();
+        assert!(!s.method_available());
+
+        // Even if the mode somehow got set, an operator with no app flow must
+        // never skip the password.
+        s.method = AuthMethod::App;
+        assert!(s.needs_password());
+    }
+
+    #[test]
+    fn the_method_row_is_skipped_when_the_operator_has_no_app_auth() {
+        let mut s = SetupScreen::new();
+        s.selected_op_idx = other_idx();
+        s.field_focus = FieldFocus::OperatorCards;
+
+        // Down from the cards lands on Username, not on an invisible row.
+        let available = s.method_available();
+        s.field_focus = if available {
+            FieldFocus::Method
+        } else {
+            FieldFocus::Username
+        };
+        assert_eq!(s.field_focus, FieldFocus::Username);
     }
 }

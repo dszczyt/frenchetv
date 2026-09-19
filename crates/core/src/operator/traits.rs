@@ -79,6 +79,17 @@ pub trait Operator: Send + Sync {
     async fn resolve_stream(&self, channel: &Channel) -> Result<StreamUrl>;
     async fn fetch_epg(&self, hours: u8) -> Result<Option<EpgData>>;
 
+    /// The account this session actually belongs to, once known.
+    ///
+    /// App-based auth (Orange's "Orange et Moi") never asks the user for a
+    /// login — the operator identifies the line itself and returns the account
+    /// after approval. Without this there is nothing to key a saved session on
+    /// in that flow, and nothing to show the user about which account they are
+    /// connected as.
+    fn account_name(&self) -> Option<&str> {
+        None
+    }
+
     /// Returns the current session token (e.g. `wassup` cookie) if authenticated.
     /// Used to persist the session across app restarts.
     fn session_token(&self) -> Option<&str> {

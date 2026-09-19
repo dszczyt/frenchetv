@@ -173,6 +173,10 @@ pub struct OrangeOperator {
     authn_tracking_id: Option<String>,
     /// Set to true once we have fired try_trigger_aba so we don't double-send.
     trigger_aba_sent: bool,
+    /// Login of the account chosen from `remoteAccounts`. In the app-auth flow
+    /// the user never types one, so this is the only thing a saved session can
+    /// be keyed on.
+    selected_login: Option<String>,
 }
 
 impl OrangeOperator {
@@ -209,6 +213,7 @@ impl OrangeOperator {
             xsrf_token: None,
             authn_tracking_id: None,
             trigger_aba_sent: false,
+            selected_login: None,
         }
     }
 
@@ -750,9 +755,27 @@ impl Operator for OrangeOperator {
                         continue;
                     }
 
+                    if account_list.len() > 1 {
+                        // The line has several accounts and we take the first.
+                        // Logged rather than silent so a user connected as the
+                        // wrong one has something to go on.
+                        tracing::warn!(
+                            "Orange: {} accounts on this line, selecting the first; \
+                             others: {:?}",
+                            account_list.len(),
+                            account_list
+                                .iter()
+                                .skip(1)
+                                .filter_map(|a| a.get("login").and_then(|v| v.as_str()))
+                                .collect::<Vec<_>>()
+                        );
+                    }
                     let first = &account_list[0];
                     let login_val = first.get("login").and_then(|v| v.as_str()).unwrap_or("");
                     tracing::info!("Orange: selecting account {:?}", login_val);
+                    if !login_val.is_empty() {
+                        self.selected_login = Some(login_val.to_string());
+                    }
 
                     let b = self
                         .client
@@ -1046,6 +1069,10 @@ impl Operator for OrangeOperator {
 
     async fn fetch_epg(&self, _hours: u8) -> Result<Option<EpgData>> {
         Ok(None)
+    }
+
+    fn account_name(&self) -> Option<&str> {
+        self.selected_login.as_deref()
     }
 
     fn session_token(&self) -> Option<&str> {
