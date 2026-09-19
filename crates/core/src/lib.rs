@@ -4,6 +4,8 @@ pub mod epg;
 pub mod error;
 pub mod logo_cache;
 pub mod operator;
+pub mod paths;
+pub mod preview;
 pub mod session;
 pub mod stream;
 
@@ -13,4 +15,5 @@ pub use epg::provider::{EpgFetch, EpgProvider};
 pub use epg::{EpgData, EpgProgram};
 pub use error::{ConfigError, EpgError, LogoCacheError, OperatorError, StreamError};
 pub use operator::{AuthPhase, Operator, OperatorKind, OperatorRegistry};
+pub use preview::{CacheView, ChannelId, Scheduler, SchedulerConfig, ViewState};
 pub use stream::{ProtectionData, StreamUrl};
