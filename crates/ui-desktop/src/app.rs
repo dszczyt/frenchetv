@@ -39,12 +39,16 @@ enum AsyncMsg {
     ChannelsErr(String),
     StreamOk {
         stream: StreamUrl,
+        /// `Some` when this was resolved for the guide's live row, carrying the
+        /// generation it was requested at. `None` targets the fullscreen player.
+        live_gen: Option<u64>,
     },
     StreamErr(String),
     /// DRM proxy started; pass proxy_mpd_url to mpv instead of the real stream URL.
     DrmProxyReady {
         proxy_mpd_url: String,
         proxy: Box<DrmProxy>,
+        live_gen: Option<u64>,
     },
     DrmProxyErr(String),
     /// A 401/403 was received after login — session is invalid, must re-authenticate.
@@ -86,6 +90,10 @@ pub struct App {
     /// very player rather than resolving the stream again.
     live: Option<Box<PlayerScreen>>,
     live_channel: Option<String>,
+    /// Bumped on every live-row switch. A stream resolved for a row the cursor
+    /// has since left must not be loaded — otherwise walking the list plays
+    /// whichever channel's licence exchange happened to finish last.
+    live_generation: u64,
     /// Focus must hold still before a stream is started. Without it, running
     /// the D-pad down the list would start and abandon a stream per row.
     focus_since: Option<(String, std::time::Instant)>,
@@ -145,6 +153,7 @@ impl App {
             preview_scheduler: Scheduler::new(SchedulerConfig::default()),
             live: None,
             live_channel: None,
+            live_generation: 0,
             focus_since: None,
             logo_ttl_hours,
             tx,
@@ -384,6 +393,16 @@ impl App {
     }
 
     fn start_resolve_stream(&self, channel: Channel) {
+        self.resolve_stream_inner(channel, None)
+    }
+
+    /// Resolve for the guide's live row, tagged with the generation it was
+    /// asked for so a superseded result can be discarded.
+    fn start_resolve_stream_for_live(&self, channel: Channel, generation: u64) {
+        self.resolve_stream_inner(channel, Some(generation))
+    }
+
+    fn resolve_stream_inner(&self, channel: Channel, live_gen: Option<u64>) {
         let tx = self.tx.clone();
         let ctx = self.egui_ctx.clone();
         let op = match &self.current_operator {
@@ -406,7 +425,7 @@ impl App {
             match result {
                 Ok(stream) => {
                     tracing::debug!("resolve_stream: ok → {}", stream.url);
-                    let _ = tx.send(AsyncMsg::StreamOk { stream });
+                    let _ = tx.send(AsyncMsg::StreamOk { stream, live_gen });
                 }
                 Err(OperatorError::InvalidCredentials) => {
                     tracing::warn!("resolve_stream: 401/403 → SessionExpired");
@@ -434,7 +453,7 @@ impl App {
     /// 3. Do the license exchange.
     /// 4. Start the local HTTP proxy.
     /// 5. Send `DrmProxyReady` so the player can start mpv against the proxy URL.
-    fn start_drm_proxy(&self, stream: StreamUrl) {
+    fn start_drm_proxy(&self, stream: StreamUrl, live_gen: Option<u64>) {
         use crate::drm::cdm::CdmHandle;
         use crate::drm::{fmp4, license, proxy};
 
@@ -645,6 +664,7 @@ impl App {
             let _ = tx.send(AsyncMsg::DrmProxyReady {
                 proxy_mpd_url,
                 proxy: Box::new(drm_proxy),
+                live_gen,
             });
             ctx.request_repaint();
         });
@@ -682,15 +702,26 @@ impl App {
     /// Created per guide entry rather than held for the app's life: capture
     /// needs an authenticated operator to resolve streams, and dropping it on
     /// exit is what abandons any in-flight capture.
-    /// Whichever player a resolved stream belongs to: the fullscreen one when
-    /// it exists, otherwise the guide's live row.
-    fn active_player<'a>(
+    /// True when this result was resolved for a live row the cursor has since
+    /// left. Walking a channel list otherwise plays whichever licence exchange
+    /// finished last rather than the row being pointed at.
+    fn is_stale_live(&self, live_gen: Option<u64>) -> bool {
+        matches!(live_gen, Some(g) if g != self.live_generation)
+    }
+
+    /// Which player a resolved stream belongs to: the guide's live row when it
+    /// was requested for one, otherwise the fullscreen player.
+    fn target_player<'a>(
         screen: &'a mut Screen,
         live: &'a mut Option<Box<PlayerScreen>>,
+        live_gen: Option<u64>,
     ) -> Option<&'a mut PlayerScreen> {
+        if live_gen.is_some() {
+            return live.as_deref_mut();
+        }
         match screen {
             Screen::Player(p) => Some(p),
-            _ => live.as_deref_mut(),
+            _ => None,
         }
     }
 
@@ -730,14 +761,23 @@ impl App {
             return;
         }
 
-        tracing::debug!("live row: starting {}", channel.name);
-        self.live = Some(Box::new(PlayerScreen::new(
-            channel.clone(),
-            self.egui_ctx.clone(),
-            self.force_software_renderer,
-        )));
+        tracing::debug!("live row: switching to {}", channel.name);
+        // Reuse the existing player rather than replacing it. Dropping one
+        // blocks the UI thread on mpv teardown, which while walking a channel
+        // list is a freeze on every row.
+        match self.live.as_mut() {
+            Some(player) => player.switch_channel(channel.clone()),
+            None => {
+                self.live = Some(Box::new(PlayerScreen::new(
+                    channel.clone(),
+                    self.egui_ctx.clone(),
+                    self.force_software_renderer,
+                )));
+            }
+        }
         self.live_channel = Some(channel.id.clone());
-        self.start_resolve_stream(channel);
+        self.live_generation = self.live_generation.wrapping_add(1);
+        self.start_resolve_stream_for_live(channel, self.live_generation);
     }
 
     fn start_previews(&mut self) {
@@ -813,12 +853,15 @@ impl App {
                     }
                     _ => {}
                 },
-                AsyncMsg::StreamOk { stream } => {
+                AsyncMsg::StreamOk { stream, live_gen } => {
+                    if self.is_stale_live(live_gen) {
+                        continue;
+                    }
                     if stream.protection.is_some() {
                         // DRM stream — start the proxy pipeline before handing off to mpv.
-                        self.start_drm_proxy(stream);
+                        self.start_drm_proxy(stream, live_gen);
                     } else if let Some(player) =
-                        Self::active_player(&mut self.screen, &mut self.live)
+                        Self::target_player(&mut self.screen, &mut self.live, live_gen)
                     {
                         player.start_playing(&stream);
                     }
@@ -826,10 +869,16 @@ impl App {
                 AsyncMsg::DrmProxyReady {
                     proxy_mpd_url,
                     proxy,
+                    live_gen,
                 } => {
+                    if self.is_stale_live(live_gen) {
+                        continue;
+                    }
                     // Keep proxy alive; give mpv the local URL.
                     self._drm_proxy = Some(proxy);
-                    if let Some(player) = Self::active_player(&mut self.screen, &mut self.live) {
+                    if let Some(player) =
+                        Self::target_player(&mut self.screen, &mut self.live, live_gen)
+                    {
                         // Build a plain StreamUrl pointing to the proxy.
                         if let Ok(proxy_url) = proxy_mpd_url.parse::<url::Url>() {
                             player.start_playing(&StreamUrl::direct(proxy_url));

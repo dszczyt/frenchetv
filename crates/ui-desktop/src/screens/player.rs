@@ -137,6 +137,17 @@ impl PlayerScreen {
     }
 
     /// Called when the stream has been resolved — starts mpv playback.
+    /// Point this player at a different channel without tearing it down.
+    ///
+    /// Destroying a player means `mpv_render_context_free` and an mpv handle
+    /// shutdown, both of which block until in-flight work finishes — on the UI
+    /// thread that is a visible freeze, and doing it once per focus change
+    /// while navigating a list is a freeze per row.
+    pub fn switch_channel(&mut self, channel: Channel) {
+        self.channel = channel;
+        self.state = PlayerState::Loading;
+    }
+
     pub fn start_playing(&mut self, stream: &StreamUrl) {
         self.player.play(
             stream.url.as_str(),
