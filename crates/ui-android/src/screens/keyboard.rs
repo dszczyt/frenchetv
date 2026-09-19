@@ -204,14 +204,16 @@ impl OnScreenKeyboard {
 
     fn paint(&self, ctx: &egui::Context, keys: &[Vec<KeyCap>]) {
         let screen = ctx.screen_rect();
-        // Keys are sized from the available width so the grid fits any panel,
-        // rather than assuming a resolution.
-        let grid_w = (screen.width() * 0.72).min(620.0);
-        let key_h = ((screen.height() * 0.09).clamp(28.0, 44.0)).floor();
+        // Sits in the right half while the form occupies the left, so the whole
+        // form and the whole keyboard are legible at once — on a TV there is no
+        // pointer to scroll with, and a keyboard covering the fields hides the
+        // very text being typed.
+        let grid_w = (screen.width() * 0.46).clamp(280.0, 560.0);
+        let key_h = ((screen.height() * 0.085).clamp(26.0, 42.0)).floor();
         let unit_w = grid_w / 10.0;
 
         egui::Area::new(egui::Id::new("osk"))
-            .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -12.0))
+            .anchor(egui::Align2::RIGHT_CENTER, egui::vec2(-16.0, 0.0))
             .show(ctx, |ui| {
                 egui::Frame::none()
                     .fill(Color32::from_rgb(18, 20, 26))
