@@ -12,6 +12,11 @@ ruvector.db
 !crates/ui-android/android/app/src/main/res/**/*.png
 *.txt
 
+# Local agent-tooling scratch state — generated, machine-specific, not shared
+.claude-flow/
+.swarm/
+debug.log
+
 # Bouygues PFS spike capture output (never commit secrets)
 /tools/spike/out/
 /tools/spike/node_modules/
