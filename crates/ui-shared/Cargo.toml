@@ -1,0 +1,10 @@
+[package]
+name = "ui-shared"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+frenchetv-core = { path = "../core" }
+egui = "0.30"
+chrono = { version = "0.4", features = ["serde"] }
+log = "0.4"

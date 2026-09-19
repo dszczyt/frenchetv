@@ -4492,6 +4492,7 @@ dependencies = [
  "log",
  "reqwest",
  "tokio",
+ "ui-shared",
  "url",
  "winit",
 ]
@@ -4522,8 +4523,19 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "ui-shared",
  "url",
  "zip",
+]
+
+[[package]]
+name = "ui-shared"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "egui",
+ "frenchetv-core",
+ "log",
 ]
 
 [[package]]

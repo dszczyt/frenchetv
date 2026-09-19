@@ -6,6 +6,7 @@ rust-version.workspace = true
 
 [dependencies]
 frenchetv-core = { path = "../core" }
+ui-shared = { path = "../ui-shared" }
 eframe = { version = "0.30", features = ["wgpu"] }
 egui = "0.30"
 egui_extras = { version = "0.30", features = ["image"] }

@@ -9,6 +9,7 @@ crate-type = ["cdylib"]
 
 [dependencies]
 frenchetv-core = { path = "../core" }
+ui-shared = { path = "../ui-shared" }
 
 [target.'cfg(target_os = "android")'.dependencies]
 # "glow" (GLES) rather than "wgpu": broader driver compatibility on the cheap

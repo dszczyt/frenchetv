@@ -48,7 +48,6 @@ pub mod space {
     pub const MD: f32 = 16.0;
     pub const LG: f32 = 24.0;
     pub const XL: f32 = 32.0;
-    pub const XXL: f32 = 48.0;
 }
 
 /// Corner-radius scale.

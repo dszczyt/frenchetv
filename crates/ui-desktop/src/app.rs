@@ -1,11 +1,8 @@
 use crate::drm::DrmProxy;
-use crate::screens::channel_list::ChannelListAction;
 use crate::screens::otp::OtpAction;
 use crate::screens::player::PlayerAction;
 use crate::screens::setup::SetupAction;
-use crate::screens::{
-    ChannelListScreen, OtpScreen, PlayerScreen, PushWaitScreen, RestoringScreen, SetupScreen,
-};
+use crate::screens::{OtpScreen, PlayerScreen, PushWaitScreen, RestoringScreen, SetupScreen};
 use frenchetv_core::session as keyring_session;
 use frenchetv_core::{
     AuthPhase, Channel, Config, Operator, OperatorError, OperatorKind, OperatorRegistry, StreamUrl,
@@ -13,6 +10,7 @@ use frenchetv_core::{
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
+use ui_shared::guide::{GuideAction, GuideScreen};
 
 type SharedOperator = Arc<TokioMutex<Box<dyn Operator>>>;
 /// Shared logo cache: logo_url → decoded egui texture.
@@ -53,6 +51,8 @@ enum AsyncMsg {
     WidevineDone,
     /// Background Widevine CDM download failed.
     WidevineErr(String),
+    /// Schedule data arrived. Best-effort: the guide works without it.
+    EpgOk(Box<frenchetv_core::EpgData>),
 }
 
 enum Screen {
@@ -63,7 +63,7 @@ enum Screen {
     Setup(SetupScreen),
     PushWait(PushWaitScreen),
     Otp(OtpScreen),
-    ChannelList(ChannelListScreen),
+    Guide(Box<GuideScreen>),
     Player(Box<PlayerScreen>),
 }
 
@@ -632,8 +632,35 @@ impl App {
         });
     }
 
-    fn make_channel_list(&self, channels: Vec<Channel>) -> ChannelListScreen {
-        ChannelListScreen::new(channels, Arc::clone(&self.logos))
+    /// Load the schedule in the background.
+    ///
+    /// Fire-and-forget by design: per CLAUDE.md an EPG failure degrades
+    /// silently, so this never surfaces an error. The guide renders rows and
+    /// logos with or without a schedule.
+    fn start_fetch_epg(&self, operator: SharedOperator, channels: Vec<Channel>) {
+        let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let config = Config::load().unwrap_or_default();
+        let feed_url = config.epg.feed_url.clone();
+        let ttl = config.cache.epg_ttl_minutes;
+        self.rt.spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
+            let provider = frenchetv_core::EpgProvider::new(client, feed_url, ttl);
+            let op = operator.lock().await;
+            let fetched = provider.fetch(op.as_ref(), &channels, 24).await;
+            drop(op);
+            if !fetched.data.is_empty() {
+                let _ = tx.send(AsyncMsg::EpgOk(Box::new(fetched.data)));
+                ctx.request_repaint();
+            }
+        });
+    }
+
+    fn make_guide(&self, channels: Vec<Channel>) -> Box<GuideScreen> {
+        Box::new(GuideScreen::new(channels, Arc::clone(&self.logos)))
     }
 
     fn drain_async_messages(&mut self, ctx: &egui::Context) {
@@ -677,9 +704,10 @@ impl App {
                     }
                     self.current_session = Some((kind_str, username));
                     self.start_fetch_logos(channels.clone());
+                    self.start_fetch_epg(operator.clone(), channels.clone());
                     self.channels = channels.clone();
                     self.current_operator = Some(operator);
-                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                    self.screen = Screen::Guide(self.make_guide(channels));
                 }
                 AsyncMsg::ChannelsErr(err) => match &mut self.screen {
                     Screen::Setup(s) => {
@@ -720,12 +748,17 @@ impl App {
                 AsyncMsg::DrmProxyErr(err) => {
                     tracing::error!("DRM proxy error: {}", err);
                     let channels = self.channels.clone();
-                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                    self.screen = Screen::Guide(self.make_guide(channels));
                 }
                 AsyncMsg::StreamErr(err) => {
                     tracing::error!("stream resolution failed: {}", err);
                     let channels = self.channels.clone();
-                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                    self.screen = Screen::Guide(self.make_guide(channels));
+                }
+                AsyncMsg::EpgOk(data) => {
+                    if let Screen::Guide(guide) = &mut self.screen {
+                        guide.set_epg(*data);
+                    }
                 }
                 AsyncMsg::SessionExpired => {
                     tracing::info!("Session expired — clearing credentials, returning to setup");
@@ -788,8 +821,8 @@ impl eframe::App for App {
                 }
                 OtpAction::None => {}
             },
-            Screen::ChannelList(list) => match list.show(ctx) {
-                ChannelListAction::SelectChannel(channel) => {
+            Screen::Guide(guide) => match guide.show(ctx) {
+                GuideAction::SelectChannel(channel) => {
                     self.start_resolve_stream((*channel).clone());
                     self.screen = Screen::Player(Box::new(PlayerScreen::new(
                         *channel,
@@ -797,12 +830,12 @@ impl eframe::App for App {
                         self.force_software_renderer,
                     )));
                 }
-                ChannelListAction::ChangeProvider => {
+                GuideAction::ChangeProvider => {
                     self.current_operator = None;
                     self.channels = Vec::new();
                     self.screen = Screen::Setup(SetupScreen::new());
                 }
-                ChannelListAction::None => {}
+                GuideAction::None => {}
             },
             Screen::Player(player) => {
                 let channels = self.channels.clone();
@@ -810,7 +843,7 @@ impl eframe::App for App {
                 match player.show(ctx) {
                     PlayerAction::Back => {
                         self._drm_proxy = None;
-                        self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                        self.screen = Screen::Guide(self.make_guide(channels));
                     }
                     PlayerAction::NextChannel => {
                         if let Some(idx) = channels.iter().position(|c| c.id == current_id) {
