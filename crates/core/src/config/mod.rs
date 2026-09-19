@@ -7,6 +7,9 @@ pub struct Config {
     pub operator: OperatorConfig,
     pub preferences: Preferences,
     pub cache: CacheConfig,
+    /// Defaulted so a config.toml written before this existed still loads.
+    #[serde(default)]
+    pub epg: EpgConfig,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -36,6 +39,21 @@ impl Default for Preferences {
 pub struct CacheConfig {
     pub epg_ttl_minutes: u32,
     pub logo_ttl_hours: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EpgConfig {
+    /// XMLTV feed to pull the schedule from. Configurable because public feeds
+    /// move and die; see docs/operators.md.
+    pub feed_url: String,
+}
+
+impl Default for EpgConfig {
+    fn default() -> Self {
+        Self {
+            feed_url: crate::epg::provider::DEFAULT_FEED_URL.to_string(),
+        }
+    }
 }
 
 impl Default for CacheConfig {
@@ -118,6 +136,7 @@ logo_ttl_hours = 24
                 startup_channel: Some("tf1".into()),
             },
             cache: CacheConfig::default(),
+            epg: EpgConfig::default(),
         };
         let serialized = toml::to_string(&cfg).unwrap();
         let deserialized: Config = toml::from_str(&serialized).unwrap();
