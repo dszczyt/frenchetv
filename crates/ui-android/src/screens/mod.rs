@@ -1,4 +1,5 @@
 pub mod channel_list;
+pub mod keyboard;
 pub mod player;
 pub mod setup;
 
