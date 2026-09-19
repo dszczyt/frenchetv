@@ -106,6 +106,24 @@ pub enum NavOutcome {
     ApplyFilter(usize),
 }
 
+/// Scroll offset that keeps row `row` fully on screen, moving as little as
+/// possible.
+///
+/// Minimal rather than centring: a guide that recentres on every D-pad press
+/// makes the whole list lurch, and the rows around the focused one are the
+/// context you are reading.
+pub fn offset_keeping_row_visible(row: usize, row_h: f32, current: f32, viewport_h: f32) -> f32 {
+    let top = row as f32 * row_h;
+    let bottom = top + row_h;
+    if top < current {
+        top
+    } else if bottom > current + viewport_h {
+        (bottom - viewport_h).max(0.0)
+    } else {
+        current
+    }
+}
+
 pub struct GuideScreen {
     channels: Vec<Channel>,
     filter: CategoryFilter,
@@ -123,6 +141,12 @@ pub struct GuideScreen {
     visible: Vec<String>,
     visible_focus: Option<usize>,
     last_focus_row: usize,
+    /// Set when focus moves, so the list scrolls to follow it. Without this the
+    /// focused row walks off screen — and `visible_focus` then goes `None`,
+    /// which also costs the scheduler its focus priority.
+    scroll_pending: bool,
+    scroll_offset: f32,
+    viewport_h: f32,
     pub previews: PreviewCache,
 }
 
@@ -143,6 +167,9 @@ impl GuideScreen {
             visible: Vec::new(),
             visible_focus: None,
             last_focus_row: 0,
+            scroll_pending: false,
+            scroll_offset: 0.0,
+            viewport_h: 0.0,
             previews: PreviewCache::new(),
         }
     }
@@ -268,6 +295,7 @@ impl GuideScreen {
                 };
                 self.focused_row = 0;
                 self.focused_prog = 0;
+                self.scroll_pending = true;
                 GuideAction::None
             }
             NavOutcome::None => GuideAction::None,
@@ -312,11 +340,13 @@ impl GuideScreen {
                     } else {
                         self.focused_row -= 1;
                         self.focused_prog = 0;
+                        self.scroll_pending = true;
                     }
                 }
                 if input.down && self.focused_row + 1 < rows {
                     self.focused_row += 1;
                     self.focused_prog = 0;
+                    self.scroll_pending = true;
                 }
                 // Left/Right walk programmes within the row; the window scrolls
                 // once the cursor reaches an edge. Positional, so it stays
@@ -397,21 +427,35 @@ impl GuideScreen {
                 let mut visible = Vec::new();
                 let mut visible_focus = None;
 
-                egui::ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show_rows(ui, m.row_h, filtered.len(), |ui, range| {
-                        for idx in range.clone() {
-                            let ch = &filtered[idx];
-                            if idx == focused_row {
-                                visible_focus = Some(visible.len());
-                            }
-                            visible.push(ch.id.clone());
+                let mut area = egui::ScrollArea::vertical().auto_shrink([false, false]);
+                if self.scroll_pending {
+                    let target = offset_keeping_row_visible(
+                        focused_row,
+                        m.row_h,
+                        self.scroll_offset,
+                        self.viewport_h,
+                    );
+                    area = area.vertical_scroll_offset(target);
+                    self.scroll_pending = false;
+                }
 
-                            let is_focused =
-                                self.focus_layer == FocusLayer::Rows && idx == focused_row;
-                            self.paint_row(ui, m, ch, is_focused, timeline_w, window_end);
+                let out = area.show_rows(ui, m.row_h, filtered.len(), |ui, range| {
+                    for idx in range.clone() {
+                        let ch = &filtered[idx];
+                        if idx == focused_row {
+                            visible_focus = Some(visible.len());
                         }
-                    });
+                        visible.push(ch.id.clone());
+
+                        let is_focused = self.focus_layer == FocusLayer::Rows && idx == focused_row;
+                        self.paint_row(ui, m, ch, is_focused, timeline_w, window_end);
+                    }
+                });
+
+                // Remembered for the next focus move: the offset maths needs
+                // to know where the list actually sits and how tall it is.
+                self.scroll_offset = out.state.offset.y;
+                self.viewport_h = out.inner_rect.height();
 
                 self.visible = visible;
                 self.visible_focus = visible_focus;
@@ -795,6 +839,46 @@ mod tests {
         g.apply_nav(key(|i| i.up = true), 2, 4, 0);
         g.apply_nav(key(|i| i.down = true), 2, 4, 0);
         assert_eq!(g.focus_layer, FocusLayer::Rows);
+    }
+
+    #[test]
+    fn scrolling_follows_focus_by_the_smallest_move() {
+        let row_h = 60.0;
+        let viewport = 300.0; // five rows
+
+        // Already visible: do not move. Recentring on every press would make
+        // the list lurch and throw away the context around the focused row.
+        assert_eq!(offset_keeping_row_visible(2, row_h, 0.0, viewport), 0.0);
+        assert_eq!(offset_keeping_row_visible(4, row_h, 0.0, viewport), 0.0);
+
+        // Just below the fold: scroll exactly enough to show it.
+        assert_eq!(offset_keeping_row_visible(5, row_h, 0.0, viewport), 60.0);
+        assert_eq!(offset_keeping_row_visible(6, row_h, 0.0, viewport), 120.0);
+
+        // Above the fold: align its top.
+        assert_eq!(offset_keeping_row_visible(3, row_h, 240.0, viewport), 180.0);
+        assert_eq!(offset_keeping_row_visible(0, row_h, 240.0, viewport), 0.0);
+    }
+
+    #[test]
+    fn scroll_offset_never_goes_negative() {
+        // A viewport taller than the whole list must not scroll backwards past
+        // the top.
+        assert_eq!(offset_keeping_row_visible(0, 60.0, 0.0, 1000.0), 0.0);
+        assert_eq!(offset_keeping_row_visible(1, 60.0, 0.0, 1000.0), 0.0);
+    }
+
+    #[test]
+    fn moving_focus_requests_a_scroll() {
+        let mut g = screen(20);
+        assert!(!g.scroll_pending);
+        g.apply_nav(key(|i| i.down = true), 20, 4, 0);
+        assert!(g.scroll_pending, "a row move must ask the list to follow");
+
+        g.scroll_pending = false;
+        // Left/Right walk programmes, not rows — no scroll needed.
+        g.apply_nav(key(|i| i.right = true), 20, 4, 3);
+        assert!(!g.scroll_pending);
     }
 
     #[test]
