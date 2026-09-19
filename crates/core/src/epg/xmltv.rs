@@ -120,7 +120,7 @@ pub fn parse_channels(xml: &[u8]) -> Result<Vec<XmltvChannel>, EpgError> {
 /// allocating.
 pub fn parse_programs(
     xml: &[u8],
-    wanted: &HashMap<String, String>,
+    wanted: &HashMap<String, Vec<String>>,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<Vec<EpgProgram>, EpgError> {
     let mut reader = Reader::from_reader(xml);
@@ -130,7 +130,7 @@ pub fn parse_programs(
     let mut buf = Vec::new();
 
     // Set when inside a <programme> we intend to keep.
-    let mut pending: Option<(String, DateTime<Utc>, DateTime<Utc>)> = None;
+    let mut pending: Option<(Vec<String>, DateTime<Utc>, DateTime<Utc>)> = None;
     let mut title: Option<String> = None;
     let mut desc: Option<String> = None;
     let mut in_title = false;
@@ -148,7 +148,7 @@ pub fn parse_programs(
                     desc = None;
 
                     let feed_id = attr(&e, b"channel").unwrap_or_default();
-                    let Some(our_id) = wanted.get(&feed_id) else {
+                    let Some(our_ids) = wanted.get(&feed_id) else {
                         continue;
                     };
                     let (Some(start), Some(stop)) = (
@@ -162,7 +162,7 @@ pub fn parse_programs(
                             continue;
                         }
                     }
-                    pending = Some((our_id.clone(), start, stop));
+                    pending = Some((our_ids.clone(), start, stop));
                 }
                 b"title" if pending.is_some() => in_title = true,
                 b"desc" if pending.is_some() => in_desc = true,
@@ -179,14 +179,21 @@ pub fn parse_programs(
                 b"title" => in_title = false,
                 b"desc" => in_desc = false,
                 b"programme" => {
-                    if let Some((channel_id, start, stop)) = pending.take() {
-                        out.push(EpgProgram {
-                            channel_id,
-                            title: title.take().unwrap_or_else(|| "—".to_string()),
-                            start,
-                            stop,
-                            description: desc.take().filter(|d| !d.is_empty()),
-                        });
+                    if let Some((channel_ids, start, stop)) = pending.take() {
+                        // One feed entry can serve several of our channels
+                        // (variants that normalise together), and each needs
+                        // its own row in the guide.
+                        let title = title.take().unwrap_or_else(|| "—".to_string());
+                        let description = desc.take().filter(|d| !d.is_empty());
+                        for channel_id in channel_ids {
+                            out.push(EpgProgram {
+                                channel_id,
+                                title: title.clone(),
+                                start,
+                                stop,
+                                description: description.clone(),
+                            });
+                        }
                     }
                 }
                 _ => {}
@@ -203,7 +210,7 @@ pub fn parse_programs(
 /// Parse a whole feed for the given channels.
 pub fn parse_guide(
     xml: &[u8],
-    wanted: &HashMap<String, String>,
+    wanted: &HashMap<String, Vec<String>>,
     window: Option<(DateTime<Utc>, DateTime<Utc>)>,
 ) -> Result<EpgData, EpgError> {
     Ok(EpgData::from_programs(parse_programs(xml, wanted, window)?))
@@ -235,8 +242,20 @@ mod tests {
   </programme>
 </tv>"#;
 
-    fn wanted() -> HashMap<String, String> {
-        HashMap::from([("TF1.fr".to_string(), "tf1".to_string())])
+    fn wanted() -> HashMap<String, Vec<String>> {
+        HashMap::from([("TF1.fr".to_string(), vec!["tf1".to_string()])])
+    }
+
+    #[test]
+    fn a_feed_entry_serving_two_channels_yields_a_programme_for_each() {
+        let wanted = HashMap::from([(
+            "TF1.fr".to_string(),
+            vec!["tf1".to_string(), "tf1vo".to_string()],
+        )]);
+        let progs = parse_programs(FEED, &wanted, None).unwrap();
+        assert_eq!(progs.len(), 4, "two programmes x two channels");
+        assert_eq!(progs.iter().filter(|p| p.channel_id == "tf1").count(), 2);
+        assert_eq!(progs.iter().filter(|p| p.channel_id == "tf1vo").count(), 2);
     }
 
     #[test]

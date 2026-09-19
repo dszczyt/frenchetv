@@ -80,8 +80,20 @@ impl Config {
             return Ok(Self::default());
         }
         let content = std::fs::read_to_string(&path)?;
-        let cfg: Self = toml::from_str(&content)?;
+        let mut cfg: Self = toml::from_str(&content)?;
+        cfg.migrate();
         Ok(cfg)
+    }
+
+    /// Repair settings that were valid when written but are not any more.
+    fn migrate(&mut self) {
+        if crate::epg::provider::RETIRED_FEED_URLS.contains(&self.epg.feed_url.as_str()) {
+            tracing::info!(
+                old = %self.epg.feed_url,
+                "EPG feed URL is retired; falling back to the current default"
+            );
+            self.epg.feed_url = crate::epg::provider::DEFAULT_FEED_URL.to_string();
+        }
     }
 
     /// Persist config to disk, creating the directory if needed.
@@ -145,6 +157,34 @@ logo_ttl_hours = 24
             deserialized.preferences.startup_channel.as_deref(),
             Some("tf1")
         );
+    }
+
+    #[test]
+    fn a_retired_feed_url_migrates_to_the_current_default() {
+        // A dead URL persists in config.toml once written, so changing the
+        // constant alone would never reach an existing install.
+        let toml_str = format!(
+            "[operator]\nkind = \"orange\"\nusername = \"u\"\n\n\
+             [preferences]\nlanguage = \"fr\"\nparental_lock = false\n\n\
+             [cache]\nepg_ttl_minutes = 60\nlogo_ttl_hours = 24\n\n\
+             [epg]\nfeed_url = \"{}\"\n",
+            crate::epg::provider::RETIRED_FEED_URLS[0]
+        );
+        let mut cfg: Config = toml::from_str(&toml_str).unwrap();
+        cfg.migrate();
+        assert_eq!(cfg.epg.feed_url, crate::epg::provider::DEFAULT_FEED_URL);
+    }
+
+    #[test]
+    fn a_feed_url_the_user_chose_is_left_alone() {
+        let mut cfg = Config {
+            epg: EpgConfig {
+                feed_url: "https://example.invalid/mine.xml".into(),
+            },
+            ..Default::default()
+        };
+        cfg.migrate();
+        assert_eq!(cfg.epg.feed_url, "https://example.invalid/mine.xml");
     }
 
     #[test]

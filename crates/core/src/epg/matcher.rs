@@ -14,37 +14,62 @@ use std::collections::HashMap;
 
 #[derive(Debug, Default, Clone)]
 pub struct MatchReport {
-    /// Feed channel id -> our channel id. Ready to hand to `parse_programs`.
-    pub matched: HashMap<String, String>,
+    /// Feed channel id -> every one of our channels it serves.
+    ///
+    /// One-to-many on purpose: normalisation deliberately collapses variants,
+    /// so "TCM CINEMA" and "TCM CINEMA (VO)" both resolve to the same feed
+    /// entry. A one-to-one map silently dropped whichever was seen second,
+    /// leaving that channel with no schedule at all.
+    pub matched: HashMap<String, Vec<String>>,
     /// Names of our channels with no counterpart in the feed.
     pub unmatched: Vec<String>,
 }
 
 impl MatchReport {
+    /// How many of *our* channels got a schedule — not how many feed entries
+    /// were used, which is smaller whenever variants share one.
     pub fn matched_count(&self) -> usize {
-        self.matched.len()
+        self.matched.values().map(Vec::len).sum()
     }
 }
 
-/// Overrides for names that do not survive normalisation.
+/// Overrides for names that survive normalisation differently on each side.
 ///
 /// Keyed by our normalised channel name; the value is the normalised feed name
-/// to accept as equivalent.
-/// `normalize` drops `+`, so "Canal+" becomes "canal" while a feed spelling it
-/// "Canal Plus" becomes "canalplus". These are the pairs that difference (and
-/// a few other known spellings) produces.
+/// to accept as equivalent. Kept deliberately short — every entry here is a
+/// rule `normalize` could not express, and the `+`-to-"plus" mapping already
+/// removed the whole Canal+/Ciné+/Ligue 1+ family that used to live here.
 const OVERRIDES: &[(&str, &str)] = &[
-    ("canal", "canalplus"),
-    ("canaldecale", "canalplusdecale"),
-    ("canalcinema", "canalpluscinema"),
-    ("canalsport", "canalplussport"),
+    ("francelatelevision", "franceinfo"),
+    ("rmcstory", "rmcstoryhd"),
 ];
 
 /// Strip accents, casing, punctuation and broadcast-quality suffixes.
 ///
 /// `"France 2 HD"`, `"france2"` and `"FRANCE 2"` all normalise to `"france2"`.
 pub fn normalize(name: &str) -> String {
-    let lowered: String = name
+    // Parenthetical qualifiers mark a variant of the same channel — "(VO)" is
+    // the original-language feed of a channel the guide lists once.
+    let without_parens = {
+        let mut out = String::with_capacity(name.len());
+        let mut depth = 0usize;
+        for c in name.chars() {
+            match c {
+                '(' | '[' => depth += 1,
+                ')' | ']' => depth = depth.saturating_sub(1),
+                _ if depth == 0 => out.push(c),
+                _ => {}
+            }
+        }
+        out
+    };
+
+    // Lowercase BEFORE folding accents. Folding first only ever matched the
+    // lowercase forms, so an upper-case accented name — and French line-ups
+    // are largely upper-case, "CINÉ+classic", "MATÉLÉ" — kept its accent and
+    // never matched the feed's spelling.
+    let lowered: String = without_parens
+        .to_lowercase()
         .chars()
         .map(|c| match c {
             'á' | 'à' | 'â' | 'ä' | 'ã' | 'å' => 'a',
@@ -58,14 +83,22 @@ pub fn normalize(name: &str) -> String {
             other => other,
         })
         .collect::<String>()
-        .to_lowercase();
+        // "Canal+" and a feed's "Canal Plus" have to land on the same string.
+        // Dropping the '+' as punctuation made them differ, which is what the
+        // override table used to paper over.
+        .replace('+', "plus");
 
     // Keep alphanumerics only; punctuation and spacing carry no signal here.
     let compact: String = lowered.chars().filter(|c| c.is_alphanumeric()).collect();
 
-    // Drop a trailing quality marker. Only at the end — "hd" inside a name
-    // (say a channel actually called "HDmovies") is part of the name.
-    for suffix in ["uhd", "4k", "fullhd", "hd", "sd"] {
+    // Drop a trailing quality or language marker. Only at the end — "hd"
+    // inside a name (say a channel actually called "HDmovies") is part of it.
+    // Language suffixes matter here: a line-up lists "France 24 Français"
+    // where the feed simply says "France 24".
+    for suffix in [
+        "uhd", "4k", "fullhd", "hd", "sd", "francais", "anglais", "espagnol", "arabe", "allemand",
+        "vo", "vf",
+    ] {
         if let Some(stripped) = compact.strip_suffix(suffix) {
             if !stripped.is_empty() {
                 return stripped.to_string();
@@ -102,7 +135,11 @@ pub fn match_channels(ours: &[Channel], feed: &[XmltvChannel]) -> MatchReport {
 
         match feed_id {
             Some(id) => {
-                report.matched.insert((*id).to_string(), ch.id.clone());
+                report
+                    .matched
+                    .entry((*id).to_string())
+                    .or_default()
+                    .push(ch.id.clone());
             }
             None => report.unmatched.push(ch.name.clone()),
         }
@@ -137,6 +174,15 @@ mod tests {
     }
 
     #[test]
+    fn folds_accents_on_upper_case_names_too() {
+        // Folding used to run before lowercasing, so upper-case accented names
+        // kept their accent — and French line-ups are largely upper-case.
+        assert_eq!(normalize("CINÉ+classic"), normalize("Ciné+ Classic"));
+        assert_eq!(normalize("MATÉLÉ"), "matele");
+        assert_eq!(normalize("ATHAQAFIA"), "athaqafia");
+    }
+
+    #[test]
     fn normalizes_case_accents_spacing_and_quality() {
         assert_eq!(normalize("France 2"), "france2");
         assert_eq!(normalize("FRANCE 2"), "france2");
@@ -144,8 +190,8 @@ mod tests {
         assert_eq!(normalize("France 2 HD"), "france2");
         assert_eq!(normalize("Arte"), "arte");
         assert_eq!(normalize("ARTE UHD"), "arte");
-        assert_eq!(normalize("Canal+ Décalé"), "canaldecale");
-        assert_eq!(normalize("Canal+"), "canal");
+        assert_eq!(normalize("Canal+ Décalé"), "canalplusdecale");
+        assert_eq!(normalize("Canal+"), "canalplus");
         assert_eq!(normalize("TF1 Séries Films"), "tf1seriesfilms");
         assert_eq!(normalize("M6"), "m6");
     }
@@ -173,8 +219,11 @@ mod tests {
         ];
         let r = match_channels(&ours, &feed);
         assert_eq!(r.matched_count(), 2);
-        assert_eq!(r.matched.get("France2.fr").unwrap(), "c1");
-        assert_eq!(r.matched.get("TF1.fr").unwrap(), "c2");
+        assert_eq!(
+            r.matched.get("France2.fr").unwrap(),
+            &vec!["c1".to_string()]
+        );
+        assert_eq!(r.matched.get("TF1.fr").unwrap(), &vec!["c2".to_string()]);
         assert!(r.unmatched.is_empty());
     }
 
@@ -184,7 +233,7 @@ mod tests {
         // No display-name at all; the id carries the only usable name.
         let feed = vec![feed_chan("M6.fr", &[])];
         let r = match_channels(&ours, &feed);
-        assert_eq!(r.matched.get("M6.fr").unwrap(), "c1");
+        assert_eq!(r.matched.get("M6.fr").unwrap(), &vec!["c1".to_string()]);
     }
 
     #[test]
@@ -197,15 +246,47 @@ mod tests {
     }
 
     #[test]
-    fn overrides_bridge_the_canal_plus_spelling() {
-        let ours = vec![chan("c1", "Canal+")];
-        let feed = vec![feed_chan("CanalPlus.fr", &["Canal Plus"])];
+    fn plus_channels_match_whichever_way_the_feed_spells_them() {
+        // Real unmatched names from a live run: the whole Canal+/Ciné+/Ligue 1+
+        // family failed until '+' normalised to "plus" rather than being
+        // dropped as punctuation.
+        let ours = vec![
+            chan("c1", "Canal+"),
+            chan("c2", "CINÉ+classic"),
+            chan("c3", "LIGUE 1+"),
+        ];
+        let feed = vec![
+            feed_chan("CanalPlus.fr", &["Canal Plus"]),
+            feed_chan("CinePlusClassic.fr", &["Ciné+ Classic"]),
+            feed_chan("Ligue1Plus.fr", &["Ligue 1+"]),
+        ];
         let r = match_channels(&ours, &feed);
-        assert_eq!(
-            r.matched.get("CanalPlus.fr"),
-            Some(&"c1".to_string()),
-            "normalize drops '+', so this only matches via the override table"
-        );
+        assert_eq!(r.matched_count(), 3, "unmatched: {:?}", r.unmatched);
+    }
+
+    #[test]
+    fn language_and_version_qualifiers_are_stripped() {
+        // Also from the live run: a line-up says "FRANCE 24 Français" and
+        // "TCM CINEMA (VO)" where the feed just names the channel.
+        assert_eq!(normalize("FRANCE 24 Français"), "france24");
+        assert_eq!(normalize("AL JAZEERA Anglais"), "aljazeera");
+        assert_eq!(normalize("TCM CINEMA (VO)"), "tcmcinema");
+        assert_eq!(normalize("BOOMERANG (VO)"), "boomerang");
+        // A name that is only a qualifier keeps it rather than vanishing.
+        assert_eq!(normalize("(VO)"), "");
+    }
+
+    #[test]
+    fn one_feed_channel_can_serve_several_of_ours() {
+        // Normalisation collapses variants on purpose; a one-to-one map used to
+        // drop whichever variant was seen second, leaving it scheduleless.
+        let ours = vec![chan("c1", "TCM CINEMA"), chan("c2", "TCM CINEMA (VO)")];
+        let feed = vec![feed_chan("TCM.fr", &["TCM Cinéma"])];
+        let r = match_channels(&ours, &feed);
+        assert_eq!(r.matched_count(), 2, "both variants keep a schedule");
+        let served = r.matched.get("TCM.fr").unwrap();
+        assert!(served.contains(&"c1".to_string()));
+        assert!(served.contains(&"c2".to_string()));
     }
 
     #[test]

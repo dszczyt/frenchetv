@@ -16,7 +16,7 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 fn cache_dir() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("frenchetv").join("epg"))
+    Some(crate::paths::cache_dir()?.join("epg"))
 }
 
 fn cache_key(parts: &[&str]) -> String {

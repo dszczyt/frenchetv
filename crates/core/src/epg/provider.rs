@@ -16,7 +16,18 @@ use chrono::{DateTime, Duration, Utc};
 
 /// Default feed. Overridable via config — feeds move and die, so this is a
 /// starting point rather than a constant of nature.
-pub const DEFAULT_FEED_URL: &str = "https://xmltv.ch/xmltv/xmltv-tnt-fr.xml";
+///
+/// Chosen over the TNT-only feeds because it carries ~516 channels: an
+/// operator line-up is several hundred, and a 30-channel terrestrial guide
+/// leaves most rows blank.
+pub const DEFAULT_FEED_URL: &str = "https://epg.pw/xmltv/epg_FR.xml";
+
+/// Feeds that used to be the default and no longer serve anything.
+///
+/// A dead URL survives in `config.toml` once it has been written there, so
+/// changing `DEFAULT_FEED_URL` alone would not reach anyone who already ran
+/// the app. `Config::load` treats these as unset.
+pub const RETIRED_FEED_URLS: &[&str] = &["https://xmltv.ch/xmltv/xmltv-tnt-fr.xml"];
 
 pub struct EpgProvider {
     client: reqwest::Client,
