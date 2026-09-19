@@ -1,8 +1,10 @@
 use crate::drm::DrmProxy;
+use crate::player::preview_capture::MpvPreviewCapture;
 use crate::screens::otp::OtpAction;
 use crate::screens::player::PlayerAction;
 use crate::screens::setup::SetupAction;
 use crate::screens::{OtpScreen, PlayerScreen, PushWaitScreen, RestoringScreen, SetupScreen};
+use frenchetv_core::preview::{Scheduler, SchedulerConfig};
 use frenchetv_core::session as keyring_session;
 use frenchetv_core::{
     AuthPhase, Channel, Config, Operator, OperatorError, OperatorKind, OperatorRegistry, StreamUrl,
@@ -76,6 +78,9 @@ pub struct App {
     current_session: Option<(String, String)>,
     /// Decoded channel logos, populated asynchronously after channel list loads.
     logos: LogoCache,
+    /// Preview pipeline for the guide. `None` until an operator is available.
+    preview_capture: Option<MpvPreviewCapture>,
+    preview_scheduler: Scheduler,
     /// TTL (hours) for the on-disk logo cache — from `Config.cache.logo_ttl_hours`.
     logo_ttl_hours: u32,
     tx: mpsc::SyncSender<AsyncMsg>,
@@ -128,6 +133,8 @@ impl App {
             current_operator: None,
             current_session: None,
             logos,
+            preview_capture: None,
+            preview_scheduler: Scheduler::new(SchedulerConfig::default()),
             logo_ttl_hours,
             tx,
             rx,
@@ -659,6 +666,18 @@ impl App {
         });
     }
 
+    /// Start the preview pipeline for the guide.
+    ///
+    /// Created per guide entry rather than held for the app's life: capture
+    /// needs an authenticated operator to resolve streams, and dropping it on
+    /// exit is what abandons any in-flight capture.
+    fn start_previews(&mut self) {
+        if let Some(op) = &self.current_operator {
+            self.preview_capture = Some(MpvPreviewCapture::new(Arc::clone(op)));
+            self.preview_scheduler = Scheduler::new(SchedulerConfig::default());
+        }
+    }
+
     fn make_guide(&self, channels: Vec<Channel>) -> Box<GuideScreen> {
         Box::new(GuideScreen::new(channels, Arc::clone(&self.logos)))
     }
@@ -708,6 +727,7 @@ impl App {
                     self.channels = channels.clone();
                     self.current_operator = Some(operator);
                     self.screen = Screen::Guide(self.make_guide(channels));
+                    self.start_previews();
                 }
                 AsyncMsg::ChannelsErr(err) => match &mut self.screen {
                     Screen::Setup(s) => {
@@ -749,11 +769,13 @@ impl App {
                     tracing::error!("DRM proxy error: {}", err);
                     let channels = self.channels.clone();
                     self.screen = Screen::Guide(self.make_guide(channels));
+                    self.start_previews();
                 }
                 AsyncMsg::StreamErr(err) => {
                     tracing::error!("stream resolution failed: {}", err);
                     let channels = self.channels.clone();
                     self.screen = Screen::Guide(self.make_guide(channels));
+                    self.start_previews();
                 }
                 AsyncMsg::EpgOk(data) => {
                     if let Screen::Guide(guide) = &mut self.screen {
@@ -821,22 +843,37 @@ impl eframe::App for App {
                 }
                 OtpAction::None => {}
             },
-            Screen::Guide(guide) => match guide.show(ctx) {
-                GuideAction::SelectChannel(channel) => {
-                    self.start_resolve_stream((*channel).clone());
-                    self.screen = Screen::Player(Box::new(PlayerScreen::new(
-                        *channel,
-                        self.egui_ctx.clone(),
-                        self.force_software_renderer,
-                    )));
+            Screen::Guide(guide) => {
+                if let Some(capture) = self.preview_capture.as_mut() {
+                    guide.drive_previews(
+                        ctx,
+                        capture,
+                        &mut self.preview_scheduler,
+                        std::time::Instant::now(),
+                    );
                 }
-                GuideAction::ChangeProvider => {
-                    self.current_operator = None;
-                    self.channels = Vec::new();
-                    self.screen = Screen::Setup(SetupScreen::new());
+                match guide.show(ctx) {
+                    GuideAction::SelectChannel(channel) => {
+                        // Capture yields to playback: a preview competing for the
+                        // decoder would stutter the stream actually being watched,
+                        // which makes the whole feature net-negative.
+                        self.preview_capture = None;
+                        self.start_resolve_stream((*channel).clone());
+                        self.screen = Screen::Player(Box::new(PlayerScreen::new(
+                            *channel,
+                            self.egui_ctx.clone(),
+                            self.force_software_renderer,
+                        )));
+                    }
+                    GuideAction::ChangeProvider => {
+                        self.preview_capture = None;
+                        self.current_operator = None;
+                        self.channels = Vec::new();
+                        self.screen = Screen::Setup(SetupScreen::new());
+                    }
+                    GuideAction::None => {}
                 }
-                GuideAction::None => {}
-            },
+            }
             Screen::Player(player) => {
                 let channels = self.channels.clone();
                 let current_id = player.channel.id.clone();
@@ -844,6 +881,7 @@ impl eframe::App for App {
                     PlayerAction::Back => {
                         self._drm_proxy = None;
                         self.screen = Screen::Guide(self.make_guide(channels));
+                        self.start_previews();
                     }
                     PlayerAction::NextChannel => {
                         if let Some(idx) = channels.iter().position(|c| c.id == current_id) {
