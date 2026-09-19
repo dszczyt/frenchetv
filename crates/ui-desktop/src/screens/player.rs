@@ -12,6 +12,7 @@ fn overlay_anim_id() -> egui::Id {
     egui::Id::new("player_info_overlay")
 }
 
+#[derive(PartialEq, Eq)]
 enum PlayerState {
     Loading,
     Playing,
@@ -60,6 +61,11 @@ pub struct PlayerScreen {
     pub channel: Channel,
     player: Player,
     state: PlayerState,
+    /// Rectangle this player occupied in the guide before being promoted to
+    /// fullscreen. Drives the zoom so selecting a channel grows the picture
+    /// already on screen instead of cutting to a fresh one.
+    zoom_from: Option<egui::Rect>,
+    zoom_t: f32,
     info_visible: bool,
     info_hide_timer: f32,
     fullscreen: bool,
@@ -79,6 +85,34 @@ impl PlayerScreen {
     /// `egui_ctx` is passed to `LibMpvPlayer` so mpv's update callback can
     /// wake the egui frame loop when a new frame is ready.
     /// `force_software` skips GL renderer probe and always uses software path.
+    /// A frame sized for `size`, for painting somewhere other than fullscreen.
+    ///
+    /// The guide uses this to show live video in the focused row: the same
+    /// player, drawn into a small rectangle, so selecting the channel is a
+    /// change of destination rather than a new stream.
+    pub fn frame_for(
+        &mut self,
+        ctx: &egui::Context,
+        size: egui::Vec2,
+    ) -> Option<egui::load::SizedTexture> {
+        if self.state != PlayerState::Playing {
+            return None;
+        }
+        self.player
+            .render_frame(ctx, size.x.max(1.0) as u32, size.y.max(1.0) as u32)
+    }
+
+    /// Where a zoom-to-fullscreen transition starts from, if this player was
+    /// promoted out of a guide row.
+    pub fn zoom_from(&mut self, rect: egui::Rect) {
+        self.zoom_from = Some(rect);
+        self.zoom_t = 0.0;
+    }
+
+    pub fn channel_id(&self) -> &str {
+        &self.channel.id
+    }
+
     pub fn new(channel: Channel, egui_ctx: egui::Context, force_software: bool) -> Self {
         #[cfg(unix)]
         let player = if std::env::var_os("FRENCHETV_MPV_SUBPROCESS").is_some() {
@@ -94,6 +128,8 @@ impl PlayerScreen {
             channel,
             player,
             state: PlayerState::Loading,
+            zoom_from: None,
+            zoom_t: 0.0,
             info_visible: false,
             info_hide_timer: 0.0,
             fullscreen: false,
@@ -184,13 +220,44 @@ impl PlayerScreen {
                     }
                     PlayerState::Playing => match self.player.render_frame(ctx, w, h) {
                         Some(sized_texture) => {
-                            ui.centered_and_justified(|ui| {
-                                ui.add(
-                                    egui::Image::new(sized_texture)
-                                        .maintain_aspect_ratio(true)
-                                        .fit_to_exact_size(available),
+                            // Promoted out of a guide row: grow from where the
+                            // picture already was rather than cutting to a new
+                            // one. Same stream throughout — only the
+                            // destination rectangle changes.
+                            if let Some(from) = self.zoom_from {
+                                const ZOOM_SECS: f32 = 0.28;
+                                self.zoom_t = (self.zoom_t
+                                    + ctx.input(|i| i.unstable_dt) / ZOOM_SECS)
+                                    .min(1.0);
+                                // Ease-out: fast at first, settling into place.
+                                let t = 1.0 - (1.0 - self.zoom_t).powi(3);
+                                let full = ui.max_rect();
+                                let rect = egui::Rect::from_min_max(
+                                    from.min + (full.min - from.min) * t,
+                                    from.max + (full.max - from.max) * t,
                                 );
-                            });
+                                ui.painter().image(
+                                    sized_texture.id,
+                                    rect,
+                                    egui::Rect::from_min_max(
+                                        egui::pos2(0.0, 0.0),
+                                        egui::pos2(1.0, 1.0),
+                                    ),
+                                    egui::Color32::WHITE,
+                                );
+                                if self.zoom_t >= 1.0 {
+                                    self.zoom_from = None;
+                                }
+                                ctx.request_repaint();
+                            } else {
+                                ui.centered_and_justified(|ui| {
+                                    ui.add(
+                                        egui::Image::new(sized_texture)
+                                            .maintain_aspect_ratio(true)
+                                            .fit_to_exact_size(available),
+                                    );
+                                });
+                            }
                         }
                         None => {
                             ui.centered_and_justified(|ui| {

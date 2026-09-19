@@ -147,6 +147,14 @@ pub struct GuideScreen {
     scroll_pending: bool,
     scroll_offset: f32,
     viewport_h: f32,
+    /// Live video for the focused row, when the platform can supply it.
+    /// Desktop renders mpv into an egui texture so it can be painted anywhere;
+    /// Android plays in a separate Activity and has none, so it stays `None`
+    /// and the focused row shows its captured still like every other row.
+    live_texture: Option<egui::load::SizedTexture>,
+    /// Where the focused row's preview was painted last frame. The fullscreen
+    /// transition zooms out of exactly this rectangle.
+    focused_preview_rect: Option<Rect>,
     pub previews: PreviewCache,
 }
 
@@ -170,8 +178,26 @@ impl GuideScreen {
             scroll_pending: false,
             scroll_offset: 0.0,
             viewport_h: 0.0,
+            live_texture: None,
+            focused_preview_rect: None,
             previews: PreviewCache::new(),
         }
+    }
+
+    /// Supply live video for the focused row. `None` falls back to the still.
+    pub fn set_live_texture(&mut self, texture: Option<egui::load::SizedTexture>) {
+        self.live_texture = texture;
+    }
+
+    /// The channel the cursor is on, if any.
+    pub fn focused_channel(&self) -> Option<Channel> {
+        self.filtered().get(self.focused_row).map(|c| (*c).clone())
+    }
+
+    /// Where the focused row's preview sits on screen, for the zoom-to-
+    /// fullscreen transition to start from.
+    pub fn focused_preview_rect(&self) -> Option<Rect> {
+        self.focused_preview_rect
     }
 
     pub fn set_epg(&mut self, epg: EpgData) {
@@ -609,10 +635,21 @@ impl GuideScreen {
         // Never a blank hole: a row with no captured frame yet shows the
         // channel name on the preview's dark fill.
         painter.rect_filled(preview_rect, 3.0, palette::SURFACE);
-        match self.previews.peek(&ch.id) {
-            Some(tex) => {
+        if focused {
+            self.focused_preview_rect = Some(preview_rect);
+        }
+        // Live video for the focused row when the platform supplies it,
+        // otherwise the most recent captured still, and failing that the
+        // channel's name — a row is never a blank hole.
+        let live_id = if focused {
+            self.live_texture.map(|t| t.id)
+        } else {
+            None
+        };
+        match live_id.or_else(|| self.previews.peek(&ch.id).map(|t| t.id())) {
+            Some(tex_id) => {
                 painter.image(
-                    tex.id(),
+                    tex_id,
                     preview_rect,
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     Color32::WHITE,

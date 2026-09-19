@@ -81,6 +81,14 @@ pub struct App {
     /// Preview pipeline for the guide. `None` until an operator is available.
     preview_capture: Option<MpvPreviewCapture>,
     preview_scheduler: Scheduler,
+    /// The focused row's live stream: a real player, already running, drawn
+    /// into the row instead of fullscreen. Selecting the channel promotes this
+    /// very player rather than resolving the stream again.
+    live: Option<Box<PlayerScreen>>,
+    live_channel: Option<String>,
+    /// Focus must hold still before a stream is started. Without it, running
+    /// the D-pad down the list would start and abandon a stream per row.
+    focus_since: Option<(String, std::time::Instant)>,
     /// TTL (hours) for the on-disk logo cache — from `Config.cache.logo_ttl_hours`.
     logo_ttl_hours: u32,
     tx: mpsc::SyncSender<AsyncMsg>,
@@ -135,6 +143,9 @@ impl App {
             logos,
             preview_capture: None,
             preview_scheduler: Scheduler::new(SchedulerConfig::default()),
+            live: None,
+            live_channel: None,
+            focus_since: None,
             logo_ttl_hours,
             tx,
             rx,
@@ -671,6 +682,64 @@ impl App {
     /// Created per guide entry rather than held for the app's life: capture
     /// needs an authenticated operator to resolve streams, and dropping it on
     /// exit is what abandons any in-flight capture.
+    /// Whichever player a resolved stream belongs to: the fullscreen one when
+    /// it exists, otherwise the guide's live row.
+    fn active_player<'a>(
+        screen: &'a mut Screen,
+        live: &'a mut Option<Box<PlayerScreen>>,
+    ) -> Option<&'a mut PlayerScreen> {
+        match screen {
+            Screen::Player(p) => Some(p),
+            _ => live.as_deref_mut(),
+        }
+    }
+
+    /// Start a live stream for the focused row once focus has held still.
+    ///
+    /// The debounce is the point: running the D-pad down the list would
+    /// otherwise start and abandon one stream per row, each carrying a licence
+    /// exchange.
+    fn update_live_row(&mut self, ctx: &egui::Context, focused: Option<Channel>) {
+        const SETTLE: std::time::Duration = std::time::Duration::from_millis(700);
+        let now = std::time::Instant::now();
+
+        let Some(channel) = focused else {
+            self.focus_since = None;
+            return;
+        };
+
+        match &self.focus_since {
+            Some((id, _)) if *id == channel.id => {}
+            _ => {
+                self.focus_since = Some((channel.id.clone(), now));
+                // egui repaints on demand, so an idle guide would simply stop
+                // calling this and the settle deadline would never arrive.
+                ctx.request_repaint_after(SETTLE);
+                return;
+            }
+        }
+
+        if self.live_channel.as_deref() == Some(channel.id.as_str()) {
+            return; // already playing this one
+        }
+        let Some((_, since)) = &self.focus_since else {
+            return;
+        };
+        if now.duration_since(*since) < SETTLE {
+            ctx.request_repaint_after(SETTLE - now.duration_since(*since));
+            return;
+        }
+
+        tracing::debug!("live row: starting {}", channel.name);
+        self.live = Some(Box::new(PlayerScreen::new(
+            channel.clone(),
+            self.egui_ctx.clone(),
+            self.force_software_renderer,
+        )));
+        self.live_channel = Some(channel.id.clone());
+        self.start_resolve_stream(channel);
+    }
+
     fn start_previews(&mut self) {
         if let Some(op) = &self.current_operator {
             self.preview_capture = Some(MpvPreviewCapture::new(Arc::clone(op)));
@@ -748,7 +817,9 @@ impl App {
                     if stream.protection.is_some() {
                         // DRM stream — start the proxy pipeline before handing off to mpv.
                         self.start_drm_proxy(stream);
-                    } else if let Screen::Player(player) = &mut self.screen {
+                    } else if let Some(player) =
+                        Self::active_player(&mut self.screen, &mut self.live)
+                    {
                         player.start_playing(&stream);
                     }
                 }
@@ -758,7 +829,7 @@ impl App {
                 } => {
                     // Keep proxy alive; give mpv the local URL.
                     self._drm_proxy = Some(proxy);
-                    if let Screen::Player(player) = &mut self.screen {
+                    if let Some(player) = Self::active_player(&mut self.screen, &mut self.live) {
                         // Build a plain StreamUrl pointing to the proxy.
                         if let Ok(proxy_url) = proxy_mpd_url.parse::<url::Url>() {
                             player.start_playing(&StreamUrl::direct(proxy_url));
@@ -812,6 +883,20 @@ impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.drain_async_messages(ctx);
 
+        // Live video for the focused guide row. Computed before the screen
+        // match so it does not hold a borrow of `self.screen` across the call.
+        let (focused, from_rect) = match &self.screen {
+            Screen::Guide(g) => (g.focused_channel(), g.focused_preview_rect()),
+            _ => (None, None),
+        };
+        if matches!(self.screen, Screen::Guide(_)) {
+            self.update_live_row(ctx, focused);
+        }
+        let live_frame = match (self.live.as_mut(), from_rect) {
+            (Some(player), Some(rect)) => player.frame_for(ctx, rect.size()),
+            _ => None,
+        };
+
         match &mut self.screen {
             Screen::Restoring(restoring) => {
                 restoring.show(ctx);
@@ -852,21 +937,46 @@ impl eframe::App for App {
                         std::time::Instant::now(),
                     );
                 }
+
+                guide.set_live_texture(live_frame);
+
                 match guide.show(ctx) {
                     GuideAction::SelectChannel(channel) => {
                         // Capture yields to playback: a preview competing for the
                         // decoder would stutter the stream actually being watched,
                         // which makes the whole feature net-negative.
                         self.preview_capture = None;
-                        self.start_resolve_stream((*channel).clone());
-                        self.screen = Screen::Player(Box::new(PlayerScreen::new(
-                            *channel,
-                            self.egui_ctx.clone(),
-                            self.force_software_renderer,
-                        )));
+
+                        // Reuse the stream already running in the row when it is
+                        // the one being selected: no second resolve, no second
+                        // licence exchange, and the picture already on screen
+                        // simply grows into place.
+                        let promote = self
+                            .live
+                            .as_ref()
+                            .is_some_and(|p| p.channel_id() == channel.id);
+                        if promote {
+                            let mut player = self.live.take().expect("checked just above");
+                            if let Some(rect) = from_rect {
+                                player.zoom_from(rect);
+                            }
+                            self.live_channel = None;
+                            self.screen = Screen::Player(player);
+                        } else {
+                            self.live = None;
+                            self.live_channel = None;
+                            self.start_resolve_stream((*channel).clone());
+                            self.screen = Screen::Player(Box::new(PlayerScreen::new(
+                                *channel,
+                                self.egui_ctx.clone(),
+                                self.force_software_renderer,
+                            )));
+                        }
                     }
                     GuideAction::ChangeProvider => {
                         self.preview_capture = None;
+                        self.live = None;
+                        self.live_channel = None;
                         self.current_operator = None;
                         self.channels = Vec::new();
                         self.screen = Screen::Setup(SetupScreen::new());
