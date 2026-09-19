@@ -11,7 +11,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 fn sessions_path() -> Option<PathBuf> {
-    dirs::config_dir().map(|d| d.join("frenchetv").join("sessions.json"))
+    crate::paths::config_dir().map(|d| d.join("sessions.json"))
 }
 
 fn account_key(operator: &str, username: &str) -> String {

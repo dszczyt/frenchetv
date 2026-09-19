@@ -1,7 +1,6 @@
-use crate::screens::channel_list::ChannelListAction;
 use crate::screens::player::PlayerAction;
 use crate::screens::setup::SetupAction;
-use crate::screens::{ChannelListScreen, PlayerScreen, SetupScreen};
+use crate::screens::{PlayerScreen, SetupScreen};
 use android_activity::AndroidApp;
 use frenchetv_core::session as session_store;
 use frenchetv_core::{
@@ -10,6 +9,7 @@ use frenchetv_core::{
 use std::collections::HashMap;
 use std::sync::{mpsc, Arc, Mutex};
 use tokio::sync::Mutex as TokioMutex;
+use ui_shared::guide::{GuideAction, GuideScreen};
 
 type SharedOperator = Arc<TokioMutex<Box<dyn frenchetv_core::Operator>>>;
 
@@ -36,12 +36,14 @@ enum AsyncMsg {
     StreamErr(String),
     /// A 401/403 was received — session is invalid, must re-authenticate.
     SessionExpired,
+    /// Schedule data arrived. Best-effort: the guide works without it.
+    EpgOk(Box<frenchetv_core::EpgData>),
 }
 
 enum Screen {
     Setup(SetupScreen),
     PushWait(PushWaitScreen),
-    ChannelList(ChannelListScreen),
+    Guide(Box<GuideScreen>),
     Player(PlayerScreen),
 }
 
@@ -122,6 +124,15 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, android_app: AndroidApp) -> Self {
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
+        // Point core at the app's private storage before anything reads it.
+        // `dirs` resolves to nothing on Android, so until this call config and
+        // sessions silently failed to persist on the device.
+        if let Some(dir) = android_app.internal_data_path() {
+            frenchetv_core::paths::set_app_dir(dir);
+        } else {
+            log::warn!("no internal data path; config and sessions will not persist");
+        }
+
         let (tx, rx) = mpsc::sync_channel(16);
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         let logos: LogoCache = Arc::new(Mutex::new(HashMap::new()));
@@ -161,8 +172,35 @@ impl App {
         app
     }
 
-    fn make_channel_list(&self, channels: Vec<Channel>) -> ChannelListScreen {
-        ChannelListScreen::new(channels, Arc::clone(&self.logos))
+    fn make_guide(&self, channels: Vec<Channel>) -> Box<GuideScreen> {
+        Box::new(GuideScreen::new(channels, Arc::clone(&self.logos)))
+    }
+
+    /// Load the schedule in the background.
+    ///
+    /// Deliberately fire-and-forget: per CLAUDE.md an EPG failure degrades
+    /// silently, so this never reports an error to the UI. The guide renders
+    /// rows, logos and previews with or without a schedule.
+    fn start_fetch_epg(&self, operator: SharedOperator, channels: Vec<Channel>) {
+        let tx = self.tx.clone();
+        let ctx = self.egui_ctx.clone();
+        let config = Config::load().unwrap_or_default();
+        let feed_url = config.epg.feed_url.clone();
+        let ttl = config.cache.epg_ttl_minutes;
+        self.rt.spawn(async move {
+            let client = reqwest::Client::builder()
+                .timeout(std::time::Duration::from_secs(30))
+                .build()
+                .unwrap_or_default();
+            let provider = frenchetv_core::EpgProvider::new(client, feed_url, ttl);
+            let op = operator.lock().await;
+            let fetched = provider.fetch(op.as_ref(), &channels, 24).await;
+            drop(op);
+            if !fetched.data.is_empty() {
+                let _ = tx.send(AsyncMsg::EpgOk(Box::new(fetched.data)));
+                ctx.request_repaint();
+            }
+        });
     }
 
     fn start_fetch_logos(&self, channels: Vec<Channel>) {
@@ -428,9 +466,10 @@ impl App {
                     }
                     self.current_session = Some((kind_str, username));
                     self.start_fetch_logos(channels.clone());
+                    self.start_fetch_epg(operator.clone(), channels.clone());
                     self.channels = channels.clone();
                     self.current_operator = Some(operator);
-                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                    self.screen = Screen::Guide(self.make_guide(channels));
                 }
                 AsyncMsg::ChannelsErr(err) => {
                     if let Screen::Setup(s) = &mut self.screen {
@@ -447,7 +486,12 @@ impl App {
                 AsyncMsg::StreamErr(err) => {
                     log::error!("stream resolution failed: {}", err);
                     let channels = self.channels.clone();
-                    self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                    self.screen = Screen::Guide(self.make_guide(channels));
+                }
+                AsyncMsg::EpgOk(data) => {
+                    if let Screen::Guide(guide) = &mut self.screen {
+                        guide.set_epg(*data);
+                    }
                 }
                 AsyncMsg::SessionExpired => {
                     log::info!("Session expired — clearing credentials, returning to setup");
@@ -492,17 +536,21 @@ impl eframe::App for App {
             Screen::PushWait(pw) => {
                 pw.show(ctx);
             }
-            Screen::ChannelList(list) => {
-                if let ChannelListAction::SelectChannel(channel) = list.show(ctx) {
+            Screen::Guide(guide) => match guide.show(ctx) {
+                GuideAction::SelectChannel(channel) => {
                     self.start_resolve_stream(*channel);
                 }
-            }
+                GuideAction::ChangeProvider => {
+                    self.screen = Screen::Setup(self.fresh_setup_screen());
+                }
+                GuideAction::None => {}
+            },
             Screen::Player(player) => {
                 let channels = self.channels.clone();
                 let current_id = player.channel.id.clone();
                 match player.show(ctx) {
                     PlayerAction::Back => {
-                        self.screen = Screen::ChannelList(self.make_channel_list(channels));
+                        self.screen = Screen::Guide(self.make_guide(channels));
                     }
                     PlayerAction::NextChannel => {
                         if let Some(idx) = channels.iter().position(|c| c.id == current_id) {

@@ -5,9 +5,8 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
 fn logo_cache_dir() -> Result<PathBuf, LogoCacheError> {
-    Ok(dirs::cache_dir()
+    Ok(crate::paths::cache_dir()
         .ok_or(LogoCacheError::NoDirFound)?
-        .join("frenchetv")
         .join("logos"))
 }
 

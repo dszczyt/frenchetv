@@ -69,8 +69,8 @@ impl Config {
     /// Returns `~/.config/frenchetv/config.toml` (Linux/macOS) or
     /// `%APPDATA%\frenchetv\config.toml` (Windows).
     pub fn config_path() -> Result<PathBuf, ConfigError> {
-        let base = dirs::config_dir().ok_or(ConfigError::NoDirFound)?;
-        Ok(base.join("frenchetv").join("config.toml"))
+        let base = crate::paths::config_dir().ok_or(ConfigError::NoDirFound)?;
+        Ok(base.join("config.toml"))
     }
 
     /// Load config from disk, returning `Config::default()` if the file doesn't exist.
