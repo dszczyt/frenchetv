@@ -465,7 +465,7 @@ impl eframe::App for App {
             }
             Screen::ChannelList(list) => {
                 if let ChannelListAction::SelectChannel(channel) = list.show(ctx) {
-                    self.start_resolve_stream(channel);
+                    self.start_resolve_stream(*channel);
                 }
             }
             Screen::Player(player) => {

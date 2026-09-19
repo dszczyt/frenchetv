@@ -156,13 +156,13 @@ impl SetupScreen {
                                         (
                                             Color32::from_rgb(10, 132, 255),
                                             Color32::from_rgb(20, 40, 70),
-                                            3.0,
+                                            3.0_f32,
                                         )
                                     } else {
                                         (
                                             Color32::from_rgb(60, 60, 70),
                                             Color32::from_rgb(25, 27, 34),
-                                            1.5,
+                                            1.5_f32,
                                         )
                                     };
 
@@ -299,7 +299,7 @@ impl SetupScreen {
                                 )
                                 .fill(btn_bg)
                                 .stroke(egui::Stroke::new(
-                                    if submit_focused { 3.0 } else { 1.5 },
+                                    if submit_focused { 3.0_f32 } else { 1.5_f32 },
                                     btn_border,
                                 ))
                                 .rounding(12.0)

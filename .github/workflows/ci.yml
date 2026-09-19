@@ -108,17 +108,29 @@ jobs:
         if: matrix.name == 'windows-cross'
         run: cargo build -p ui-desktop --release --locked --target x86_64-pc-windows-gnu
 
-  # Build-only check (no signing, no packaging) — cargo-ndk compiling the Rust
+  # Build + lint (no signing, no packaging) — cargo-ndk compiling the Rust
   # side for both ABIs frenchetv ships on Android is the thing host `cargo
   # check` structurally cannot catch, since ui-android's app/player/screens
   # modules are #[cfg(target_os = "android")]-gated.
+  #
+  # That same gating means the `quality` job's `cargo clippy --workspace` walks
+  # straight past all of ui-android: on a host target the modules do not exist,
+  # so the crate lints clean no matter what is in it. Clippy therefore has to
+  # run here, against an Android target, or it does not run on this crate at
+  # all. It drifted for real while unlinted — the desktop ChannelListAction
+  # boxes its Channel to satisfy `large_enum_variant` and the Android mirror
+  # did not, because nothing ever checked.
+  #
+  # Pinned to the same toolchain as `quality` for the same reason: `-D warnings`
+  # plus a floating toolchain turns this red on untouched code.
   build-android:
-    name: build (android, arm64-v8a + armeabi-v7a)
+    name: build + clippy (android, arm64-v8a + armeabi-v7a)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.97.1
         with:
+          components: clippy
           targets: aarch64-linux-android, armv7-linux-androideabi
       - uses: Swatinem/rust-cache@v2
         with:
@@ -128,6 +140,13 @@ jobs:
         with:
           ndk-version: r26d
       - run: cargo install cargo-ndk --locked
+      - name: cargo ndk clippy
+        env:
+          ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: |
+          cargo ndk -t arm64-v8a -t armeabi-v7a \
+            clippy -p ui-android --all-targets -- -D warnings
+
       - name: cargo ndk build
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}

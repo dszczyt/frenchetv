@@ -31,7 +31,10 @@ pub struct ChannelListScreen {
 #[derive(Debug)]
 pub enum ChannelListAction {
     None,
-    SelectChannel(Channel),
+    /// Boxed to keep the enum small — `Channel` is ~208 bytes, so an unboxed
+    /// variant makes every `ChannelListAction` that large. Mirrors the desktop
+    /// screen's signature.
+    SelectChannel(Box<Channel>),
 }
 
 impl ChannelListScreen {
@@ -71,7 +74,7 @@ impl ChannelListScreen {
         let row_count = if visible.is_empty() {
             0
         } else {
-            (visible.len() + COLS - 1) / COLS
+            visible.len().div_ceil(COLS)
         };
 
         let filter_labels = Self::all_filter_labels();
@@ -118,7 +121,7 @@ impl ChannelListScreen {
                     let new_row_count = if new_visible_count == 0 {
                         0
                     } else {
-                        (new_visible_count + COLS - 1) / COLS
+                        new_visible_count.div_ceil(COLS)
                     };
                     if self.focused_row >= new_row_count && new_row_count > 0 {
                         self.focused_row = new_row_count - 1;
@@ -156,7 +159,7 @@ impl ChannelListScreen {
                     let idx = self.focused_row * COLS + self.focused_col;
                     if let Some(channel) = visible.get(idx) {
                         if !channel.locked {
-                            action = ChannelListAction::SelectChannel((*channel).clone());
+                            action = ChannelListAction::SelectChannel(Box::new((*channel).clone()));
                         }
                     }
                 }
@@ -332,7 +335,7 @@ impl ChannelListScreen {
                                     ui.end_row();
                                 }
                             }
-                            if !visible.is_empty() && visible.len() % COLS != 0 {
+                            if !visible.is_empty() && !visible.len().is_multiple_of(COLS) {
                                 ui.end_row();
                             }
                         });
