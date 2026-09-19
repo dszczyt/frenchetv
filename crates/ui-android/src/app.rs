@@ -106,6 +106,9 @@ pub struct App {
     current_session: Option<(String, String)>,
     /// Channel being resolved — stored so StreamOk can construct PlayerScreen.
     pending_channel: Option<Channel>,
+    /// Credentials to persist once auth succeeds. Held rather than written at
+    /// submit time so a rejected password is never stored.
+    pending_credentials: Option<(String, String)>,
     logos: LogoCache,
     /// TTL (hours) for the on-disk logo cache — from `Config.cache.logo_ttl_hours`.
     logo_ttl_hours: u32,
@@ -125,13 +128,17 @@ impl App {
         let config = Config::load().unwrap_or_default();
         let logo_ttl_hours = config.cache.logo_ttl_hours;
 
+        let remember_available = crate::credentials::is_available(&android_app);
+        let saved = crate::credentials::load(&android_app).map(|c| (c.username, c.password));
+
         let app = Self {
+            screen: Screen::Setup(SetupScreen::with_saved(remember_available, saved)),
             android_app,
-            screen: Screen::Setup(SetupScreen::new()),
             channels: Vec::new(),
             current_operator: None,
             current_session: None,
             pending_channel: None,
+            pending_credentials: None,
             logos,
             logo_ttl_hours,
             tx,
@@ -371,20 +378,32 @@ impl App {
         });
     }
 
+    /// A setup screen prefilled from the keystore, so returning to login does
+    /// not mean retyping an email address on a D-pad.
+    fn fresh_setup_screen(&self) -> SetupScreen {
+        let available = crate::credentials::is_available(&self.android_app);
+        let saved = crate::credentials::load(&self.android_app).map(|c| (c.username, c.password));
+        SetupScreen::with_saved(available, saved)
+    }
+
     fn drain_async_messages(&mut self, ctx: &egui::Context) {
         while let Ok(msg) = self.rx.try_recv() {
             match msg {
-                AsyncMsg::AuthErr(err) => match &mut self.screen {
-                    Screen::Setup(s) => {
-                        s.set_error(format!("Connexion échouée : {}", err));
+                AsyncMsg::AuthErr(err) => {
+                    // Never persist a password the operator just rejected.
+                    self.pending_credentials = None;
+                    match &mut self.screen {
+                        Screen::Setup(s) => {
+                            s.set_error(format!("Connexion échouée : {}", err));
+                        }
+                        Screen::PushWait(_) => {
+                            let mut s = self.fresh_setup_screen();
+                            s.set_error(format!("Connexion échouée : {}", err));
+                            self.screen = Screen::Setup(s);
+                        }
+                        _ => {}
                     }
-                    Screen::PushWait(_) => {
-                        let mut s = SetupScreen::new();
-                        s.set_error(format!("Connexion échouée : {}", err));
-                        self.screen = Screen::Setup(s);
-                    }
-                    _ => {}
-                },
+                }
                 AsyncMsg::PushAuthPending => {
                     self.screen = Screen::PushWait(PushWaitScreen::new());
                 }
@@ -403,6 +422,9 @@ impl App {
                         if let Err(e) = cfg.save() {
                             log::warn!("Failed to save config: {}", e);
                         }
+                    }
+                    if let Some((u, p)) = self.pending_credentials.take() {
+                        crate::credentials::save(&self.android_app, &u, &p);
                     }
                     self.current_session = Some((kind_str, username));
                     self.start_fetch_logos(channels.clone());
@@ -435,7 +457,7 @@ impl App {
                     self.current_operator = None;
                     self.channels = Vec::new();
                     self.pending_channel = None;
-                    let mut s = SetupScreen::new();
+                    let mut s = self.fresh_setup_screen();
                     s.set_error("Session expirée. Veuillez vous reconnecter.".to_string());
                     self.screen = Screen::Setup(s);
                 }
@@ -451,12 +473,19 @@ impl eframe::App for App {
 
         match &mut self.screen {
             Screen::Setup(setup) => {
+                let remember = setup.remember_requested();
                 if let SetupAction::StartAuth {
                     operator,
                     username,
                     password,
                 } = setup.show(ctx)
                 {
+                    self.pending_credentials = if remember {
+                        Some((username.clone(), password.clone()))
+                    } else {
+                        crate::credentials::clear(&self.android_app);
+                        None
+                    };
                     self.start_auth(operator, username, password);
                 }
             }

@@ -10,6 +10,7 @@ enum FieldFocus {
     OperatorCards,
     Username,
     Password,
+    Remember,
     SubmitButton,
 }
 
@@ -96,6 +97,9 @@ pub struct SetupScreen {
     error_message: Option<String>,
     loading: bool,
     keyboard: OnScreenKeyboard,
+    /// Hidden entirely when the device cannot store credentials (API < 23).
+    remember_available: bool,
+    remember: bool,
 }
 
 #[derive(Debug)]
@@ -118,7 +122,27 @@ impl SetupScreen {
             error_message: None,
             loading: false,
             keyboard: OnScreenKeyboard::new(),
+            remember_available: false,
+            remember: false,
         }
+    }
+
+    /// Start with credentials restored from the keystore. `remember` is on
+    /// precisely when something was stored, so the toggle reflects reality.
+    pub fn with_saved(remember_available: bool, saved: Option<(String, String)>) -> Self {
+        let mut s = Self::new();
+        s.remember_available = remember_available;
+        if let Some((u, p)) = saved {
+            s.username = u;
+            s.password = p;
+            s.remember = true;
+        }
+        s
+    }
+
+    /// Whether the user asked for these credentials to be kept.
+    pub fn remember_requested(&self) -> bool {
+        self.remember_available && self.remember
     }
 
     pub fn set_error(&mut self, msg: impl Into<String>) {
@@ -183,15 +207,34 @@ impl SetupScreen {
                         self.field_focus = FieldFocus::Username;
                     }
                     if down {
-                        self.field_focus = FieldFocus::SubmitButton;
+                        self.field_focus = if self.remember_available {
+                            FieldFocus::Remember
+                        } else {
+                            FieldFocus::SubmitButton
+                        };
                     }
                     if enter {
                         self.keyboard.open();
                     }
                 }
-                FieldFocus::SubmitButton => {
+                FieldFocus::Remember => {
                     if up {
                         self.field_focus = FieldFocus::Password;
+                    }
+                    if down {
+                        self.field_focus = FieldFocus::SubmitButton;
+                    }
+                    if enter {
+                        self.remember = !self.remember;
+                    }
+                }
+                FieldFocus::SubmitButton => {
+                    if up {
+                        self.field_focus = if self.remember_available {
+                            FieldFocus::Remember
+                        } else {
+                            FieldFocus::Password
+                        };
                     }
                     if enter && !self.loading {
                         let op = &operators[self.selected_op_idx];
@@ -301,6 +344,78 @@ impl SetupScreen {
                         );
 
                         ui.add_space(m.gap_md);
+
+                        if self.remember_available {
+                            let focused = self.field_focus == FieldFocus::Remember;
+                            let accent = Color32::from_rgb(10, 132, 255);
+                            let box_side = m.label + 2.0;
+                            let text = "Se souvenir de moi";
+                            let font = FontId::proportional(m.label);
+                            let text_w = ui
+                                .fonts(|f| {
+                                    f.layout_no_wrap(text.to_string(), font.clone(), Color32::WHITE)
+                                })
+                                .size()
+                                .x;
+
+                            let (rect, _) = ui.allocate_exact_size(
+                                Vec2::new(box_side + 10.0 + text_w, box_side + 8.0),
+                                egui::Sense::hover(),
+                            );
+                            let box_rect = egui::Rect::from_min_size(
+                                egui::pos2(rect.left(), rect.center().y - box_side / 2.0),
+                                Vec2::splat(box_side),
+                            );
+                            ui.painter().rect(
+                                box_rect,
+                                4.0,
+                                if self.remember {
+                                    accent
+                                } else {
+                                    Color32::from_rgb(8, 9, 12)
+                                },
+                                egui::Stroke::new(
+                                    if focused { 2.5_f32 } else { 1.5_f32 },
+                                    if focused {
+                                        accent
+                                    } else {
+                                        Color32::from_rgb(60, 60, 70)
+                                    },
+                                ),
+                            );
+                            if self.remember {
+                                // Drawn rather than a glyph: the bundled font has
+                                // no check mark and would render tofu.
+                                let c = box_rect.center();
+                                let s2 = box_side * 0.28;
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(c.x - s2, c.y),
+                                        egui::pos2(c.x - s2 * 0.2, c.y + s2 * 0.8),
+                                    ],
+                                    egui::Stroke::new(2.0_f32, Color32::WHITE),
+                                );
+                                ui.painter().line_segment(
+                                    [
+                                        egui::pos2(c.x - s2 * 0.2, c.y + s2 * 0.8),
+                                        egui::pos2(c.x + s2, c.y - s2 * 0.7),
+                                    ],
+                                    egui::Stroke::new(2.0_f32, Color32::WHITE),
+                                );
+                            }
+                            ui.painter().text(
+                                egui::pos2(box_rect.right() + 10.0, rect.center().y),
+                                egui::Align2::LEFT_CENTER,
+                                text,
+                                font,
+                                if focused {
+                                    Color32::WHITE
+                                } else {
+                                    Color32::from_rgb(180, 180, 180)
+                                },
+                            );
+                            ui.add_space(m.gap_sm);
+                        }
 
                         if let Some(err) = &self.error_message {
                             ui.label(

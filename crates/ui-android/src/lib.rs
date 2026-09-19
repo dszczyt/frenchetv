@@ -26,6 +26,8 @@ fn android_main(app: AndroidApp) {
 #[cfg(target_os = "android")]
 mod app;
 #[cfg(target_os = "android")]
+mod credentials;
+#[cfg(target_os = "android")]
 mod player;
 #[cfg(target_os = "android")]
 mod screens;
