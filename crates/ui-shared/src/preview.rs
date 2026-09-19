@@ -47,6 +47,10 @@ pub struct PreviewCache {
     entries: HashMap<String, Entry>,
     in_flight: Vec<String>,
     failures: HashMap<String, u32>,
+    /// When a capture was last attempted, successful or not. The scheduler
+    /// needs this to bench a channel that fails before it ever yields a frame
+    /// — such a channel has no capture time to measure a back-off from.
+    last_attempt: HashMap<String, Instant>,
     tick: u64,
 }
 
@@ -91,6 +95,8 @@ impl PreviewCache {
     }
 
     pub fn mark_requested(&mut self, channel_id: &str) {
+        self.last_attempt
+            .insert(channel_id.to_string(), Instant::now());
         if !self.in_flight.iter().any(|id| id == channel_id) {
             self.in_flight.push(channel_id.to_string());
         }
@@ -136,5 +142,53 @@ impl frenchetv_core::preview::CacheView for PreviewCache {
 
     fn failures(&self, id: &str) -> u32 {
         self.failures.get(id).copied().unwrap_or(0)
+    }
+
+    fn last_attempt_at(&self, id: &str) -> Option<Instant> {
+        self.last_attempt.get(id).copied()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use frenchetv_core::preview::CacheView;
+
+    #[test]
+    fn a_failed_capture_records_an_attempt_and_counts_the_failure() {
+        let mut cache = PreviewCache::new();
+        assert_eq!(cache.failures("tf1"), 0);
+        assert!(cache.last_attempt_at("tf1").is_none());
+
+        cache.mark_requested("tf1");
+        assert!(cache.in_flight("tf1"));
+        // The attempt is recorded even though no frame ever arrived — that is
+        // the only thing the scheduler can bench a never-captured channel on.
+        assert!(cache.last_attempt_at("tf1").is_some());
+
+        cache.mark_failed("tf1");
+        assert!(!cache.in_flight("tf1"));
+        assert_eq!(cache.failures("tf1"), 1);
+        assert!(cache.last_attempt_at("tf1").is_some());
+
+        cache.mark_requested("tf1");
+        cache.mark_failed("tf1");
+        assert_eq!(cache.failures("tf1"), 2, "failures accumulate");
+    }
+
+    #[test]
+    fn in_flight_is_idempotent_and_clearable() {
+        let mut cache = PreviewCache::new();
+        cache.mark_requested("tf1");
+        cache.mark_requested("tf1");
+        assert_eq!(
+            cache.in_flight_count(),
+            1,
+            "requesting twice is one capture"
+        );
+
+        cache.clear_in_flight();
+        assert_eq!(cache.in_flight_count(), 0);
+        assert!(!cache.in_flight("tf1"));
     }
 }

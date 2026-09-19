@@ -37,6 +37,14 @@ pub trait CacheView {
     fn in_flight(&self, id: &str) -> bool;
     /// Consecutive failures, for back-off. 0 when healthy.
     fn failures(&self, id: &str) -> u32;
+    /// When a capture for this channel was last *attempted*, successfully or
+    /// not.
+    ///
+    /// Back-off cannot run from `captured_at` alone: a channel that fails
+    /// before it ever yields a frame has no capture time, sorts as "missing"
+    /// — which is first in its tier — and would be retried forever, which is
+    /// exactly the monopolisation back-off exists to prevent.
+    fn last_attempt_at(&self, id: &str) -> Option<Instant>;
 }
 
 /// Tuning for [`Scheduler`]. See [`SchedulerConfig::default`] for the budget
@@ -200,11 +208,16 @@ impl Scheduler {
         }
 
         let Some(captured_at) = cache.captured_at(id) else {
-            // Never captured: nothing to be fresh, and no timestamp to run a
-            // back-off from either. A channel that keeps failing before it ever
-            // yields a frame therefore stays eligible — `CacheView` exposes no
-            // last-attempt time, and inventing one here would be guessing.
-            return true;
+            // Never captured: nothing to be stale, so only back-off can hold
+            // it back — measured from the last attempt, since there is no
+            // capture to measure from.
+            return match backoff_window(self.config.failure_backoff, cache.failures(id)) {
+                Some(window) => match cache.last_attempt_at(id) {
+                    Some(attempted) => now.saturating_duration_since(attempted) >= window,
+                    None => true,
+                },
+                None => true,
+            };
         };
 
         let age = now.saturating_duration_since(captured_at);
@@ -213,7 +226,18 @@ impl Scheduler {
         }
 
         match backoff_window(self.config.failure_backoff, cache.failures(id)) {
-            Some(window) => age >= window,
+            // Measure from whichever happened later: a channel that captured
+            // once long ago and has failed every attempt since is benched by
+            // those attempts, not released by the stale capture.
+            Some(window) => {
+                let since = match cache.last_attempt_at(id) {
+                    Some(attempted) if attempted > captured_at => {
+                        now.saturating_duration_since(attempted)
+                    }
+                    _ => age,
+                };
+                since >= window
+            }
             None => true,
         }
     }
@@ -243,6 +267,7 @@ mod tests {
         captured: HashMap<String, Instant>,
         in_flight: HashSet<String>,
         failures: HashMap<String, u32>,
+        last_attempt: HashMap<String, Instant>,
     }
 
     impl CacheView for FakeCache {
@@ -255,6 +280,64 @@ mod tests {
         fn failures(&self, id: &str) -> u32 {
             self.failures.get(id).copied().unwrap_or(0)
         }
+        fn last_attempt_at(&self, id: &str) -> Option<Instant> {
+            self.last_attempt.get(id).copied()
+        }
+    }
+
+    #[test]
+    fn a_channel_that_never_captured_is_still_benched_by_backoff() {
+        // The gap this closes: with no capture time, a repeatedly failing
+        // channel sorted as "missing" — first in its tier — and was retried
+        // forever, monopolising the rotation back-off exists to prevent.
+        let cfg = SchedulerConfig::default();
+        let t0 = Instant::now();
+        let scheduler = Scheduler::new(cfg.clone());
+
+        let mut cache = FakeCache::default();
+        cache.failures.insert("broken".into(), 1);
+        cache.last_attempt.insert("broken".into(), t0);
+
+        let view = ViewState {
+            visible: vec!["broken".to_string()],
+            focused: None,
+        };
+
+        // Inside the back-off window: benched, even though it has no frame.
+        let inside = t0 + cfg.failure_backoff - Duration::from_secs(1);
+        assert_eq!(scheduler.next_target(&view, &cache, inside), None);
+
+        // Past it: eligible again.
+        let outside = t0 + cfg.failure_backoff;
+        assert_eq!(
+            scheduler.next_target(&view, &cache, outside),
+            Some("broken".to_string())
+        );
+    }
+
+    #[test]
+    fn failed_attempts_after_a_stale_capture_still_bench_the_channel() {
+        // A channel that captured once long ago and has failed every attempt
+        // since must be held by those attempts, not released by the old frame.
+        let cfg = SchedulerConfig::default();
+        let t0 = Instant::now();
+        let scheduler = Scheduler::new(cfg.clone());
+
+        let mut cache = FakeCache::default();
+        cache.captured.insert("flaky".into(), t0);
+        cache.failures.insert("flaky".into(), 1);
+        // Attempted much later than the capture.
+        cache
+            .last_attempt
+            .insert("flaky".into(), t0 + Duration::from_secs(600));
+
+        let view = ViewState {
+            visible: vec!["flaky".to_string()],
+            focused: None,
+        };
+
+        let now = t0 + Duration::from_secs(600) + cfg.failure_backoff - Duration::from_secs(1);
+        assert_eq!(scheduler.next_target(&view, &cache, now), None);
     }
 
     /// Distance from the fake clock's origin to `now`. Every age in a case is
