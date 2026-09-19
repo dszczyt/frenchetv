@@ -50,20 +50,31 @@ rustup target add aarch64-linux-android armv7-linux-androideabi
 cargo install cargo-ndk
 ```
 
-You also need two SDK pieces that are **not** interchangeable with whatever
-your distro ships:
+You also need three toolchain pieces that are **not** interchangeable with
+whatever your distro ships:
 
 - **Android NDK r26d**, exported as `ANDROID_NDK_HOME`. This is what CI uses;
-  other versions may work but are untested.
+  other versions may work but are untested. Needed to compile the Rust `.so`.
 - **JDK 17 or 21.** Gradle 8.6 / AGP 8.2.2 do not run on newer JDKs — a JDK 25+
   system default will fail before it compiles anything. If your distro only
   ships a newer JDK, unpack a Temurin 17 tarball somewhere local and point
   `JAVA_HOME` at it rather than changing your system default.
+- **Android SDK** with `platforms;android-34` and `build-tools;34.0.0`,
+  exported as `ANDROID_HOME`. Needed to package the APK — the NDK alone is not
+  enough, and Gradle fails with "SDK location not found" without it. Install it
+  without Android Studio via the command-line tools:
+
+  ```bash
+  # unpack commandlinetools-linux-*.zip to $ANDROID_HOME/cmdline-tools/latest
+  sdkmanager --licenses
+  sdkmanager "platforms;android-34" "build-tools;34.0.0" "platform-tools"
+  ```
 
 Then:
 
 ```bash
 export ANDROID_NDK_HOME=/path/to/android-ndk-r26d
+export ANDROID_HOME=/path/to/android-sdk
 export JAVA_HOME=/path/to/jdk-17
 
 # Rust .so for both shipped ABIs
