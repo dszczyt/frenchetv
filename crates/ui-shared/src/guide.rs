@@ -170,6 +170,11 @@ impl GuideScreen {
         for (channel_id, frame) in capture.poll() {
             self.previews.insert(ctx, &channel_id, frame);
         }
+        // Must happen every tick: an unreported failure leaves the channel in
+        // flight, and the scheduler then skips it for good.
+        for channel_id in capture.poll_failures() {
+            self.previews.mark_failed(&channel_id);
+        }
 
         // Restart the settle timer whenever focus moved. Without this a held
         // D-pad cancels and restarts capture forever and nothing ever

@@ -30,6 +30,14 @@ pub trait PreviewCapture: Send {
     fn request(&mut self, channel: &Channel);
     /// Frames finished since the last call, as (channel id, frame).
     fn poll(&mut self) -> Vec<(String, ColorImage)>;
+    /// Channels whose capture failed or timed out since the last call.
+    ///
+    /// Part of the trait rather than an inherent method on each backend: a
+    /// request marks a channel in flight, and only a frame or a failure takes
+    /// it out again. A backend that could not report failures would leave a
+    /// timed-out channel in flight forever, and the scheduler would skip it
+    /// silently for the rest of the session.
+    fn poll_failures(&mut self) -> Vec<String>;
     /// Abandon anything in flight — the guide was left, or playback needs the
     /// decoder back.
     fn cancel(&mut self);
