@@ -171,7 +171,11 @@ pub struct GuideScreen {
     /// Desktop renders mpv into an egui texture so it can be painted anywhere;
     /// Android plays in a separate Activity and has none, so it stays `None`
     /// and the focused row shows its captured still like every other row.
-    live_texture: Option<egui::load::SizedTexture>,
+    /// Live picture, tagged with the channel it belongs to. The tag matters:
+    /// while a switch is settling the player is still rendering the previous
+    /// channel, and an untagged texture gets painted into whichever row is
+    /// focused now — showing the wrong channel's video.
+    live_texture: Option<(String, egui::load::SizedTexture)>,
     /// Fades live video in over the still it replaces. Switching rows
     /// otherwise pops twice — live out, still in, live in — which reads as a
     /// flicker.
@@ -212,7 +216,7 @@ impl GuideScreen {
     }
 
     /// Supply live video for the focused row. `None` falls back to the still.
-    pub fn set_live_texture(&mut self, texture: Option<egui::load::SizedTexture>) {
+    pub fn set_live_texture(&mut self, texture: Option<(String, egui::load::SizedTexture)>) {
         self.live_texture = texture;
     }
 
@@ -690,10 +694,10 @@ impl GuideScreen {
         // channel's name — a row is never a blank hole.
         let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
         let still = self.previews.peek(&ch.id).map(|t| (t.id(), t.size_vec2()));
-        let live = if focused {
-            self.live_texture.map(|t| (t.id, t.size))
-        } else {
-            None
+        // Only when it is this channel's picture: see `live_texture`.
+        let live = match (focused, self.live_texture.as_ref()) {
+            (true, Some((id, tex))) if *id == ch.id => Some((tex.id, tex.size)),
+            _ => None,
         };
 
         // The still stays underneath while live fades in, so a row change

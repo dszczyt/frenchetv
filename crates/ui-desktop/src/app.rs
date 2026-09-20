@@ -90,6 +90,19 @@ pub struct App {
     /// very player rather than resolving the stream again.
     live: Option<Box<PlayerScreen>>,
     live_channel: Option<String>,
+    /// The guide, set aside while a channel plays fullscreen.
+    ///
+    /// Rebuilding it on the way back lost the schedule — which only ever
+    /// arrives once, on `EpgOk` — along with every captured preview, the
+    /// scroll position and the focused row.
+    stashed_guide: Option<Box<GuideScreen>>,
+    /// Kept here, not only in the guide. The schedule arrives once and may
+    /// land while a channel is fullscreen, when there is no guide on screen to
+    /// receive it.
+    epg: frenchetv_core::EpgData,
+    /// Set by the guide when a channel is chosen; acted on after the screen
+    /// match, which is the only place the old screen can be moved out.
+    pending_play: Option<(Box<Channel>, Option<egui::Rect>)>,
     /// Bumped on every live-row switch. A stream resolved for a row the cursor
     /// has since left must not be loaded — otherwise walking the list plays
     /// whichever channel's licence exchange happened to finish last.
@@ -153,6 +166,9 @@ impl App {
             preview_scheduler: Scheduler::new(SchedulerConfig::default()),
             live: None,
             live_channel: None,
+            stashed_guide: None,
+            pending_play: None,
+            epg: frenchetv_core::EpgData::default(),
             live_generation: 0,
             focus_since: None,
             logo_ttl_hours,
@@ -780,6 +796,43 @@ impl App {
         self.start_resolve_stream_for_live(channel, self.live_generation);
     }
 
+    /// Move to fullscreen playback, keeping the guide for the way back.
+    ///
+    /// Done after the screen match because that is the only point the current
+    /// screen can be moved out rather than overwritten.
+    fn enter_fullscreen(&mut self, channel: Channel, from_rect: Option<egui::Rect>) {
+        if let Screen::Guide(guide) =
+            std::mem::replace(&mut self.screen, Screen::Setup(SetupScreen::new()))
+        {
+            self.stashed_guide = Some(guide);
+        }
+
+        // Reuse the stream already running in the row when it is the one being
+        // selected: no second resolve, no second licence exchange, and the
+        // picture already on screen simply grows.
+        let promote = self
+            .live
+            .as_ref()
+            .is_some_and(|p| p.channel_id() == channel.id);
+        self.live_channel = None;
+        let player = if promote {
+            let mut player = self.live.take().expect("checked just above");
+            if let Some(rect) = from_rect {
+                player.zoom_from(rect);
+            }
+            player
+        } else {
+            self.live = None;
+            self.start_resolve_stream(channel.clone());
+            Box::new(PlayerScreen::new(
+                channel,
+                self.egui_ctx.clone(),
+                self.force_software_renderer,
+            ))
+        };
+        self.screen = Screen::Player(player);
+    }
+
     fn start_previews(&mut self) {
         if let Some(op) = &self.current_operator {
             self.preview_capture = Some(MpvPreviewCapture::new(Arc::clone(op)));
@@ -788,7 +841,9 @@ impl App {
     }
 
     fn make_guide(&self, channels: Vec<Channel>) -> Box<GuideScreen> {
-        Box::new(GuideScreen::new(channels, Arc::clone(&self.logos)))
+        let mut guide = Box::new(GuideScreen::new(channels, Arc::clone(&self.logos)));
+        guide.set_epg(self.epg.clone());
+        guide
     }
 
     fn drain_async_messages(&mut self, ctx: &egui::Context) {
@@ -898,8 +953,13 @@ impl App {
                     self.start_previews();
                 }
                 AsyncMsg::EpgOk(data) => {
+                    self.epg = *data;
+                    // Whichever guide exists — on screen, or set aside while a
+                    // channel plays fullscreen.
                     if let Screen::Guide(guide) = &mut self.screen {
-                        guide.set_epg(*data);
+                        guide.set_epg(self.epg.clone());
+                    } else if let Some(guide) = self.stashed_guide.as_mut() {
+                        guide.set_epg(self.epg.clone());
                     }
                 }
                 AsyncMsg::SessionExpired => {
@@ -941,10 +1001,19 @@ impl eframe::App for App {
         if matches!(self.screen, Screen::Guide(_)) {
             self.update_live_row(ctx, focused);
         }
+        // Tagged with the channel it is actually showing, so the guide can
+        // refuse to paint it into a row it does not belong to.
         let live_frame = match (self.live.as_mut(), from_rect) {
-            (Some(player), Some(rect)) => player.frame_for(ctx, rect.size()),
+            (Some(player), Some(rect)) => {
+                let id = player.channel_id().to_string();
+                player.frame_for(ctx, rect.size()).map(|tex| (id, tex))
+            }
             _ => None,
         };
+
+        if let Some((channel, from_rect)) = self.pending_play.take() {
+            self.enter_fullscreen(*channel, from_rect);
+        }
 
         match &mut self.screen {
             Screen::Restoring(restoring) => {
@@ -1000,27 +1069,7 @@ impl eframe::App for App {
                         // the one being selected: no second resolve, no second
                         // licence exchange, and the picture already on screen
                         // simply grows into place.
-                        let promote = self
-                            .live
-                            .as_ref()
-                            .is_some_and(|p| p.channel_id() == channel.id);
-                        if promote {
-                            let mut player = self.live.take().expect("checked just above");
-                            if let Some(rect) = from_rect {
-                                player.zoom_from(rect);
-                            }
-                            self.live_channel = None;
-                            self.screen = Screen::Player(player);
-                        } else {
-                            self.live = None;
-                            self.live_channel = None;
-                            self.start_resolve_stream((*channel).clone());
-                            self.screen = Screen::Player(Box::new(PlayerScreen::new(
-                                *channel,
-                                self.egui_ctx.clone(),
-                                self.force_software_renderer,
-                            )));
-                        }
+                        self.pending_play = Some((channel, from_rect));
                     }
                     GuideAction::ChangeProvider => {
                         self.preview_capture = None;
@@ -1039,7 +1088,12 @@ impl eframe::App for App {
                 match player.show(ctx) {
                     PlayerAction::Back => {
                         self._drm_proxy = None;
-                        self.screen = Screen::Guide(self.make_guide(channels));
+                        // Put the guide back as it was — schedule, previews,
+                        // scroll position and focused row intact.
+                        self.screen = match self.stashed_guide.take() {
+                            Some(guide) => Screen::Guide(guide),
+                            None => Screen::Guide(self.make_guide(channels)),
+                        };
                         self.start_previews();
                     }
                     PlayerAction::NextChannel => {
