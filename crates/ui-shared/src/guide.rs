@@ -124,6 +124,26 @@ pub fn offset_keeping_row_visible(row: usize, row_h: f32, current: f32, viewport
     }
 }
 
+/// Largest rect of the given aspect ratio that fits inside `container`,
+/// centred.
+///
+/// Channel logos are wide (360x90 is typical) and the row's logo slot is close
+/// to square, so painting straight into the slot stretched every one of them.
+pub fn fit_preserving_aspect(container: Rect, aspect: f32) -> Rect {
+    if aspect <= 0.0 || !aspect.is_finite() || container.width() <= 0.0 || container.height() <= 0.0
+    {
+        return container;
+    }
+    let container_aspect = container.width() / container.height();
+    let size = if container_aspect > aspect {
+        // Container is wider than the image: height is the limit.
+        Vec2::new(container.height() * aspect, container.height())
+    } else {
+        Vec2::new(container.width(), container.width() / aspect)
+    };
+    Rect::from_center_size(container.center(), size)
+}
+
 pub struct GuideScreen {
     channels: Vec<Channel>,
     filter: CategoryFilter,
@@ -152,6 +172,11 @@ pub struct GuideScreen {
     /// Android plays in a separate Activity and has none, so it stays `None`
     /// and the focused row shows its captured still like every other row.
     live_texture: Option<egui::load::SizedTexture>,
+    /// Fades live video in over the still it replaces. Switching rows
+    /// otherwise pops twice — live out, still in, live in — which reads as a
+    /// flicker.
+    live_fade: f32,
+    fade_for_row: usize,
     /// Where the focused row's preview was painted last frame. The fullscreen
     /// transition zooms out of exactly this rectangle.
     focused_preview_rect: Option<Rect>,
@@ -179,6 +204,8 @@ impl GuideScreen {
             scroll_offset: 0.0,
             viewport_h: 0.0,
             live_texture: None,
+            live_fade: 0.0,
+            fade_for_row: 0,
             focused_preview_rect: None,
             previews: PreviewCache::new(),
         }
@@ -296,6 +323,25 @@ impl GuideScreen {
 
     pub fn show(&mut self, ctx: &egui::Context) -> GuideAction {
         let m = Metrics::for_height(ctx.screen_rect().height());
+
+        // Live video fades in over whatever the row was already showing.
+        const FADE_SECS: f32 = 0.22;
+        if self.focused_row != self.fade_for_row {
+            self.fade_for_row = self.focused_row;
+            self.live_fade = 0.0;
+        }
+        match self.live_texture {
+            // Reset while there is no live picture, so whenever one arrives —
+            // a row change, or the stream reconnecting on the same row — it
+            // fades in over the still rather than snapping on.
+            None => self.live_fade = 0.0,
+            Some(_) if self.live_fade < 1.0 => {
+                self.live_fade =
+                    (self.live_fade + ctx.input(|i| i.unstable_dt) / FADE_SECS).min(1.0);
+                ctx.request_repaint();
+            }
+            Some(_) => {}
+        }
 
         let input = ctx.input(|i| NavInput {
             left: i.key_pressed(Key::ArrowLeft),
@@ -610,9 +656,10 @@ impl GuideScreen {
             .and_then(|u| self.logos.lock().ok().and_then(|m| m.get(u).cloned()));
         match logo {
             Some(tex) => {
+                let size = tex.size_vec2();
                 painter.image(
                     tex.id(),
-                    logo_rect,
+                    fit_preserving_aspect(logo_rect, size.x / size.y),
                     Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
                     Color32::WHITE,
                 );
@@ -641,21 +688,35 @@ impl GuideScreen {
         // Live video for the focused row when the platform supplies it,
         // otherwise the most recent captured still, and failing that the
         // channel's name — a row is never a blank hole.
-        let live_id = if focused {
-            self.live_texture.map(|t| t.id)
+        let uv = Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0));
+        let still = self.previews.peek(&ch.id).map(|t| (t.id(), t.size_vec2()));
+        let live = if focused {
+            self.live_texture.map(|t| (t.id, t.size))
         } else {
             None
         };
-        match live_id.or_else(|| self.previews.peek(&ch.id).map(|t| t.id())) {
-            Some(tex_id) => {
+
+        // The still stays underneath while live fades in, so a row change
+        // never blanks: the picture already there is replaced, not removed.
+        if let Some((id, size)) = still {
+            painter.image(
+                id,
+                fit_preserving_aspect(preview_rect, size.x / size.y),
+                uv,
+                Color32::WHITE,
+            );
+        }
+        match live {
+            Some((id, size)) => {
+                let alpha = if still.is_some() { self.live_fade } else { 1.0 };
                 painter.image(
-                    tex_id,
-                    preview_rect,
-                    Rect::from_min_max(egui::pos2(0.0, 0.0), egui::pos2(1.0, 1.0)),
-                    Color32::WHITE,
+                    id,
+                    fit_preserving_aspect(preview_rect, size.x / size.y),
+                    uv,
+                    Color32::WHITE.gamma_multiply(alpha),
                 );
             }
-            None => {
+            None if still.is_none() => {
                 painter.text(
                     preview_rect.center(),
                     Align2::CENTER_CENTER,
@@ -664,6 +725,7 @@ impl GuideScreen {
                     palette::TEXT_FAINT,
                 );
             }
+            None => {}
         }
 
         // ── timeline ─────────────────────────────────────────────────────
@@ -876,6 +938,43 @@ mod tests {
         g.apply_nav(key(|i| i.up = true), 2, 4, 0);
         g.apply_nav(key(|i| i.down = true), 2, 4, 0);
         assert_eq!(g.focus_layer, FocusLayer::Rows);
+    }
+
+    #[test]
+    fn logos_keep_their_aspect_ratio_inside_the_slot() {
+        // A 360x90 logo (the shape most channels ship) in a near-square slot:
+        // painting straight into the slot stretched it 4x vertically.
+        let slot = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(60.0, 50.0));
+        let fitted = fit_preserving_aspect(slot, 360.0 / 90.0);
+        assert!((fitted.width() / fitted.height() - 4.0).abs() < 0.001);
+        assert!(fitted.width() <= slot.width() + 0.001);
+        assert!(fitted.height() <= slot.height() + 0.001);
+        // Centred in the slot it was given.
+        assert!((fitted.center().x - slot.center().x).abs() < 0.001);
+        assert!((fitted.center().y - slot.center().y).abs() < 0.001);
+    }
+
+    #[test]
+    fn fit_uses_whichever_dimension_binds() {
+        let slot = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(100.0, 100.0));
+        // Wide image: width fills, height shrinks.
+        let wide = fit_preserving_aspect(slot, 2.0);
+        assert!((wide.width() - 100.0).abs() < 0.001);
+        assert!((wide.height() - 50.0).abs() < 0.001);
+        // Tall image: height fills, width shrinks.
+        let tall = fit_preserving_aspect(slot, 0.5);
+        assert!((tall.height() - 100.0).abs() < 0.001);
+        assert!((tall.width() - 50.0).abs() < 0.001);
+    }
+
+    #[test]
+    fn fit_is_safe_on_degenerate_input() {
+        let slot = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::new(10.0, 10.0));
+        // A texture reporting zero height would otherwise divide by zero.
+        assert_eq!(fit_preserving_aspect(slot, 0.0), slot);
+        assert_eq!(fit_preserving_aspect(slot, f32::NAN), slot);
+        let empty = Rect::from_min_size(egui::pos2(0.0, 0.0), Vec2::ZERO);
+        assert_eq!(fit_preserving_aspect(empty, 1.78), empty);
     }
 
     #[test]
