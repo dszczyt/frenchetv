@@ -114,6 +114,9 @@ pub struct App {
     logos: LogoCache,
     /// TTL (hours) for the on-disk logo cache — from `Config.cache.logo_ttl_hours`.
     logo_ttl_hours: u32,
+    /// One-shot breadcrumb: proves the egui loop actually ran a frame, which a
+    /// black screen alone cannot tell you.
+    first_frame_logged: bool,
     tx: mpsc::SyncSender<AsyncMsg>,
     rx: mpsc::Receiver<AsyncMsg>,
     rt: tokio::runtime::Runtime,
@@ -122,6 +125,7 @@ pub struct App {
 
 impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, android_app: AndroidApp) -> Self {
+        log::info!("App::new: starting");
         egui_extras::install_image_loaders(&cc.egui_ctx);
 
         // Point core at the app's private storage before anything reads it.
@@ -152,6 +156,7 @@ impl App {
             pending_credentials: None,
             logos,
             logo_ttl_hours,
+            first_frame_logged: false,
             tx,
             rx,
             rt,
@@ -169,6 +174,7 @@ impl App {
             }
         }
 
+        log::info!("App::new: done");
         app
     }
 
@@ -547,6 +553,10 @@ impl App {
 
 impl eframe::App for App {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        if !self.first_frame_logged {
+            self.first_frame_logged = true;
+            log::info!("first frame: screen_rect = {:?}", ctx.screen_rect());
+        }
         self.drain_async_messages(ctx);
 
         match &mut self.screen {
