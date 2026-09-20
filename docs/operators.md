@@ -103,3 +103,39 @@ list is reachable, but live *playback* is gated by a **PFS security WASM module*
 > `google-chrome-stable`, headed) captured the authenticated session's XHR/fetch
 > traffic while a real user completed login + OTP. No credentials or tokens are
 > stored in the repo. Unit tests exercise the auth flow against `wiremock` mocks.
+
+
+## EPG feeds
+
+The schedule comes from a public XMLTV feed, not from the operators —
+`Operator::fetch_epg` returns `None` for both, so `EpgProvider` always falls
+through to the feed. The URL is configurable (`[epg] feed_url` in
+`config.toml`); `DEFAULT_FEED_URL` is only a starting point, and
+`RETIRED_FEED_URLS` migrates installs off ones that have gone bad.
+
+**Always check a candidate feed's timestamps against reality before adopting
+it.** Coverage is the obvious metric and the misleading one: a feed can offer
+hundreds of channels and place every programme at the wrong time.
+
+The check that matters takes a minute. Pick a programme whose broadcast time
+is common knowledge — TF1's `JT 13h` and `JT 20h` are ideal, being daily and
+named after their slot — and confirm the feed puts them at 13:00 and 20:00
+Paris:
+
+```bash
+curl -s "<feed-url>" -o /tmp/feed.xml
+# then find TF1's channel id and print the start times of its news bulletins
+```
+
+Feeds evaluated so far:
+
+| Feed | Channels | Verdict |
+|---|---|---|
+| `xmltvfr.fr/xmltv/xmltv_tnt.xml` | ~30 | **Current default.** Honest `+0200` offsets; both bulletins land correctly. |
+| `xmltvfr.fr/xmltv/xmltv.xml` | many | Same source, so presumably as accurate, but ~146MB — too heavy to refetch on a Fire TV. Reasonable to configure on desktop. |
+| `epg.pw/xmltv/epg_FR.xml` | ~516 | **Retired.** Every programme shifted a consistent +8 hours while declaring `+0000`: `JT 20h` at 04:00, `JT 13h` at 21:00 Paris. |
+| `xmltv.ch/xmltv/xmltv-tnt-fr.xml` | — | **Retired.** 503 on every request. |
+
+Wide coverage of wrong times is worse than narrow coverage of right ones: an
+unmatched channel shows "Programme non disponible", which is honest, whereas a
+mistimed one looks authoritative and is not.

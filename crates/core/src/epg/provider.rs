@@ -17,17 +17,33 @@ use chrono::{DateTime, Duration, Utc};
 /// Default feed. Overridable via config — feeds move and die, so this is a
 /// starting point rather than a constant of nature.
 ///
-/// Chosen over the TNT-only feeds because it carries ~516 channels: an
-/// operator line-up is several hundred, and a 30-channel terrestrial guide
-/// leaves most rows blank.
-pub const DEFAULT_FEED_URL: &str = "https://epg.pw/xmltv/epg_FR.xml";
+/// Chosen for correctness over coverage, the hard way.
+///
+/// epg.pw carries ~516 channels against this feed's ~30, and was the default
+/// until its timestamps were checked against reality: it places TF1's "JT 20h"
+/// at 04:00 and "JT 13h" at 21:00 Paris — every programme shifted a
+/// consistent +8 hours while labelled `+0000`. Wide coverage of wrong times is
+/// worse than narrow coverage of right ones, and a channel with no data shows
+/// "Programme non disponible" rather than a lie.
+///
+/// This feed declares honest `+0200` offsets and puts both bulletins where
+/// they actually air. The same host publishes a ~146MB `xmltv.xml` with far
+/// more channels; it is not the default because re-downloading that on a
+/// Fire TV is not reasonable, but it is a sensible value to configure on
+/// desktop.
+pub const DEFAULT_FEED_URL: &str = "https://xmltvfr.fr/xmltv/xmltv_tnt.xml";
 
 /// Feeds that used to be the default and no longer serve anything.
 ///
 /// A dead URL survives in `config.toml` once it has been written there, so
 /// changing `DEFAULT_FEED_URL` alone would not reach anyone who already ran
 /// the app. `Config::load` treats these as unset.
-pub const RETIRED_FEED_URLS: &[&str] = &["https://xmltv.ch/xmltv/xmltv-tnt-fr.xml"];
+pub const RETIRED_FEED_URLS: &[&str] = &[
+    // Returned 503 for every request.
+    "https://xmltv.ch/xmltv/xmltv-tnt-fr.xml",
+    // Serves every French programme shifted +8 hours while claiming +0000.
+    "https://epg.pw/xmltv/epg_FR.xml",
+];
 
 pub struct EpgProvider {
     client: reqwest::Client,
